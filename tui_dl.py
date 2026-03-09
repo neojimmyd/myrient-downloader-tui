@@ -20,7 +20,7 @@ import xml.etree.ElementTree as ET
 from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import unquote, urljoin
+from urllib.parse import quote, unquote, urljoin
 
 from bs4 import BeautifulSoup
 from textual import work
@@ -32,7 +32,7 @@ from textual.timer import Timer
 from textual.widgets import (
     Button, DataTable, DirectoryTree, Footer, Header, Input,
     Label, ListItem, ListView, ProgressBar, RichLog, Select,
-    SelectionList, TabbedContent, TabPane
+    SelectionList, TabbedContent, TabPane, Tree
 )
 from textual.widgets.selection_list import Selection
 
@@ -165,9 +165,10 @@ class DownloadProgress(Message):
         super().__init__()
 
 class DownloadComplete(Message):
-    def __init__(self, item: Dict[str, str], success: bool):
+    def __init__(self, item: Dict[str, str], success: bool, cancelled: bool = False):
         self.item = item
         self.success = success
+        self.cancelled = cancelled
         super().__init__()
 
 class LibraryProgress(Message):
@@ -203,16 +204,15 @@ class MyrientTUI(App):
     .pane-left { width: 35%; height: 1fr; border: round $primary; padding: 1; }
     .pane-right { width: 65%; height: 1fr; border: round $secondary; padding: 1; }
     .pane-half { width: 50%; height: 1fr; border: round $primary; padding: 1; }
+    .pane-full { width: 100%; height: 1fr; border: round $primary; padding: 1; }
     
     /* Dedicated Library Manager Layout */
     .pane-library-tree { width: 75%; height: 1fr; border: round $primary; padding: 1; }
     .pane-library-ops { width: 25%; height: 1fr; border: round $secondary; padding: 1; }
     
     /* Queue & Download Dashboard Layout */
-    .pane-queue { width: 35%; height: 1fr; border: round $primary; padding: 1; }
-    .pane-dl { width: 65%; height: 1fr; }
-    .dl-top { height: 75%; border: round $secondary; padding: 1; margin-bottom: 1; }
-    .dl-bottom { height: 25%; border: round $secondary; padding: 1; }
+    .pane-queue { width: 40%; height: 1fr; border: round $primary; padding: 1; }
+    .pane-dl { width: 60%; height: 1fr; border: round $secondary; padding: 1; }
     
     .search-bar { margin-bottom: 1; }
     
@@ -232,7 +232,7 @@ class MyrientTUI(App):
     Button { margin: 0 1; }
     
     .progress-container { height: auto; margin-bottom: 1; }
-    RichLog { border: round $surface-lighten-2; height: 1fr; }
+    RichLog { height: 1fr; border: none; }
     DirectoryTree { height: 1fr; border: solid $secondary; margin-bottom: 1; }
     
     #dialog { grid-size: 2; padding: 1 2; width: 60; height: 12; border: thick $primary; background: $surface; align: center middle; }
@@ -254,6 +254,7 @@ class MyrientTUI(App):
         self._games_lookup: Dict[str, Dict[str, str]] = {}
         
         self.selected_console: Optional[Dict[str, str]] = None
+        self.selected_lib_path: Optional[Path] = None
         
         self.proc_lock = threading.Lock()
         self.active_processes = set()
@@ -262,6 +263,11 @@ class MyrientTUI(App):
         self.global_total = 0
         self.global_completed = 0
         
+        # Engine Control State
+        self.engine_running = False
+        self.cancel_flag = threading.Event()
+        
+        # UI Debounce Timers
         self._search_timer: Optional[Timer] = None
 
     def _register_process(self, proc: subprocess.Popen) -> None:
@@ -331,19 +337,16 @@ class MyrientTUI(App):
                         yield DataTable(id="queue-table")
                         with Horizontal(classes="controls"):
                             yield Button("Remove Selection", id="btn-remove-items", variant="warning")
-                            yield Button("Start Downloads", id="btn-start-dl", variant="primary")
+                            yield Button("Start / Resume", id="btn-start-dl", variant="primary")
+                            yield Button("Pause", id="btn-pause-dl", variant="error")
                     
-                    with Vertical(classes="pane-dl"):
-                        with VerticalScroll(classes="dl-top", id="progress-area"):
-                            yield Label(
-                                "[bold #E5E50F]Universal Queue Progress: 0/0 Games Completed[/]", 
-                                id="lbl-global-progress"
-                            )
-                            yield ProgressBar(id="global-progress", show_eta=True)
-                            yield Label("\n[bold cyan]Active Threads (Real-Time I/O)[/]")
-                        with VerticalScroll(classes="dl-bottom"):
-                            yield Label("[bold yellow]Engine Live Log[/]")
-                            yield RichLog(id="sys-log", markup=True, wrap=True, max_lines=500)
+                    with VerticalScroll(classes="pane-dl", id="progress-area"):
+                        yield Label(
+                            "[bold #E5E50F]Universal Queue Progress: 0/0 Games Completed[/]", 
+                            id="lbl-global-progress"
+                        )
+                        yield ProgressBar(id="global-progress", show_eta=True)
+                        yield Label("\n[bold cyan]Active Threads (Real-Time I/O)[/]")
 
             with TabPane("📁 Library Manager", id="tab-library"):
                 with Horizontal(classes="horizontal-layout"):
@@ -392,6 +395,12 @@ class MyrientTUI(App):
                             id="set-exclude",
                             classes="invisible-unchecked"
                         )
+            
+            with TabPane("📜 System Logs", id="tab-logs"):
+                with Vertical(classes="pane-full"):
+                    yield Label("[bold yellow]Engine Background Events[/]")
+                    yield RichLog(id="sys-log", markup=True, wrap=True, max_lines=500)
+                    
         yield Footer()
 
     def on_mount(self) -> None:
@@ -463,7 +472,7 @@ class MyrientTUI(App):
                 
         return "".join(result_array)
 
-    def on_input_changed(self, event) -> None:
+    def on_input_changed(self, event: Input.Changed) -> None:
         """Debounces search input to prevent UI stutter during rapid typing."""
         if self._search_timer is not None:
             self._search_timer.stop()
@@ -556,13 +565,16 @@ class MyrientTUI(App):
             except Exception:
                 pass
 
-    def on_select_changed(self, event) -> None:
+    def on_select_changed(self, event: Select.Changed) -> None:
         if event.control.id == "queue-select" and event.value != Select.BLANK:
             self.state.set_active_queue(str(event.value))
             self._refresh_queue_table()
             self.notify(f"Switched to: {event.value}")
 
-    async def on_list_view_selected(self, event) -> None:
+    def on_tree_node_highlighted(self, event) -> None:
+        self.selected_lib_path = getattr(event.node.data, 'path', None)
+
+    async def on_list_view_selected(self, event: ListView.Selected) -> None:
         list_id = getattr(event.list_view, "id", None)
         
         if list_id == "console-list":
@@ -577,7 +589,7 @@ class MyrientTUI(App):
                 self.query_one("#search-games", Input).value = ""
                 self.fetch_games(data)
 
-    def on_button_pressed(self, event) -> None:
+    def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id
         
         if button_id == "btn-add-queue":
@@ -612,6 +624,12 @@ class MyrientTUI(App):
         elif button_id == "btn-start-dl":
             if self.state.get_active_queue():
                 self.start_download_engine()
+                
+        elif button_id == "btn-pause-dl":
+            if self.engine_running:
+                self.post_message(SystemLog("[bold yellow]Pause signal sent. Suspending threads and preserving partial files...[/]"))
+                self.cancel_flag.set()
+                self.cleanup_subprocesses()
                 
         elif button_id == "btn-save-settings":
             try:
@@ -726,6 +744,7 @@ class MyrientTUI(App):
 
     async def on_games_loaded(self, message: GamesLoaded) -> None:
         self._all_games_data = message.games
+        # RAM Optimization: Store active dictionary for O(1) queue lookups instead of JSON parsing
         self._games_lookup = {g["url_part"]: g for g in message.games}
         self._render_games(self.query_one("#search-games", Input).value)
 
@@ -807,12 +826,18 @@ class MyrientTUI(App):
 
     @work(exclusive=True, thread=True)
     def start_download_engine(self) -> None:
+        if self.engine_running:
+            return
+            
         queue = self.state.get_active_queue().copy()
         max_threads = self.state.settings.get("max_concurrent", 4)
         
         if not queue:
             return
             
+        self.engine_running = True
+        self.cancel_flag.clear()
+        
         self.global_total = len(queue)
         self.global_completed = 0
         
@@ -833,14 +858,26 @@ class MyrientTUI(App):
             for future in concurrent.futures.as_completed(futures):
                 try: 
                     result = future.result()
-                    self.post_message(DownloadComplete(futures[future], result["success"]))
+                    self.post_message(DownloadComplete(
+                        futures[future], 
+                        result.get("success", False), 
+                        result.get("cancelled", False)
+                    ))
                 except Exception as err: 
                     self.post_message(SystemLog(f"Thread crash {futures[future]['name']}: {err}", True))
                     self.post_message(DownloadComplete(futures[future], False))
                     
-        self.post_message(SystemLog("[bold green]Batch Queue Finished[/]"))
+        self.engine_running = False
+        
+        if self.cancel_flag.is_set():
+            self.post_message(SystemLog("[bold yellow]Downloads Successfully Paused[/]"))
+        else:
+            self.post_message(SystemLog("[bold green]Batch Queue Finished[/]"))
 
     def _download_worker(self, item: Dict[str, str]) -> Dict[str, Any]:
+        if self.cancel_flag.is_set():
+            return {"success": False, "cancelled": True}
+            
         dest_dir = Path(item['dest_path'])
         target_file = dest_dir / unquote(item['game_url'].split('/')[-1])
         item_name = item["name"]
@@ -870,6 +907,10 @@ class MyrientTUI(App):
             
             try:
                 for line in proc.stderr:
+                    if self.cancel_flag.is_set():
+                        proc.terminate()
+                        return {"success": False, "cancelled": True}
+                        
                     stderr_log.append(line.strip())
                     match = WGET_PROG_REGEX.search(line)
                     if match:
@@ -883,6 +924,9 @@ class MyrientTUI(App):
             finally: 
                 proc.wait()
                 self._unregister_process(proc)
+                
+            if self.cancel_flag.is_set():
+                return {"success": False, "cancelled": True}
 
             if proc.returncode != 0: 
                 error_msg = " | ".join(stderr_log)
@@ -895,12 +939,27 @@ class MyrientTUI(App):
                     headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
                 )
                 
+                if target_file.exists():
+                    existing_size = target_file.stat().st_size
+                    if existing_size < size_bytes:
+                        req.add_header('Range', f'bytes={existing_size}-')
+                        open_mode = 'ab'
+                        downloaded = existing_size
+                    else:
+                        open_mode = 'wb'
+                        downloaded = 0
+                else:
+                    open_mode = 'wb'
+                    downloaded = 0
+                
                 try:
                     with urllib.request.urlopen(req, timeout=30) as response:
-                        with open(target_file, 'wb') as file:
-                            downloaded = 0
+                        with open(target_file, open_mode) as file:
                             last_ui_update = 0.0
                             while True:
+                                if self.cancel_flag.is_set():
+                                    return {"success": False, "cancelled": True}
+                                    
                                 chunk = response.read(1024 * 1024)
                                 if not chunk:
                                     break
@@ -919,6 +978,9 @@ class MyrientTUI(App):
                 except Exception as err:
                     raise Exception(f"Urllib socket failed: {str(err)}")
 
+            if self.cancel_flag.is_set():
+                return {"success": False, "cancelled": True}
+
             self.post_message(DownloadProgress(item["id"], item_name, size_bytes, size_bytes, "Extracting ZIP"))
 
             if target_file.exists() and target_file.suffix.lower() == '.zip':
@@ -936,6 +998,9 @@ class MyrientTUI(App):
                     (dest_dir / ".validated").touch()
                 else:
                     raise Exception(f"Unzip failed: {unzip_err}")
+            
+            if self.cancel_flag.is_set():
+                return {"success": False, "cancelled": True}
             
             if self.state.settings.get('auto_convert_chd', False):
                 self.post_message(DownloadProgress(item["id"], item_name, size_bytes, size_bytes, "Converting CHD"))
@@ -976,6 +1041,9 @@ class MyrientTUI(App):
         conversion_targets = [f for f in dest_dir.rglob('*') if f.suffix.lower() in ('.cue', '.iso')]
         
         for file_path in conversion_targets:
+            if self.cancel_flag.is_set():
+                return
+                
             with self.chd_lock:
                 try:
                     proc = subprocess.Popen(
@@ -1024,23 +1092,33 @@ class MyrientTUI(App):
             )
 
     def on_download_complete(self, message: DownloadComplete) -> None:
-        self.global_completed += 1
-        try:
-            self.query_one("#global-progress", ProgressBar).advance(1)
-            self.query_one("#lbl-global-progress", Label).update(
-                f"[bold #E5E50F]Universal Queue Progress: {self.global_completed}/{self.global_total} Games Completed[/]"
-            )
-        except Exception:
-            pass
+        if message.success:
+            self.global_completed += 1
+            try:
+                self.query_one("#global-progress", ProgressBar).advance(1)
+                self.query_one("#lbl-global-progress", Label).update(
+                    f"[bold #E5E50F]Universal Queue Progress: {self.global_completed}/{self.global_total} Games Completed[/]"
+                )
+            except Exception:
+                pass
 
-        current_queue = self.state.get_active_queue()
-        self.state.update_active_queue([i for i in current_queue if i["id"] != message.item["id"]])
-        self._refresh_queue_table()
-        
-        try:
-            self.query_one(f"#cont_pb_{message.item['id']}").remove()
-        except Exception:
-            pass
+            current_queue = self.state.get_active_queue()
+            self.state.update_active_queue([i for i in current_queue if i["id"] != message.item["id"]])
+            self._refresh_queue_table()
+            
+            try:
+                self.query_one(f"#cont_pb_{message.item['id']}").remove()
+            except Exception:
+                pass
+                
+        elif message.cancelled:
+            try:
+                lbl_id = f"lbl_{message.item['id']}"
+                self.query_one(f"#{lbl_id}", Label).update(
+                    f"[bold yellow]Paused[/] | [white]{message.item['name']}[/white]"
+                )
+            except Exception:
+                pass
 
     @work(exclusive=True, thread=True)
     def run_lib_organize(self) -> None:
@@ -1076,7 +1154,7 @@ class MyrientTUI(App):
 
     @work(exclusive=True, thread=True)
     def run_lib_validate(self) -> None:
-        self.post_message(SystemLog("Library Scan: Building target list..."))
+        self.post_message(SystemLog("Scanning library for validation targets..."))
         library = Path(self.state.settings['library_root'])
         
         targets = []
@@ -1104,7 +1182,7 @@ class MyrientTUI(App):
 
     @work(exclusive=True, thread=True)
     def run_lib_convert(self) -> None:
-        self.post_message(SystemLog("Library Scan: Building target list..."))
+        self.post_message(SystemLog("Scanning library for CHD conversion targets..."))
         library = Path(self.state.settings['library_root'])
         
         targets = []
@@ -1163,7 +1241,6 @@ class MyrientTUI(App):
                     dat_base_url = "https://myrient.erista.me/dats/Redump/"
                     
                     try:
-                        # Wget fallback safely avoids urllib Cloudflare 403 blocks
                         html_output = subprocess.check_output(
                             ["wget", "-qO-", dat_base_url], text=True, errors="ignore"
                         )
@@ -1180,7 +1257,6 @@ class MyrientTUI(App):
                         href = a_tag.get('href', '')
                         unquoted_href = unquote(href)
                         if unquoted_href.startswith(target_prefix) and unquoted_href.endswith('.dat'):
-                            # Use exact raw href from server to perfectly preserve %28 parentheses
                             dat_href = href
                             break
                             
