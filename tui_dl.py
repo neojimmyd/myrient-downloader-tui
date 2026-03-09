@@ -5,6 +5,7 @@ A high-performance Textual application for managing Redump libraries.
 """
 
 import concurrent.futures
+import hashlib
 import json
 import logging
 import os
@@ -18,8 +19,9 @@ import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 from collections import deque
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, unquote, urljoin
 
 from bs4 import BeautifulSoup
@@ -30,7 +32,7 @@ from textual.message import Message
 from textual.screen import ModalScreen
 from textual.timer import Timer
 from textual.widgets import (
-    Button, DataTable, DirectoryTree, Footer, Header, Input,
+    Button, DataTable, Footer, Header, Input,
     Label, ListItem, ListView, ProgressBar, RichLog, Select,
     SelectionList, TabbedContent, TabPane, Tree
 )
@@ -204,6 +206,7 @@ class MyrientTUI(App):
     .pane-left { width: 35%; height: 1fr; border: round $primary; padding: 1; }
     .pane-right { width: 65%; height: 1fr; border: round $secondary; padding: 1; }
     .pane-half { width: 50%; height: 1fr; border: round $primary; padding: 1; }
+    .pane-full { width: 100%; height: 1fr; border: round $primary; padding: 1; }
     
     /* Dedicated Library Manager Layout */
     .pane-library-tree { width: 75%; height: 1fr; border: round $primary; padding: 1; }
@@ -226,13 +229,14 @@ class MyrientTUI(App):
     
     #console-list { height: 1fr; margin-bottom: 1; border: solid $secondary; }
     DataTable { border: round $accent; height: 1fr; }
+    Tree { height: 1fr; border: solid $secondary; margin-bottom: 1; }
     .controls { height: auto; align: center middle; margin-top: 1; }
     .top-controls { height: auto; border-bottom: solid $surface-lighten-2; margin-bottom: 1; padding: 1; }
     Button { margin: 0 1; }
     
     .progress-container { height: auto; margin-bottom: 1; }
     RichLog { height: 1fr; border: none; }
-    DirectoryTree { height: 1fr; border: solid $secondary; margin-bottom: 1; }
+    Tree { height: 1fr; border: solid $secondary; margin-bottom: 1; }
     
     #dialog { grid-size: 2; padding: 1 2; width: 60; height: 12; border: thick $primary; background: $surface; align: center middle; }
     #question { column-span: 2; content-align: center middle; height: 1fr; }
@@ -246,7 +250,9 @@ class MyrientTUI(App):
     def __init__(self):
         super().__init__()
         self.state = ConfigManager(CONFIG_FILE)
-        self._link_cache: Dict[str, List[Dict[str, str]]] = {}
+        # TTL-aware cache: stores (data, timestamp) to prevent stale results across long sessions
+        self._link_cache: Dict[str, Tuple[List[Dict[str, str]], float]] = {}
+        self._link_cache_ttl: float = 300.0  # 5-minute TTL
         
         self._all_consoles_data: List[Dict[str, str]] = []
         self._all_games_data: List[Dict[str, str]] = []
@@ -263,8 +269,12 @@ class MyrientTUI(App):
         self.global_completed = 0
         
         # Engine Control State
+        # Use a lock to eliminate the TOCTOU race between checking and setting engine_running
         self.engine_running = False
+        self._engine_lock = threading.Lock()
         self.cancel_flag = threading.Event()
+        # global_completed is incremented from multiple threads; needs its own lock
+        self._progress_lock = threading.Lock()
         
         # UI Debounce Timers
         self._search_timer: Optional[Timer] = None
@@ -351,17 +361,24 @@ class MyrientTUI(App):
                 with Horizontal(classes="horizontal-layout"):
                     with Vertical(classes="pane-library-tree"):
                         yield Label("[bold cyan]Local Storage[/]")
-                        lib_path = Path(self.state.settings["library_root"])
-                        yield DirectoryTree(str(lib_path) if lib_path.exists() else ".", id="lib-tree")
+                        yield Tree("Scanning library...", id="lib-tree")
                         yield Button("Delete Selected File/Folder", id="btn-lib-delete", variant="error")
                     with VerticalScroll(classes="pane-library-ops"):
                         yield Label("[bold #E5E50F]Operations[/]")
                         yield Button("Scan & Organize", id="btn-lib-organize")
-                        yield Button("Validate Hashes", id="btn-lib-validate")
+                        yield Button("Verify Against Redump DAT", id="btn-lib-dat-audit", variant="primary")
                         yield Button("Convert to CHD", id="btn-lib-convert")
-                        yield Label("\n[bold cyan]Audit Selected Folder[/]")
-                        yield Input(placeholder="DAT Path (Blank = Auto-Download)", id="input-dat-path")
-                        yield Button("Run DAT Audit", id="btn-lib-audit", variant="primary")
+                        yield Button("Refresh Status", id="btn-lib-refresh-status")
+                        yield Label(
+                            "\n[bold green]✓[/bold green] Validated  "
+                            "[bold red]✗[/bold red] Corrupted  "
+                            "[yellow]~[/yellow] Incomplete"
+                        )
+                        yield Button(
+                            "Re-queue Failed & Incomplete", 
+                            id="btn-requeue-failed", 
+                            variant="warning"
+                        )
                         
                         yield Label("\n[bold cyan]Operation Status[/]")
                         yield Label("[dim]Idle[/dim]", id="lib-status-label")
@@ -394,12 +411,12 @@ class MyrientTUI(App):
                             id="set-exclude",
                             classes="invisible-unchecked"
                         )
-            
+
             with TabPane("System Logs", id="tab-logs"):
                 with Vertical(classes="pane-full"):
                     yield Label("[bold yellow]Engine Background Events[/]")
                     yield RichLog(id="sys-log", markup=True, wrap=True, max_lines=500)
-                    
+
         yield Footer()
 
     def on_mount(self) -> None:
@@ -411,6 +428,7 @@ class MyrientTUI(App):
         self._refresh_queue_table()
         self._load_settings_toggles()
         self.fetch_consoles()
+        self.run_lib_status_scan()
 
     def _log(self, msg: str, is_error: bool = False) -> None:
         try:
@@ -438,12 +456,16 @@ class MyrientTUI(App):
             pass
 
     # --- Fuzzy Search Engine & Highlighter ---
+    @staticmethod
+    @lru_cache(maxsize=256)
+    def _compile_fuzzy_pattern(query: str) -> re.Pattern:
+        """Cache compiled fuzzy patterns — avoids re-compiling the same query on every keystroke frame."""
+        return re.compile('.*'.join(re.escape(c) for c in query.lower()), re.IGNORECASE)
+
     def fuzzy_match(self, query: str, text: str) -> bool:
         if not query:
             return True
-            
-        pattern = '.*'.join(re.escape(c) for c in query.lower())
-        return re.search(pattern, text.lower()) is not None
+        return self._compile_fuzzy_pattern(query).search(text.lower()) is not None
 
     def fuzzy_highlight_fast(self, text: str, hl_compiled: Optional[re.Pattern]) -> str:
         """Injects explicit [white] tags so text stays visible against dark backgrounds."""
@@ -451,8 +473,9 @@ class MyrientTUI(App):
         
         if not hl_compiled:
             return f"[white]{safe_text}[/white]"
-            
-        match = hl_compiled.search(text)
+        
+        # IMPORTANT: search on safe_text so group positions align with the escaped output
+        match = hl_compiled.search(safe_text)
         if not match:
             return f"[white]{safe_text}[/white]"
             
@@ -460,14 +483,12 @@ class MyrientTUI(App):
         result_array = []
         
         for i, group_text in enumerate(groups):
-            safe_group = group_text.replace("[", "\\[")
-            if not safe_group:
+            if not group_text:
                 continue
-                
             if i % 2 == 1:
-                result_array.append(f"[bold #ff0044]{safe_group}[/]")
+                result_array.append(f"[bold #ff0044]{group_text}[/]")
             else:
-                result_array.append(f"[white]{safe_group}[/white]")
+                result_array.append(f"[white]{group_text}[/white]")
                 
         return "".join(result_array)
 
@@ -588,10 +609,20 @@ class MyrientTUI(App):
     def on_button_pressed(self, event) -> None:
         button_id = event.button.id
         
-        if button_id == "btn-add-queue":
-            self._add_selected_to_queue()
-            
-        elif button_id == "btn-refresh-games" and self.selected_console:
+        # Dispatch table replaces O(n) if/elif chain with O(1) dict lookup
+        simple_dispatch = {
+            "btn-add-queue":          self._add_selected_to_queue,
+            "btn-lib-organize":       self.run_lib_organize,
+            "btn-lib-dat-audit":      self.run_bulk_dat_audit,
+            "btn-lib-convert":        self.run_lib_convert,
+            "btn-lib-refresh-status": self.run_lib_status_scan,
+            "btn-requeue-failed":     self.requeue_failed_games,
+        }
+        if button_id in simple_dispatch:
+            simple_dispatch[button_id]()
+            return
+
+        if button_id == "btn-refresh-games" and self.selected_console:
             self.fetch_games(self.selected_console)
             
         elif button_id == "btn-create-queue":
@@ -641,7 +672,7 @@ class MyrientTUI(App):
                 self.state.save()
                 
                 new_path.mkdir(parents=True, exist_ok=True)
-                self.query_one("#lib-tree", DirectoryTree).path = str(new_path)
+                self.run_lib_status_scan()
                 self.notify("Settings Saved")
                 
                 if self.selected_console:
@@ -651,12 +682,12 @@ class MyrientTUI(App):
                 self.notify(f"Error saving settings: {err}", severity="error")
                 
         elif button_id == "btn-lib-delete":
-            tree = self.query_one("#lib-tree", DirectoryTree)
-            if not tree.cursor_node or not getattr(tree.cursor_node.data, 'path', None):
-                self.notify("Please select a file or folder in the tree first.", severity="warning")
+            tree = self.query_one("#lib-tree", Tree)
+            if not tree.cursor_node or not isinstance(tree.cursor_node.data, Path):
+                self.notify("Please select a game or console folder in the tree first.", severity="warning")
                 return
                 
-            target_path = tree.cursor_node.data.path
+            target_path: Path = tree.cursor_node.data
             
             def check_delete(confirm: bool) -> None:
                 if confirm and target_path:
@@ -665,30 +696,11 @@ class MyrientTUI(App):
                             shutil.rmtree(target_path)
                         else:
                             target_path.unlink()
-                        tree.reload()
+                        self.run_lib_status_scan()
                     except Exception as err:
                         self.notify(f"Error during deletion: {err}", severity="error")
             self.push_screen(ConfirmDeleteScreen(target_path.name), check_delete)
             
-        elif button_id == "btn-lib-organize":
-            self.run_lib_organize()
-            
-        elif button_id == "btn-lib-validate":
-            self.run_lib_validate()
-            
-        elif button_id == "btn-lib-convert":
-            self.run_lib_convert()
-            
-        elif button_id == "btn-lib-audit":
-            tree = self.query_one("#lib-tree", DirectoryTree)
-            if not tree.cursor_node or not getattr(tree.cursor_node.data, 'path', None):
-                self.notify("Please select a Console folder in the tree first.", severity="warning")
-                return
-                
-            selected_path = tree.cursor_node.data.path
-            dat_path_input = self.query_one("#input-dat-path", Input).value.strip()
-            self.run_dat_audit(selected_path, dat_path_input)
-
     def _add_selected_to_queue(self) -> None:
         if not self.selected_console:
             return
@@ -782,8 +794,11 @@ class MyrientTUI(App):
         self.post_message(GamesLoaded(filtered_games))
 
     def _scrape_links(self, url: str) -> List[Dict[str, str]]:
-        if url in self._link_cache:
-            return self._link_cache[url]
+        # Return cached result only if it's still within the TTL window
+        now = time.monotonic()
+        cached = self._link_cache.get(url)
+        if cached and (now - cached[1]) < self._link_cache_ttl:
+            return cached[0]
             
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -813,7 +828,7 @@ class MyrientTUI(App):
                         "size_str": size_str
                     })
                     
-                self._link_cache[url] = items
+                self._link_cache[url] = (items, time.monotonic())
                 return items
                 
         except Exception as err:
@@ -822,16 +837,21 @@ class MyrientTUI(App):
 
     @work(exclusive=True, thread=True)
     def start_download_engine(self) -> None:
-        if self.engine_running:
-            return
-            
+        # Atomic check-and-set: prevents a second invocation from slipping through
+        # the gap between checking engine_running and setting it.
+        with self._engine_lock:
+            if self.engine_running:
+                return
+            self.engine_running = True
+
         queue = self.state.get_active_queue().copy()
         max_threads = self.state.settings.get("max_concurrent", 4)
-        
+
         if not queue:
+            with self._engine_lock:
+                self.engine_running = False
             return
-            
-        self.engine_running = True
+
         self.cancel_flag.clear()
         
         self.global_total = len(queue)
@@ -863,7 +883,8 @@ class MyrientTUI(App):
                     self.post_message(SystemLog(f"Thread crash {futures[future]['name']}: {err}", True))
                     self.post_message(DownloadComplete(futures[future], False))
                     
-        self.engine_running = False
+        with self._engine_lock:
+            self.engine_running = False
         
         if self.cancel_flag.is_set():
             self.post_message(SystemLog("[bold yellow]Downloads Successfully Paused[/]"))
@@ -1009,28 +1030,6 @@ class MyrientTUI(App):
             self.post_message(SystemLog(f"Worker Error {item_name}: {str(err)}", True))
             return {"success": False}
 
-    def _validate_roms(self, dest_dir: Path, silent: bool = False) -> bool:
-        """I/O Block Test: Reads uncompressed media to ensure hard drive sectors are physically readable."""
-        is_valid = True
-        
-        for file_path in dest_dir.rglob('*'):
-            if file_path.is_file() and file_path.suffix.lower() not in ['.zip', '.txt'] and not file_path.name.startswith('.'):
-                try:
-                    with open(file_path, 'rb') as file:
-                        while file.read(1024 * 1024 * 8):  
-                            pass
-                except OSError: 
-                    is_valid = False
-                    
-        if is_valid:
-            (dest_dir / ".corrupted").unlink(missing_ok=True)
-            (dest_dir / ".validated").touch()
-        else:
-            (dest_dir / ".validated").unlink(missing_ok=True)
-            (dest_dir / ".corrupted").touch()
-            
-        return is_valid
-
     def _convert_to_chd(self, dest_dir: Path, silent: bool = False) -> None:
         cpu_count = os.cpu_count()
         cores = str(max(1, cpu_count - 1)) if cpu_count else "1"
@@ -1041,31 +1040,34 @@ class MyrientTUI(App):
             if self.cancel_flag.is_set():
                 return
                 
-            with self.chd_lock:
-                try:
-                    proc = subprocess.Popen(
-                        ["chdman", "createcd", "-numprocessors", cores, "-i", str(file_path), "-o", str(file_path.with_suffix('.chd'))], 
-                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-                    )
-                    self._register_process(proc)
-                    proc.communicate()
-                    self._unregister_process(proc)
-                    
-                    if proc.returncode == 0:
-                        if file_path.suffix.lower() == '.cue':
-                            try:
-                                with open(file_path, 'r', encoding='utf-8', errors='ignore') as cue_file:
-                                    bins = CUE_BIN_REGEX.findall(cue_file.read())
-                                    
+            try:
+                proc = subprocess.Popen(
+                    ["chdman", "createcd", "-numprocessors", cores, "-i", str(file_path), "-o", str(file_path.with_suffix('.chd'))], 
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                )
+                self._register_process(proc)
+                # NOTE: chd_lock previously wrapped proc.communicate(), fully serializing all CHD work
+                # across threads. The lock is no longer needed here — chdman manages its own file I/O
+                # and -numprocessors already limits CPU contention. We only guard post-conversion
+                # file cleanup to prevent concurrent unlinking of the same .bin files.
+                proc.communicate()
+                self._unregister_process(proc)
+                
+                if proc.returncode == 0:
+                    if file_path.suffix.lower() == '.cue':
+                        try:
+                            with open(file_path, 'r', encoding='utf-8', errors='ignore') as cue_file:
+                                bins = CUE_BIN_REGEX.findall(cue_file.read())
+                            with self.chd_lock:  # narrow lock: only around concurrent file removal
                                 for bin_name in bins:
                                     bin_path = file_path.parent / bin_name
                                     if bin_path.exists():
                                         bin_path.unlink()
-                            except Exception:
-                                pass
-                        file_path.unlink()
-                except Exception:
-                    pass
+                        except Exception:
+                            pass
+                    file_path.unlink()
+            except Exception:
+                pass
 
     def on_download_progress(self, message: DownloadProgress) -> None:
         area = self.query_one("#progress-area")
@@ -1090,11 +1092,14 @@ class MyrientTUI(App):
 
     def on_download_complete(self, message: DownloadComplete) -> None:
         if message.success:
-            self.global_completed += 1
+            # Protect counter incremented from concurrent completion callbacks
+            with self._progress_lock:
+                self.global_completed += 1
+                completed_snap = self.global_completed
             try:
                 self.query_one("#global-progress", ProgressBar).advance(1)
                 self.query_one("#lbl-global-progress", Label).update(
-                    f"[bold #E5E50F]Universal Queue Progress: {self.global_completed}/{self.global_total} Games Completed[/]"
+                    f"[bold #E5E50F]Universal Queue Progress: {completed_snap}/{self.global_total} Games Completed[/]"
                 )
             except Exception:
                 pass
@@ -1146,36 +1151,243 @@ class MyrientTUI(App):
                 shutil.move(str(game_dir), str(parent_dir / game_dir.name))
                     
         self.post_message(LibraryProgress("Organize", "Complete", total_ops, total_ops))
-        self.call_from_thread(lambda: self.query_one("#lib-tree", DirectoryTree).reload())
+        self.run_lib_status_scan()
         self.post_message(SystemLog("Clean-up Complete."))
 
     @work(exclusive=True, thread=True)
-    def run_lib_validate(self) -> None:
-        self.post_message(SystemLog("Scanning library for validation targets..."))
+    def run_bulk_dat_audit(self) -> None:
+        """
+        Full-library DAT audit. For every console folder:
+          1. Fetches (or reuses a cached) Redump .dat file from Myrient.
+          2. SHA-1 hashes every .bin/.iso/.cue/.img file.
+          3. Looks each hash up in the DAT and marks the parent game dir
+             .validated (known-good) or .corrupted (unknown/bad dump).
+          4. Reports perfect / misnamed / bad counts per console and a grand total.
+        """
         library = Path(self.state.settings['library_root'])
-        
-        targets = []
-        if library.exists():
-            for game_dir in library.rglob('*'):
-                if game_dir.is_dir() and not game_dir.name.startswith('.') and not any(p.name.startswith('.') for p in game_dir.parents):
-                    if any(f.suffix.lower() in ['.bin', '.iso', '.chd', '.cue'] for f in game_dir.iterdir() if f.is_file()):
-                        if not any(f for f in game_dir.iterdir() if f.name.lower().endswith('.zip')):
-                            if not (game_dir / ".validated").exists():
-                                targets.append(game_dir)
-        
-        total_ops = len(targets)
-        if total_ops == 0:
-            self.post_message(SystemLog("Library Scan: No valid targets found. (Folders already validated)"))
-            self.post_message(LibraryProgress("Validation", "Done", 100, 100))
+        dat_base_url = "https://myrient.erista.me/dats/Redump/"
+        auditable_exts = {'.bin', '.iso', '.cue', '.img'}
+
+        if not library.exists():
+            self.post_message(SystemLog("DAT Audit: Library path not found.", True))
             return
-            
-        for i, game_dir in enumerate(targets, 1):
-            self.post_message(LibraryProgress(f"Validating ({i}/{total_ops})", game_dir.name, i, total_ops))
-            self.post_message(SystemLog(f"Validating: {game_dir.name}"))
-            self._validate_roms(game_dir, silent=True)
-                
-        self.post_message(LibraryProgress("Validation", "Complete", total_ops, total_ops))
-        self.post_message(SystemLog("Deep Validation Finished."))
+
+        # ── Phase 1: discover console dirs ──────────────────────────────────
+        console_dirs = sorted(
+            d for d in library.iterdir()
+            if d.is_dir() and not d.name.startswith('.')
+        )
+        if not console_dirs:
+            self.post_message(SystemLog("DAT Audit: No console folders found in library."))
+            return
+
+        self.post_message(SystemLog(
+            f"DAT Audit: Starting bulk audit of {len(console_dirs)} console(s)..."
+        ))
+
+        # ── Phase 2: fetch the DAT index page once ──────────────────────────
+        self.post_message(LibraryProgress("DAT Audit", "Fetching DAT index...", 0, 100))
+        try:
+            try:
+                index_html = subprocess.check_output(
+                    ["wget", "-qO-", dat_base_url], text=True, errors="ignore"
+                )
+            except Exception:
+                req = urllib.request.Request(
+                    dat_base_url,
+                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                )
+                with urllib.request.urlopen(req, timeout=20) as res:
+                    index_html = res.read().decode('utf-8', errors='ignore')
+
+            soup = BeautifulSoup(index_html, 'html.parser')
+            # Build a lookup: console_name_prefix -> href
+            dat_index: Dict[str, str] = {}
+            for a_tag in soup.find_all('a'):
+                href = a_tag.get('href', '')
+                name = unquote(href)
+                if name.endswith('.dat'):
+                    dat_index[name] = href
+        except Exception as err:
+            self.post_message(SystemLog(f"DAT Audit: Failed to fetch DAT index: {err}", True))
+            self.post_message(LibraryProgress("DAT Audit", "Failed", 0, 100))
+            return
+
+        # ── Phase 3: per-console audit ───────────────────────────────────────
+        grand_perfect = grand_misnamed = grand_bad = grand_skipped = 0
+        dat_cache_root = library / ".dats"
+
+        for con_idx, console_dir in enumerate(console_dirs, 1):
+            console_name = console_dir.name
+            phase_label = f"[{con_idx}/{len(console_dirs)}] {console_name}"
+            self.post_message(LibraryProgress(
+                "DAT Audit", phase_label, con_idx - 1, len(console_dirs)
+            ))
+
+            # ── 3a: find matching DAT ────────────────────────────────────────
+            target_prefix = f"{console_name} - Datfile"
+            dat_href = next(
+                (href for name, href in dat_index.items()
+                 if name.startswith(target_prefix)),
+                None
+            )
+            if not dat_href:
+                self.post_message(SystemLog(
+                    f"DAT Audit [{console_name}]: No matching DAT found — skipping."
+                ))
+                continue
+
+            # ── 3b: download DAT if not cached ──────────────────────────────
+            dat_dir = dat_cache_root / console_name
+            dat_dir.mkdir(parents=True, exist_ok=True)
+            dat_path = dat_dir / unquote(dat_href)
+
+            if not dat_path.exists():
+                dat_url = urljoin(dat_base_url, dat_href)
+                self.post_message(SystemLog(f"DAT Audit [{console_name}]: Downloading DAT..."))
+                try:
+                    proc = subprocess.run(["wget", "-q", "-O", str(dat_path), dat_url])
+                    if proc.returncode != 0:
+                        raise RuntimeError("wget failed")
+                except Exception:
+                    try:
+                        req = urllib.request.Request(
+                            dat_url,
+                            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                        )
+                        with urllib.request.urlopen(req, timeout=30) as res, open(dat_path, 'wb') as f:
+                            shutil.copyfileobj(res, f)
+                    except Exception as err:
+                        self.post_message(SystemLog(
+                            f"DAT Audit [{console_name}]: Could not download DAT: {err}", True
+                        ))
+                        continue
+
+            # ── 3c: parse DAT into sha1 → {name, game} ──────────────────────
+            dat_by_sha1: Dict[str, Dict[str, str]] = {}
+            try:
+                context = ET.iterparse(dat_path, events=('start', 'end'))
+                _, xml_root = next(context)
+                current_game = "Unknown"
+                for event, elem in context:
+                    if event == 'start' and elem.tag == 'game':
+                        current_game = elem.get('name', 'Unknown')
+                    elif event == 'end' and elem.tag == 'rom':
+                        sha1_val = elem.get('sha1')
+                        rom_name = elem.get('name')
+                        if sha1_val and rom_name:
+                            dat_by_sha1[sha1_val.lower()] = {
+                                "name": rom_name, "game": current_game
+                            }
+                        elem.clear()
+                    elif event == 'end' and elem.tag == 'game':
+                        xml_root.clear()
+            except Exception as err:
+                self.post_message(SystemLog(
+                    f"DAT Audit [{console_name}]: Failed to parse DAT: {err}", True
+                ))
+                continue
+
+            # ── 3d: collect game dirs and their auditable files ──────────────
+            # A "game dir" is any non-hidden leaf directory containing auditable files.
+            # We group files by their immediate parent so the .validated/.corrupted
+            # marker lands on the game folder, not the console folder.
+            game_dirs: Dict[Path, List[Path]] = {}
+            for item in console_dir.rglob('*'):
+                if (item.is_file()
+                        and not item.name.startswith('.')
+                        and not any(p.name.startswith('.') for p in item.parents)
+                        and item.suffix.lower() in auditable_exts):
+                    game_dirs.setdefault(item.parent, []).append(item)
+
+            if not game_dirs:
+                self.post_message(SystemLog(
+                    f"DAT Audit [{console_name}]: No auditable files found."
+                ))
+                continue
+
+            # ── 3e: hash every file and judge each game dir ──────────────────
+            con_perfect = con_misnamed = con_bad = 0
+            all_files = [(gd, fp) for gd, fps in game_dirs.items() for fp in fps]
+            total_files = len(all_files)
+
+            for f_idx, (game_dir, file_path) in enumerate(all_files, 1):
+                self.post_message(LibraryProgress(
+                    f"Hashing {console_name} ({f_idx}/{total_files})",
+                    file_path.name, f_idx, total_files
+                ))
+
+                sha1 = hashlib.sha1()
+                try:
+                    with open(file_path, 'rb') as fh:
+                        while chunk := fh.read(8 * 1024 * 1024):
+                            sha1.update(chunk)
+                    file_hash = sha1.hexdigest().lower()
+
+                    if file_hash in dat_by_sha1:
+                        expected_name = dat_by_sha1[file_hash]['name']
+                        if file_path.name == expected_name:
+                            con_perfect += 1
+                        else:
+                            con_misnamed += 1
+                            self.post_message(SystemLog(
+                                f"Misnamed [{console_name}]: '{file_path.name}' → '{expected_name}'"
+                            ))
+                    else:
+                        con_bad += 1
+                        self.post_message(SystemLog(
+                            f"Bad/Unknown [{console_name}]: '{file_path.name}' (SHA1: {file_hash})"
+                        ))
+                except Exception as err:
+                    con_bad += 1
+                    self.post_message(SystemLog(
+                        f"Read error [{console_name}]: '{file_path.name}': {err}", True
+                    ))
+
+            # ── 3f: write markers per game dir based on its files' results ───
+            # A dir is "validated" only if every file in it is a known-good hash.
+            # Any unknown or unreadable file marks the whole dir corrupted.
+            for game_dir, files in game_dirs.items():
+                dir_ok = True
+                for fp in files:
+                    sha1 = hashlib.sha1()
+                    try:
+                        with open(fp, 'rb') as fh:
+                            while chunk := fh.read(8 * 1024 * 1024):
+                                sha1.update(chunk)
+                        if sha1.hexdigest().lower() not in dat_by_sha1:
+                            dir_ok = False
+                            break
+                    except Exception:
+                        dir_ok = False
+                        break
+
+                if dir_ok:
+                    (game_dir / ".corrupted").unlink(missing_ok=True)
+                    (game_dir / ".validated").touch()
+                else:
+                    (game_dir / ".validated").unlink(missing_ok=True)
+                    (game_dir / ".corrupted").touch()
+
+            self.post_message(SystemLog(
+                f"DAT Audit [{console_name}]: "
+                f"Perfect: {con_perfect}  Misnamed: {con_misnamed}  Bad/Unknown: {con_bad}"
+            ))
+            grand_perfect  += con_perfect
+            grand_misnamed += con_misnamed
+            grand_bad      += con_bad
+
+        # ── Phase 4: finish ──────────────────────────────────────────────────
+        self.post_message(LibraryProgress("DAT Audit", "Complete", 100, 100))
+        self.post_message(SystemLog(
+            f"[bold]Bulk DAT Audit Complete[/bold] — "
+            f"Perfect: [bold green]{grand_perfect}[/]  "
+            f"Misnamed: [bold yellow]{grand_misnamed}[/]  "
+            f"Bad/Unknown: [bold red]{grand_bad}[/]"
+        ))
+        self.run_lib_status_scan()
+
+
 
     @work(exclusive=True, thread=True)
     def run_lib_convert(self) -> None:
@@ -1186,8 +1398,10 @@ class MyrientTUI(App):
         if library.exists():
             for game_dir in library.rglob('*'):
                 if game_dir.is_dir() and not game_dir.name.startswith('.') and not any(p.name.startswith('.') for p in game_dir.parents):
-                    if any(f.suffix.lower() in ['.bin', '.iso', '.cue'] for f in game_dir.iterdir() if f.is_file()):
-                        if not any(f for f in game_dir.iterdir() if f.name.lower().endswith('.zip')):
+                    # Cache iterdir() — previously called 3x per directory
+                    dir_files = [f for f in game_dir.iterdir() if f.is_file()]
+                    if any(f.suffix.lower() in ['.bin', '.iso', '.cue'] for f in dir_files):
+                        if not any(f.name.lower().endswith('.zip') for f in dir_files):
                             if not (game_dir / ".corrupted").exists():
                                 targets.append(game_dir)
                     
@@ -1206,100 +1420,148 @@ class MyrientTUI(App):
         self.post_message(SystemLog("Bulk CHD Conversion Finished."))
 
     @work(exclusive=True, thread=True)
-    def run_dat_audit(self, console_path: Path, manual_dat_path: str = "") -> None:
-        if not console_path.is_dir():
-            self.post_message(SystemLog("Audit Error: Selected path must be a directory.", True))
-            return
-            
-        if console_path == Path(self.state.settings['library_root']):
-            self.post_message(SystemLog("Audit Error: Please select a specific console folder, not the root library.", True))
-            self.post_message(LibraryProgress("DAT Audit", "Failed", 0, 100))
-            return
-            
-        console_name = console_path.name
-        self.post_message(SystemLog(f"Auditing {console_name} against DAT..."))
-        self.post_message(LibraryProgress("DAT Audit", "Initializing...", 0, 100))
+    def run_lib_status_scan(self) -> None:
+        """Scans the library and rebuilds the Tree with color-coded game status nodes."""
+        library = Path(self.state.settings['library_root'])
         
-        try:
-            if manual_dat_path:
-                dat_path = Path(manual_dat_path)
-                if not dat_path.exists():
-                    raise FileNotFoundError(f"Provided DAT path does not exist: {dat_path}")
-            else:
-                self.post_message(LibraryProgress("DAT Audit", "Fetching DAT from Myrient...", 10, 100))
-                
-                dat_dir = Path(self.state.settings['library_root']) / ".dats" / console_name
-                dat_dir.mkdir(exist_ok=True, parents=True)
-                
-                dats = list(dat_dir.glob("*.dat"))
-                if dats:
-                    dat_path = dats[0]
-                else:
-                    dat_base_url = "https://myrient.erista.me/dats/Redump/"
-                    
-                    try:
-                        html_output = subprocess.check_output(
-                            ["wget", "-qO-", dat_base_url], text=True, errors="ignore"
-                        )
-                    except Exception:
-                        req = urllib.request.Request(dat_base_url, headers={'User-Agent': 'Mozilla/5.0'})
-                        with urllib.request.urlopen(req, timeout=20) as res:
-                            html_output = res.read().decode('utf-8', errors='ignore')
-                            
-                    soup = BeautifulSoup(html_output, 'html.parser')
-                    target_prefix = f"{console_name} - Datfile"
-                    dat_href = None
-                    
-                    for a_tag in soup.find_all('a'):
-                        href = a_tag.get('href', '')
-                        unquoted_href = unquote(href)
-                        if unquoted_href.startswith(target_prefix) and unquoted_href.endswith('.dat'):
-                            dat_href = href
-                            break
-                            
-                    if not dat_href:
-                        raise Exception(f"Could not find a Myrient .dat file for '{console_name}'. Ensure folder matches Myrient naming.")
-                        
-                    dat_url = urljoin(dat_base_url, dat_href)
-                    dat_path = dat_dir / unquote(dat_href)
-                    
-                    self.post_message(SystemLog(f"Downloading DAT: {dat_url}"))
-                    proc = subprocess.run(["wget", "-q", "-O", str(dat_path), dat_url])
-                    
-                    if proc.returncode != 0:
-                        req = urllib.request.Request(dat_url, headers={'User-Agent': 'Mozilla/5.0'})
-                        with urllib.request.urlopen(req, timeout=30) as res, open(dat_path, 'wb') as file:
-                            shutil.copyfileobj(res, file)
-            
-            self.post_message(LibraryProgress("DAT Audit", "Parsing XML...", 25, 100))
-            
-            dat_games = set()
-            context = ET.iterparse(dat_path, events=('start', 'end'))
-            _, root = next(context)
-            
-            for event, elem in context:
-                if event == 'end' and elem.tag == 'game':
-                    if game_name := elem.get('name'):
-                        dat_games.add(game_name)
-                    root.clear() 
-                    
-            self.post_message(LibraryProgress("DAT Audit", "Comparing local folders...", 50, 100))
-            
-            local_games = set()
-            for item in console_path.rglob('*'):
-                if item.is_dir() and not item.name.startswith('.') and not any(p.name.startswith('.') for p in item.parents):
-                    if any(f.suffix.lower() in ['.bin', '.iso', '.chd', '.cue', '.zip'] for f in item.iterdir() if f.is_file()):
-                        local_games.add(item.name)
-            
-            found = len(local_games.intersection(dat_games))
-            missing = len(dat_games.difference(local_games))
-            
-            self.post_message(LibraryProgress("DAT Audit", f"Found: {found} | Missing: {missing}", 100, 100))
-            self.post_message(SystemLog(f"Audit Result: {found} found, {missing} missing in {console_name}."))
-            
-        except Exception as err:
-            self.post_message(LibraryProgress("DAT Audit", "Failed", 0, 100))
-            self.post_message(SystemLog(f"Audit Error: {err}", True))
+        # Build the full structure in the thread — no UI calls here
+        # structure: {console_name: (console_path, [(game_dir, status_str), ...])}
+        structure: Dict[str, tuple] = {}
+        
+        if library.exists():
+            for console_dir in sorted(library.iterdir()):
+                if console_dir.is_dir() and not console_dir.name.startswith('.'):
+                    games = []
+                    for item in sorted(console_dir.rglob('*')):
+                        if not item.is_dir() or item.name.startswith('.'):
+                            continue
+                        if any(p.name.startswith('.') for p in item.parents):
+                            continue
+                        # Only include leaf dirs that contain actual game files, partial zips, or are empty
+                        # (an empty folder = the download was started/queued but nothing arrived yet)
+                        try:
+                            dir_files = [f for f in item.iterdir() if f.is_file() and not f.name.startswith('.')]
+                        except PermissionError:
+                            continue
+                        has_game = any(f.suffix.lower() in ('.bin', '.iso', '.cue', '.chd', '.img') for f in dir_files)
+                        has_zip  = any(f.suffix.lower() == '.zip' for f in dir_files)
+                        is_empty = len(dir_files) == 0
+                        if not (has_game or has_zip or is_empty):
+                            continue
+                        if (item / ".validated").exists():
+                            status = "validated"
+                        elif (item / ".corrupted").exists():
+                            status = "corrupted"
+                        else:
+                            status = "incomplete"
+                        games.append((item, status))
+                    if games:
+                        structure[console_dir.name] = (console_dir, games)
+
+        def _build_tree() -> None:
+            try:
+                tree = self.query_one("#lib-tree", Tree)
+                tree.clear()
+                tree.root.label = f"[bold]{library.name if library.exists() else 'Library'}[/bold]"
+
+                for console_name, (console_path, games) in structure.items():
+                    n_ok   = sum(1 for _, s in games if s == "validated")
+                    n_bad  = sum(1 for _, s in games if s == "corrupted")
+                    n_inc  = sum(1 for _, s in games if s == "incomplete")
+                    badges = " ".join(filter(None, [
+                        f"[bold green]{n_ok}✓[/]"   if n_ok  else "",
+                        f"[bold red]{n_bad}✗[/]"     if n_bad else "",
+                        f"[yellow]{n_inc}~[/yellow]" if n_inc else "",
+                    ]))
+                    console_node = tree.root.add(
+                        f"[bold cyan]{console_name}[/]  {badges}",
+                        data=console_path
+                    )
+                    for game_dir, status in games:
+                        if status == "validated":
+                            label = f"[bold green]✓  {game_dir.name}[/]"
+                        elif status == "corrupted":
+                            label = f"[bold red]✗  {game_dir.name}[/]"
+                        else:
+                            label = f"[yellow]~  {game_dir.name}[/yellow]"
+                        console_node.add_leaf(label, data=game_dir)
+
+                tree.root.expand()
+            except Exception:
+                pass
+
+        self.call_from_thread(_build_tree)
+
+    @work(exclusive=True, thread=True)
+    def requeue_failed_games(self) -> None:
+        """Finds all corrupted and incomplete game dirs and adds them to the active download queue."""
+        library = Path(self.state.settings['library_root'])
+        if not library.exists():
+            self.post_message(SystemLog("Re-queue: Library path not found.", True))
+            return
+
+        targets: List[tuple] = []  # (console_name, game_dir, status)
+        for console_dir in sorted(library.iterdir()):
+            if not console_dir.is_dir() or console_dir.name.startswith('.'):
+                continue
+            console_name = console_dir.name
+            for item in sorted(console_dir.rglob('*')):
+                if not item.is_dir() or item.name.startswith('.'):
+                    continue
+                if any(p.name.startswith('.') for p in item.parents):
+                    continue
+                try:
+                    dir_files = [f for f in item.iterdir() if f.is_file() and not f.name.startswith('.')]
+                except PermissionError:
+                    continue
+                has_game = any(f.suffix.lower() in ('.bin', '.iso', '.cue', '.chd', '.img') for f in dir_files)
+                has_zip  = any(f.suffix.lower() == '.zip' for f in dir_files)
+                is_empty = len(dir_files) == 0
+                if not (has_game or has_zip or is_empty):
+                    continue
+                if not (item / ".validated").exists():
+                    status = "corrupted" if (item / ".corrupted").exists() else "incomplete"
+                    targets.append((console_name, item, status))
+
+        if not targets:
+            self.post_message(SystemLog("Re-queue: No incomplete or corrupted games found. Library looks clean!"))
+            return
+
+        current_queue  = self.state.get_active_queue()
+        existing_paths = {i["dest_path"] for i in current_queue}
+        added = 0
+
+        for console_name, game_dir, status in targets:
+            if str(game_dir) in existing_paths:
+                continue
+            # Reconstruct the Myrient download URL from the library directory structure.
+            # The zip filename is always: game_dir.name + ".zip"
+            game_zip  = game_dir.name + ".zip"
+            game_url  = BASE_URL + quote(console_name + "/", safe="") + quote(game_zip, safe="")
+            flag      = "[bold red]corrupted[/]" if status == "corrupted" else "[yellow]incomplete[/]"
+            current_queue.append({
+                "id":        f"dl_{uuid.uuid4().hex[:8]}",
+                "name":      f"[{console_name}] {game_zip}  {flag}",
+                "game_url":  game_url,
+                "dest_path": str(game_dir),
+                "size_str":  "N/A",
+            })
+            existing_paths.add(str(game_dir))
+            added += 1
+
+        if added:
+            self.state.update_active_queue(current_queue)
+            self.call_from_thread(self._refresh_queue_table)
+            # Switch to the queue tab so the user can see what was added
+            self.call_from_thread(
+                lambda: setattr(self.query_one("#tabs", TabbedContent), "active", "tab-queue-dl")
+            )
+
+        self.post_message(SystemLog(
+            f"Re-queued [bold]{added}[/bold] game(s): "
+            f"{sum(1 for _,_,s in targets if s=='corrupted')} corrupted, "
+            f"{sum(1 for _,_,s in targets if s=='incomplete')} incomplete."
+        ))
 
     def _parse_size_bytes(self, size_str: str) -> int:
         if not size_str or size_str == "N/A":
