@@ -204,7 +204,6 @@ class MyrientTUI(App):
     .pane-left { width: 35%; height: 1fr; border: round $primary; padding: 1; }
     .pane-right { width: 65%; height: 1fr; border: round $secondary; padding: 1; }
     .pane-half { width: 50%; height: 1fr; border: round $primary; padding: 1; }
-    .pane-full { width: 100%; height: 1fr; border: round $primary; padding: 1; }
     
     /* Dedicated Library Manager Layout */
     .pane-library-tree { width: 75%; height: 1fr; border: round $primary; padding: 1; }
@@ -304,7 +303,7 @@ class MyrientTUI(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with TabbedContent(id="tabs"):
-            with TabPane("🌐 Browser", id="tab-browser"):
+            with TabPane("Browser", id="tab-browser"):
                 with Horizontal(classes="horizontal-layout"):
                     with Vertical(classes="pane-left"):
                         yield Label("[bold #E5E50F]Consoles[/]")
@@ -326,7 +325,7 @@ class MyrientTUI(App):
                             yield Button("Queue Selected", id="btn-add-queue", variant="success")
                             yield Button("Refresh", id="btn-refresh-games")
 
-            with TabPane("📋 Queue & Downloads", id="tab-queue-dl"):
+            with TabPane("Queue & Downloads", id="tab-queue-dl"):
                 with Horizontal(classes="horizontal-layout"):
                     with Vertical(classes="pane-queue"):
                         with Horizontal(classes="top-controls"):
@@ -348,7 +347,7 @@ class MyrientTUI(App):
                         yield ProgressBar(id="global-progress", show_eta=True)
                         yield Label("\n[bold cyan]Active Threads (Real-Time I/O)[/]")
 
-            with TabPane("📁 Library Manager", id="tab-library"):
+            with TabPane("Library Manager", id="tab-library"):
                 with Horizontal(classes="horizontal-layout"):
                     with Vertical(classes="pane-library-tree"):
                         yield Label("[bold cyan]Local Storage[/]")
@@ -368,7 +367,7 @@ class MyrientTUI(App):
                         yield Label("[dim]Idle[/dim]", id="lib-status-label")
                         yield ProgressBar(id="lib-progress-bar", show_eta=True)
 
-            with TabPane("⚙️ Settings", id="tab-settings"):
+            with TabPane("Settings", id="tab-settings"):
                 with Horizontal(classes="horizontal-layout"):
                     with VerticalScroll(classes="pane-half"):
                         yield Label("[bold cyan]System Paths[/]")
@@ -396,7 +395,7 @@ class MyrientTUI(App):
                             classes="invisible-unchecked"
                         )
             
-            with TabPane("📜 System Logs", id="tab-logs"):
+            with TabPane("System Logs", id="tab-logs"):
                 with Vertical(classes="pane-full"):
                     yield Label("[bold yellow]Engine Background Events[/]")
                     yield RichLog(id="sys-log", markup=True, wrap=True, max_lines=500)
@@ -472,7 +471,7 @@ class MyrientTUI(App):
                 
         return "".join(result_array)
 
-    def on_input_changed(self, event: Input.Changed) -> None:
+    def on_input_changed(self, event) -> None:
         """Debounces search input to prevent UI stutter during rapid typing."""
         if self._search_timer is not None:
             self._search_timer.stop()
@@ -565,16 +564,13 @@ class MyrientTUI(App):
             except Exception:
                 pass
 
-    def on_select_changed(self, event: Select.Changed) -> None:
+    def on_select_changed(self, event) -> None:
         if event.control.id == "queue-select" and event.value != Select.BLANK:
             self.state.set_active_queue(str(event.value))
             self._refresh_queue_table()
             self.notify(f"Switched to: {event.value}")
 
-    def on_tree_node_highlighted(self, event) -> None:
-        self.selected_lib_path = getattr(event.node.data, 'path', None)
-
-    async def on_list_view_selected(self, event: ListView.Selected) -> None:
+    async def on_list_view_selected(self, event) -> None:
         list_id = getattr(event.list_view, "id", None)
         
         if list_id == "console-list":
@@ -589,7 +585,7 @@ class MyrientTUI(App):
                 self.query_one("#search-games", Input).value = ""
                 self.fetch_games(data)
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
+    def on_button_pressed(self, event) -> None:
         button_id = event.button.id
         
         if button_id == "btn-add-queue":
@@ -888,6 +884,7 @@ class MyrientTUI(App):
                 self.post_message(SystemLog(f"Skipped (Already Exists): {item_name}"))
                 return {"success": True}
                 
+            # Prevent ZeroDivisionErrors by ensuring byte math is >= 1
             size_bytes = max(self._parse_size_bytes(item["size_str"]), 1)
             
             cmd = [
