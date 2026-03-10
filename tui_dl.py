@@ -33,9 +33,8 @@ from textual.timer import Timer
 from textual.widgets import (
     Button, DataTable, Footer, Header, Input,
     Label, ListItem, ListView, ProgressBar, RichLog, Select,
-    SelectionList, TabbedContent, TabPane, Tree
+    Switch, TabbedContent, TabPane, Tree
 )
-from textual.widgets.selection_list import Selection
 
 # --- Global Configurations & Pre-Compiled Regex ---
 logging.basicConfig(
@@ -233,62 +232,38 @@ class MyrientTUI(App):
 
     /* ── Lists ────────────────────────────────────────────────────────────── */
     #console-list   { height: 1fr; border: solid $surface-lighten-2; }
-    DataTable       { height: 1fr; border: solid $surface-lighten-2; }
+    #queue-table    { height: 1fr; border: solid $surface-lighten-2; }
     Tree            { height: 1fr; border: solid $surface-lighten-2; margin-bottom: 1; }
 
-    /* ── Game list: hide checkbox, fade unselected, full-row highlight ───────
-       SelectionList renders each option as a ToggleButton. The glyph lives
-       inside .toggle--button — zeroing its width hides it without display:none
-       which would also break keyboard navigation.                            */
-    #game-list {
-        height: 1fr;
-        border: solid $surface-lighten-2;
-        background: $surface-darken-1;
-        color: $surface-darken-1;
-    }
-    /* Hide the [X] / [ ] glyph entirely */
-    #game-list .toggle--button {
-        width: 0;
-        min-width: 0;
-        padding: 0;
-        margin: 0;
-    }
-    /* Cursor row — make it readable while navigating */
-    #game-list .selection-list--option-highlighted {
-        background: $surface-lighten-1;
-        color: $text;
-    }
-    /* Selected row — full green background, whole line pops */
-    #game-list .selection-list--option-selected {
-        background: $success-darken-2;
-        color: $success;
-        text-style: bold;
-    }
-    /* Selected + cursor — slightly brighter so position is still visible */
-    #game-list .selection-list--option-selected.selection-list--option-highlighted {
-        background: $success-darken-1;
-        color: $success;
-        text-style: bold;
-    }
-    .filter-list    {
+    /* ── Filter DataTables (Settings) ────────────────────────────────────── */
+    .filter-table {
         height: 8;
         border: solid $surface-lighten-2;
         margin-bottom: 1;
+        background: $surface-darken-2;
     }
-    .filter-list > .selection--selected {
-        background: $primary-darken-2;
-        color: $primary-lighten-2;
+    .filter-table > .datatable--header { display: none; }
+    .filter-table > .datatable--cursor { background: $primary-darken-2; }
+
+    /* ── Game list (DataTable — virtual, handles 10k+ rows) ────────────────
+       Unselected games are dimmed so selected games pop visually.
+       Green bold text + checkmark = selected. Cursor = navigation.         */
+    #game-list {
+        height: 1fr;
+        border: solid $surface-lighten-2;
+        background: $surface-darken-2;
+    }
+    #game-list > .datatable--header { display: none; }
+    #game-list > .datatable--cursor { background: $primary-darken-2; }
+    /* Selection counter shown above Queue button */
+    #game-selection-count {
+        height: auto;
+        color: $success;
         text-style: bold;
+        margin: 0 0 1 0;
+        text-align: right;
     }
-    .filter-list > .selection--highlighted {
-        background: $surface-lighten-1;
-        color: $text;
-    }
-    .filter-list > .selection--selected.selection--highlighted {
-        background: $primary-darken-1;
-        color: $primary-lighten-2;
-        text-style: bold;
-    }
+
     .btn-row        { height: auto; align: center middle; margin-top: 1; }
     Button          { margin: 0 1; min-width: 16; }
 
@@ -372,8 +347,27 @@ class MyrientTUI(App):
         # global_completed is incremented from multiple threads; needs its own lock
         self._progress_lock = threading.Lock()
         
+        # Game selection state (url_parts of games staged for queue)
+        self._selected_games: set = set()
+        # Filter selection state (mirrors DataTable rows for include/exclude filters)
+        self._filter_include_sel: set = set()
+        self._filter_exclude_sel: set = set()
+
         # UI Debounce Timers
         self._search_timer: Optional[Timer] = None
+
+    def action_refresh_browser(self) -> None:
+        """Ctrl+R: re-scrape console list (bypasses cache)."""
+        self._link_cache.clear()
+        self._all_games_data = []
+        self._games_lookup = {}
+        self._selected_games.clear()
+        self._update_selection_count()
+        try:
+            self.query_one("#game-list", DataTable).clear()
+        except Exception:
+            pass
+        self.fetch_consoles()
 
     def _register_process(self, proc: subprocess.Popen) -> None:
         with self.proc_lock:
@@ -426,18 +420,19 @@ class MyrientTUI(App):
 
                     with Vertical(classes="pane pane-65"):
                         yield Label(
-                            "Games  [dim](Space = select  ·  Enter = queue)[/dim]",
+                            "Games  [dim]Space = select · Q = queue selected[/dim]",
                             classes="section-header",
                         )
                         yield Input(
-                            placeholder="Filter games…",
+                            placeholder="Search games…",
                             id="search-games",
                             classes="search-bar",
                         )
-                        yield SelectionList(id="game-list")
+                        yield DataTable(id="game-list", cursor_type="row", zebra_stripes=False)
+                        yield Label("", id="game-selection-count")
                         with Horizontal(classes="btn-row"):
-                            yield Button("Queue Selected", id="btn-add-queue", variant="success")
-                            yield Button("↺  Refresh List", id="btn-refresh-games", variant="default")
+                            yield Button("Queue Selected  [dim](Q)[/dim]", id="btn-add-queue", variant="success")
+                            yield Button("↺  Refresh", id="btn-refresh-games", variant="default")
 
             # ── Queue & Downloads ─────────────────────────────────────────────
             with TabPane("  Queue & Downloads  ", id="tab-queue-dl"):
@@ -534,7 +529,6 @@ class MyrientTUI(App):
                             id="set-threads",
                         )
                         yield Label("Post-download CHD conversion", classes="setting-label")
-                        from textual.widgets import Switch
                         yield Switch(
                             value=self.state.settings.get("auto_convert_chd", False),
                             id="set-auto-chd",
@@ -547,26 +541,13 @@ class MyrientTUI(App):
                             "[dim]Only show games matching these tags (empty = show all)[/dim]",
                             classes="setting-label",
                         )
-                        yield SelectionList(
-                            Selection("USA",    "USA"),
-                            Selection("Europe", "Europe"),
-                            Selection("Japan",  "Japan"),
-                            Selection("World",  "World"),
-                            id="set-include",
-                            classes="filter-list",
-                        )
+                        yield DataTable(id="set-include", classes="filter-table")
                         yield Label("Type Exclude Filter", classes="section-header")
                         yield Label(
                             "[dim]Hide games matching these tags[/dim]",
                             classes="setting-label",
                         )
-                        yield SelectionList(
-                            Selection("Demo",  "Demo"),
-                            Selection("Beta",  "Beta"),
-                            Selection("Proto", "Proto"),
-                            id="set-exclude",
-                            classes="filter-list",
-                        )
+                        yield DataTable(id="set-exclude", classes="filter-table")
 
             # ── Logs ──────────────────────────────────────────────────────────
             with TabPane("  Logs  ", id="tab-logs"):
@@ -576,10 +557,29 @@ class MyrientTUI(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        # Queue table
         table = self.query_one("#queue-table", DataTable)
         table.add_columns("Game Name", "Size", "Target Path")
         table.cursor_type = "row"
-        
+
+        # Game browser table — virtual rendering, no header
+        game_table = self.query_one("#game-list", DataTable)
+        game_table.add_column("", key="sel", width=3)
+        game_table.add_column("Game", key="name")
+        game_table.add_column("Size", key="size", width=10)
+        game_table.show_header = False
+
+        # Filter tables — same checkmark design, fixed rows
+        _INCLUDE_OPTS = [("USA", "USA"), ("Europe", "Europe"), ("Japan", "Japan"), ("World", "World")]
+        _EXCLUDE_OPTS = [("Demo", "Demo"), ("Beta", "Beta"), ("Proto", "Proto")]
+        for tbl_id, opts in (("set-include", _INCLUDE_OPTS), ("set-exclude", _EXCLUDE_OPTS)):
+            tbl = self.query_one(f"#{tbl_id}", DataTable)
+            tbl.add_column("", key="sel", width=3)
+            tbl.add_column("Tag", key="name")
+            tbl.show_header = False
+            for label, value in opts:
+                tbl.add_row("[dim] [/dim]", f"[dim]{label}[/dim]", key=value)
+
         self._refresh_queue_dropdown()
         self._refresh_queue_table()
         self._load_settings_toggles()
@@ -665,6 +665,108 @@ class MyrientTUI(App):
                 
         return "".join(result_array)
 
+    def on_key(self, event) -> None:
+        """Space toggles selections; Q queues games — routing depends on which widget is focused."""
+        focused = self.focused
+        fid = getattr(focused, "id", None)
+        if fid == "game-list":
+            if event.key == "space":
+                self._toggle_game_at_cursor()
+                event.prevent_default()
+                event.stop()
+            elif event.key == "q":
+                self._add_selected_to_queue()
+                event.prevent_default()
+                event.stop()
+        elif fid in ("set-include", "set-exclude"):
+            if event.key == "space":
+                self._toggle_filter_at_cursor(fid)
+                event.prevent_default()
+                event.stop()
+
+    def _toggle_game_at_cursor(self) -> None:
+        """Toggle selection on the currently highlighted DataTable row."""
+        try:
+            game_table = self.query_one("#game-list", DataTable)
+            if game_table.cursor_row is None:
+                return
+            rows = list(game_table.ordered_rows)
+            if not rows or game_table.cursor_row >= len(rows):
+                return
+            url_part = rows[game_table.cursor_row].key.value
+            if not url_part or url_part in ("LOADING", "EMPTY"):
+                return
+            if url_part in self._selected_games:
+                self._selected_games.discard(url_part)
+            else:
+                self._selected_games.add(url_part)
+            self._refresh_game_row(game_table, url_part)
+            self._update_selection_count()
+        except Exception:
+            pass
+
+    def _refresh_game_row(self, game_table: DataTable, url_part: str) -> None:
+        """Update a single row's visual to reflect its current selection state."""
+        game_data = self._games_lookup.get(url_part)
+        if not game_data:
+            return
+        selected = url_part in self._selected_games
+        sel_mark = "[bold green]✓[/]" if selected else "[dim] [/dim]"
+        name_str = game_data["name"]
+        name_markup = (
+            f"[bold green]{name_str}[/]" if selected else f"[dim]{name_str}[/dim]"
+        )
+        try:
+            game_table.update_cell(url_part, "sel", sel_mark, update_width=False)
+            game_table.update_cell(url_part, "name", name_markup, update_width=False)
+        except Exception:
+            pass
+
+    def _update_selection_count(self) -> None:
+        count = len(self._selected_games)
+        try:
+            lbl = self.query_one("#game-selection-count", Label)
+            if count == 0:
+                lbl.update("")
+            elif count == 1:
+                lbl.update("[bold green]1 game selected[/]")
+            else:
+                lbl.update(f"[bold green]{count} games selected[/]")
+        except Exception:
+            pass
+
+    def _toggle_filter_at_cursor(self, table_id: str) -> None:
+        """Toggle a filter tag selection at the current cursor row."""
+        sel_set = self._filter_include_sel if table_id == "set-include" else self._filter_exclude_sel
+        try:
+            tbl = self.query_one(f"#{table_id}", DataTable)
+            if tbl.cursor_row is None:
+                return
+            rows = list(tbl.ordered_rows)
+            if not rows or tbl.cursor_row >= len(rows):
+                return
+            tag = rows[tbl.cursor_row].key.value
+            if not tag:
+                return
+            if tag in sel_set:
+                sel_set.discard(tag)
+            else:
+                sel_set.add(tag)
+            self._refresh_filter_row(tbl, tag, sel_set)
+        except Exception:
+            pass
+
+    def _refresh_filter_row(self, tbl: DataTable, tag: str, sel_set: set) -> None:
+        """Re-render a single filter row to reflect its current selection state."""
+        selected = tag in sel_set
+        sel_mark   = "[bold cyan]✓[/]"       if selected else "[dim] [/dim]"
+        name_markup = f"[bold cyan]{tag}[/]" if selected else f"[dim]{tag}[/dim]"
+        try:
+            tbl.update_cell(tag, "sel",  sel_mark,    update_width=False)
+            tbl.update_cell(tag, "name", name_markup, update_width=False)
+        except Exception:
+            pass
+
     def on_input_changed(self, event) -> None:
         """Debounces search input to prevent UI stutter during rapid typing."""
         if self._search_timer is not None:
@@ -696,23 +798,40 @@ class MyrientTUI(App):
             list_view.mount(*new_items)
 
     def _render_games(self, query: str = "") -> None:
-        game_list = self.query_one("#game-list", SelectionList)
-        game_list.clear_options()
+        """
+        Repopulate the game DataTable, preserving selection state across searches.
+        DataTable is virtualised — clearing and re-adding 1000+ rows is fast because
+        only visible rows are actually rendered.
+        """
+        game_table = self.query_one("#game-list", DataTable)
+        game_table.clear()
+
+        if not self._all_games_data:
+            return
 
         fuzzy_pat   = self._compile_fuzzy_pattern(query) if query else None
         hl_compiled = self._compile_highlight_pattern(query) if query else None
 
-        selections = []
+        found = 0
         for game in self._all_games_data:
-            if fuzzy_pat is None or fuzzy_pat.search(game["name"]):
-                markup = self.fuzzy_highlight_fast(game["name"], hl_compiled)
-                selections.append(Selection(markup, game["url_part"]))
+            url_part = game["url_part"]
+            name = game["name"]
+            if fuzzy_pat is not None and not fuzzy_pat.search(name):
+                continue
+            selected = url_part in self._selected_games
+            sel_mark   = "[bold green]✓[/]" if selected else "[dim] [/dim]"
+            # Search highlight on unselected; selected rows always show full green bold
+            if selected:
+                name_markup = f"[bold green]{name}[/]"
+            elif hl_compiled:
+                name_markup = self.fuzzy_highlight_fast(name, hl_compiled)
+            else:
+                name_markup = f"[dim]{name}[/dim]"
+            game_table.add_row(sel_mark, name_markup, game["size_str"], key=url_part)
+            found += 1
 
-        if not selections and self._all_games_data:
-            selections = [Selection("[dim]No matches found.[/dim]", "EMPTY")]
-
-        if selections:
-            game_list.add_options(selections)
+        if found == 0 and self._all_games_data:
+            game_table.add_row("", "[dim]No matches found.[/dim]", "", key="EMPTY")
 
     # --- Queue & Settings Managers ---
     def _refresh_queue_dropdown(self) -> None:
@@ -730,27 +849,24 @@ class MyrientTUI(App):
             table.add_row(item['name'], item['size_str'], item['dest_path'], key=str(i))
 
     def _load_settings_toggles(self) -> None:
-        from textual.widgets import Switch
         try:
             self.query_one("#set-auto-chd", Switch).value = \
                 self.state.settings.get("auto_convert_chd", False)
         except Exception:
             pass
 
-        include_list = self.query_one("#set-include", SelectionList)
-        exclude_list = self.query_one("#set-exclude", SelectionList)
-
-        for tag in self.state.settings.get("filter_include", []):
-            try:
-                include_list.select(tag)
-            except Exception:
-                pass
-
-        for tag in self.state.settings.get("filter_exclude", []):
-            try:
-                exclude_list.select(tag)
-            except Exception:
-                pass
+        # Restore filter selections from saved settings into the Python sets and DataTable rows
+        self._filter_include_sel = set(self.state.settings.get("filter_include", []))
+        self._filter_exclude_sel = set(self.state.settings.get("filter_exclude", []))
+        try:
+            inc_tbl = self.query_one("#set-include", DataTable)
+            for row in inc_tbl.ordered_rows:
+                self._refresh_filter_row(inc_tbl, row.key.value, self._filter_include_sel)
+            exc_tbl = self.query_one("#set-exclude", DataTable)
+            for row in exc_tbl.ordered_rows:
+                self._refresh_filter_row(exc_tbl, row.key.value, self._filter_exclude_sel)
+        except Exception:
+            pass
 
     def on_select_changed(self, event) -> None:
         if event.control.id == "queue-select" and event.value != Select.BLANK:
@@ -766,9 +882,13 @@ class MyrientTUI(App):
             if data:
                 self.selected_console = data
 
-                game_list = self.query_one("#game-list", SelectionList)
-                game_list.clear_options()
-                game_list.add_options([Selection("[dim]Fetching games… please wait…[/dim]", "LOADING")])
+                # Clear stale game selections so they don't silently carry over
+                self._selected_games.clear()
+                self._update_selection_count()
+
+                game_table = self.query_one("#game-list", DataTable)
+                game_table.clear()
+                game_table.add_row("[dim]…[/dim]", "[dim]Fetching games — please wait…[/dim]", "", key="LOADING")
 
                 self.query_one("#search-games", Input).value = ""
                 self.fetch_games(data)
@@ -827,7 +947,6 @@ class MyrientTUI(App):
                 
         elif button_id == "btn-save-settings":
             try:
-                from textual.widgets import Switch
                 new_path = Path(self.query_one("#set-lib-path", Input).value).expanduser().resolve()
                 self.state.settings["library_root"] = str(new_path)
 
@@ -836,8 +955,8 @@ class MyrientTUI(App):
                 self.state.settings["max_concurrent"] = max(1, min(10, thread_count))
 
                 self.state.settings["auto_convert_chd"] = self.query_one("#set-auto-chd", Switch).value
-                self.state.settings["filter_include"] = self.query_one("#set-include", SelectionList).selected
-                self.state.settings["filter_exclude"] = self.query_one("#set-exclude", SelectionList).selected
+                self.state.settings["filter_include"] = sorted(self._filter_include_sel)
+                self.state.settings["filter_exclude"] = sorted(self._filter_exclude_sel)
                 self.state.save()
 
                 new_path.mkdir(parents=True, exist_ok=True)
@@ -871,12 +990,7 @@ class MyrientTUI(App):
             self.push_screen(ConfirmDeleteScreen(target_path.name), check_delete)
             
     def _add_selected_to_queue(self) -> None:
-        if not self.selected_console:
-            return
-
-        game_list = self.query_one("#game-list", SelectionList)
-        selected_urls = game_list.selected
-        if not selected_urls:
+        if not self.selected_console or not self._selected_games:
             return
 
         library_root = Path(self.state.settings["library_root"])
@@ -885,10 +999,7 @@ class MyrientTUI(App):
         current_queue = self.state.get_active_queue()
 
         added_count = 0
-        for url_part in selected_urls:
-            if url_part in ["LOADING", "EMPTY"]:
-                continue
-
+        for url_part in list(self._selected_games):
             data = self._games_lookup.get(url_part)
             if not data:
                 continue
@@ -910,7 +1021,10 @@ class MyrientTUI(App):
             })
             added_count += 1
 
-        game_list.deselect_all()
+        # Clear selections and re-render so green highlights are removed
+        self._selected_games.clear()
+        self._update_selection_count()
+        self._render_games(self.query_one("#search-games", Input).value)
         self.state.update_active_queue(current_queue)
         self._refresh_queue_table()
         self.notify(f"Queued {added_count} item(s)")
@@ -1220,7 +1334,7 @@ class MyrientTUI(App):
         cpu_count = os.cpu_count()
         cores = str(max(1, cpu_count - 1)) if cpu_count else "1"
         
-        conversion_targets = [f for f in dest_dir.rglob('*') if f.suffix.lower() in ('.cue', '.iso')]
+        conversion_targets = [f for ext in ('.cue', '.iso') for f in dest_dir.rglob(f'*{ext}')]
         
         for file_path in conversion_targets:
             if self.cancel_flag.is_set():
@@ -1475,16 +1589,14 @@ class MyrientTUI(App):
                 continue
 
             # ── 3d: collect game dirs and their auditable files ──────────────
-            # A "game dir" is any non-hidden leaf directory containing auditable files.
-            # We group files by their immediate parent so the .validated/.corrupted
-            # marker lands on the game folder, not the console folder.
+            # Use per-extension glob instead of rglob('*') to avoid materialising
+            # the entire subtree and then filtering — O(auditable files) not O(all files).
             game_dirs: Dict[Path, List[Path]] = {}
-            for item in console_dir.rglob('*'):
-                if (item.is_file()
-                        and not item.name.startswith('.')
-                        and not any(p.name.startswith('.') for p in item.parents)
-                        and item.suffix.lower() in auditable_exts):
-                    game_dirs.setdefault(item.parent, []).append(item)
+            for ext in auditable_exts:
+                for item in console_dir.rglob(f'*{ext}'):
+                    if (not item.name.startswith('.')
+                            and not any(p.name.startswith('.') for p in item.parents)):
+                        game_dirs.setdefault(item.parent, []).append(item)
 
             if not game_dirs:
                 self.post_message(SystemLog(
@@ -1767,7 +1879,7 @@ class MyrientTUI(App):
             # Reconstruct the Myrient download URL from the library directory structure.
             # The zip filename is always: game_dir.name + ".zip"
             game_zip  = game_dir.name + ".zip"
-            game_url  = BASE_URL + quote(console_name + "/", safe="") + quote(game_zip, safe="")
+            game_url  = BASE_URL + quote(console_name, safe="") + "/" + quote(game_zip, safe="")
             flag      = "[bold red]corrupted[/]" if status == "corrupted" else "[yellow]incomplete[/]"
             current_queue.append({
                 "id":        f"dl_{uuid.uuid4().hex[:8]}",
