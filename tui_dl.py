@@ -14,7 +14,6 @@ import shutil
 import subprocess
 import threading
 import time
-import urllib.error
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
@@ -198,53 +197,151 @@ class ConfirmDeleteScreen(ModalScreen[bool]):
 
 # --- Main Application ---
 class MyrientTUI(App):
+    TITLE = "Myrient Library Manager"
+    SUB_TITLE = "Redump · No-Intro · TOSEC"
+
     CSS = """
-    Screen { background: $surface; }
-    #tabs { height: 1fr; }
-    
-    .horizontal-layout { layout: horizontal; height: 1fr; width: 1fr; }
-    .pane-left { width: 35%; height: 1fr; border: round $primary; padding: 1; }
-    .pane-right { width: 65%; height: 1fr; border: round $secondary; padding: 1; }
-    .pane-half { width: 50%; height: 1fr; border: round $primary; padding: 1; }
-    .pane-full { width: 100%; height: 1fr; border: round $primary; padding: 1; }
-    
-    /* Dedicated Library Manager Layout */
-    .pane-library-tree { width: 75%; height: 1fr; border: round $primary; padding: 1; }
-    .pane-library-ops { width: 25%; height: 1fr; border: round $secondary; padding: 1; }
-    
-    /* Queue & Download Dashboard Layout */
-    .pane-queue { width: 40%; height: 1fr; border: round $primary; padding: 1; }
-    .pane-dl { width: 60%; height: 1fr; border: round $secondary; padding: 1; }
-    
-    .search-bar { margin-bottom: 1; }
-    
-    /* UI Magic: Blend unselected checkboxes into background, forcing selected boxes to pop */
-    .invisible-unchecked { 
-        height: 1fr; 
-        margin-bottom: 1; 
-        border: heavy $secondary;
+    /* ── Base ─────────────────────────────────────────────────────────────── */
+    Screen          { background: $surface; }
+    #tabs           { height: 1fr; }
+    Header          { background: $primary-darken-2; }
+
+    /* ── Layout skeletons ─────────────────────────────────────────────────── */
+    .h-layout       { layout: horizontal; height: 1fr; width: 1fr; }
+    .pane           { height: 1fr; border: round $primary-darken-1; padding: 1 2; }
+    .pane-35        { width: 35%; }
+    .pane-40        { width: 40%; }
+    .pane-60        { width: 60%; }
+    .pane-65        { width: 65%; }
+    .pane-75        { width: 75%; }
+    .pane-25        { width: 25%; }
+    .pane-50        { width: 50%; }
+    .pane-100       { width: 100%; }
+
+    /* ── Section headers ──────────────────────────────────────────────────── */
+    .section-header {
+        height: auto;
+        color: $text-muted;
+        text-style: bold;
+        margin-bottom: 1;
+        border-bottom: solid $primary-darken-1;
+        padding-bottom: 1;
+    }
+
+    /* ── Search bars ──────────────────────────────────────────────────────── */
+    .search-bar     { margin-bottom: 1; }
+
+    /* ── Lists ────────────────────────────────────────────────────────────── */
+    #console-list   { height: 1fr; border: solid $surface-lighten-2; }
+    DataTable       { height: 1fr; border: solid $surface-lighten-2; }
+    Tree            { height: 1fr; border: solid $surface-lighten-2; margin-bottom: 1; }
+
+    /* ── Game list: hide checkbox, fade unselected, full-row highlight ───────
+       SelectionList renders each option as a ToggleButton. The glyph lives
+       inside .toggle--button — zeroing its width hides it without display:none
+       which would also break keyboard navigation.                            */
+    #game-list {
+        height: 1fr;
+        border: solid $surface-lighten-2;
         background: $surface-darken-1;
         color: $surface-darken-1;
     }
-    
-    #console-list { height: 1fr; margin-bottom: 1; border: solid $secondary; }
-    DataTable { border: round $accent; height: 1fr; }
-    Tree { height: 1fr; border: solid $secondary; margin-bottom: 1; }
-    .controls { height: auto; align: center middle; margin-top: 1; }
-    .top-controls { height: auto; border-bottom: solid $surface-lighten-2; margin-bottom: 1; padding: 1; }
-    Button { margin: 0 1; }
-    
-    .progress-container { height: auto; margin-bottom: 1; }
-    RichLog { height: 1fr; border: none; }
-    Tree { height: 1fr; border: solid $secondary; margin-bottom: 1; }
-    
-    #dialog { grid-size: 2; padding: 1 2; width: 60; height: 12; border: thick $primary; background: $surface; align: center middle; }
+    /* Hide the [X] / [ ] glyph entirely */
+    #game-list .toggle--button {
+        width: 0;
+        min-width: 0;
+        padding: 0;
+        margin: 0;
+    }
+    /* Cursor row — make it readable while navigating */
+    #game-list .selection-list--option-highlighted {
+        background: $surface-lighten-1;
+        color: $text;
+    }
+    /* Selected row — full green background, whole line pops */
+    #game-list .selection-list--option-selected {
+        background: $success-darken-2;
+        color: $success;
+        text-style: bold;
+    }
+    /* Selected + cursor — slightly brighter so position is still visible */
+    #game-list .selection-list--option-selected.selection-list--option-highlighted {
+        background: $success-darken-1;
+        color: $success;
+        text-style: bold;
+    }
+    .filter-list    {
+        height: 8;
+        border: solid $surface-lighten-2;
+        margin-bottom: 1;
+    }
+    .filter-list > .selection--selected {
+        background: $primary-darken-2;
+        color: $primary-lighten-2;
+        text-style: bold;
+    }
+    .filter-list > .selection--highlighted {
+        background: $surface-lighten-1;
+        color: $text;
+    }
+    .filter-list > .selection--selected.selection--highlighted {
+        background: $primary-darken-1;
+        color: $primary-lighten-2;
+        text-style: bold;
+    }
+    .btn-row        { height: auto; align: center middle; margin-top: 1; }
+    Button          { margin: 0 1; min-width: 16; }
+
+    /* ── Queue toolbar ────────────────────────────────────────────────────── */
+    .queue-toolbar  {
+        height: auto;
+        border-bottom: solid $surface-lighten-2;
+        margin-bottom: 1;
+        padding: 0 0 1 0;
+        layout: grid;
+        grid-size: 2;
+        grid-gutter: 1;
+    }
+    .queue-toolbar Select   { column-span: 2; }
+    .queue-toolbar Input    { column-span: 2; }
+    .toolbar-btn-row        { column-span: 2; height: auto; align: center middle; }
+
+    /* ── Download progress area ───────────────────────────────────────────── */
+    #progress-area       { padding: 1 2; }
+    #lbl-global-progress { margin-bottom: 1; }
+    #global-progress     { margin-bottom: 1; display: none; }
+    .thread-divider      { margin-top: 1; color: $text-muted; }
+    .progress-container  { height: auto; margin-bottom: 1; padding: 0 0 1 0; border-bottom: solid $surface-darken-1; }
+
+    /* ── Library ops panel ────────────────────────────────────────────────── */
+    .ops-btn          { width: 100%; margin: 0 0 1 0; }
+    .legend-label     { margin: 1 0; color: $text-muted; }
+    #lib-status-label { margin-top: 1; color: $text-muted; }
+    #lib-progress-bar { display: none; }
+
+    /* ── Settings ─────────────────────────────────────────────────────────── */
+    .setting-label  { margin-top: 1; color: $text-muted; }
+
+    /* ── Logs ─────────────────────────────────────────────────────────────── */
+    RichLog         { height: 1fr; border: none; }
+
+    /* ── Confirm dialog ───────────────────────────────────────────────────── */
+    #dialog {
+        grid-size: 2;
+        padding: 1 2;
+        width: 60;
+        height: 10;
+        border: thick $error;
+        background: $surface;
+        align: center middle;
+    }
     #question { column-span: 2; content-align: center middle; height: 1fr; }
     """
 
     BINDINGS = [
-        ("q", "quit", "Quit"), 
-        ("d", "toggle_dark", "Toggle Dark Mode")
+        ("q",     "quit",        "Quit"),
+        ("d",     "toggle_dark", "Theme"),
+        ("ctrl+r","app.refresh_browser", "Refresh"),
     ]
 
     def __init__(self):
@@ -259,7 +356,6 @@ class MyrientTUI(App):
         self._games_lookup: Dict[str, Dict[str, str]] = {}
         
         self.selected_console: Optional[Dict[str, str]] = None
-        self.selected_lib_path: Optional[Path] = None
         
         self.proc_lock = threading.Lock()
         self.active_processes = set()
@@ -289,15 +385,17 @@ class MyrientTUI(App):
 
     def cleanup_subprocesses(self) -> None:
         """Safely tears down background tasks, enforcing a hard kill to prevent OS memory leaks."""
+        # Snapshot under lock, then release immediately — blocking wait/kill must not hold the lock
         with self.proc_lock:
-            for proc in list(self.active_processes):
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                except Exception:
-                    pass
+            procs = list(self.active_processes)
+        for proc in procs:
+            try:
+                proc.terminate()
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            except Exception:
+                pass
 
     @staticmethod
     def _format_size(size_bytes: int) -> str:
@@ -313,109 +411,167 @@ class MyrientTUI(App):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with TabbedContent(id="tabs"):
-            with TabPane("Browser", id="tab-browser"):
-                with Horizontal(classes="horizontal-layout"):
-                    with Vertical(classes="pane-left"):
-                        yield Label("[bold #E5E50F]Consoles[/]")
+
+            # ── Browser ──────────────────────────────────────────────────────
+            with TabPane("  Browser  ", id="tab-browser"):
+                with Horizontal(classes="h-layout"):
+                    with Vertical(classes="pane pane-35"):
+                        yield Label("Consoles", classes="section-header")
                         yield Input(
-                            placeholder="Fuzzy Search Consoles...", 
-                            id="search-consoles", 
-                            classes="search-bar"
+                            placeholder="Filter consoles…",
+                            id="search-consoles",
+                            classes="search-bar",
                         )
                         yield ListView(id="console-list")
-                    with Vertical(classes="pane-right"):
-                        yield Label("[bold #1FE056]Games (Space to Check, then Queue)[/]")
-                        yield Input(
-                            placeholder="Fuzzy Search Games...", 
-                            id="search-games", 
-                            classes="search-bar"
-                        )
-                        yield SelectionList(id="game-list", classes="invisible-unchecked")
-                        with Horizontal(classes="controls"):
-                            yield Button("Queue Selected", id="btn-add-queue", variant="success")
-                            yield Button("Refresh", id="btn-refresh-games")
 
-            with TabPane("Queue & Downloads", id="tab-queue-dl"):
-                with Horizontal(classes="horizontal-layout"):
-                    with Vertical(classes="pane-queue"):
-                        with Horizontal(classes="top-controls"):
-                            yield Select([], id="queue-select", prompt="Select Queue Profile")
-                            yield Input(placeholder="New Profile Name", id="input-new-queue")
-                            yield Button("Create", id="btn-create-queue", variant="success")
-                            yield Button("Delete", id="btn-delete-queue", variant="error")
-                        yield DataTable(id="queue-table")
-                        with Horizontal(classes="controls"):
-                            yield Button("Remove Selection", id="btn-remove-items", variant="warning")
-                            yield Button("Start / Resume", id="btn-start-dl", variant="primary")
-                            yield Button("Pause", id="btn-pause-dl", variant="error")
-                    
-                    with VerticalScroll(classes="pane-dl", id="progress-area"):
+                    with Vertical(classes="pane pane-65"):
                         yield Label(
-                            "[bold #E5E50F]Universal Queue Progress: 0/0 Games Completed[/]", 
-                            id="lbl-global-progress"
+                            "Games  [dim](Space = select  ·  Enter = queue)[/dim]",
+                            classes="section-header",
+                        )
+                        yield Input(
+                            placeholder="Filter games…",
+                            id="search-games",
+                            classes="search-bar",
+                        )
+                        yield SelectionList(id="game-list")
+                        with Horizontal(classes="btn-row"):
+                            yield Button("Queue Selected", id="btn-add-queue", variant="success")
+                            yield Button("↺  Refresh List", id="btn-refresh-games", variant="default")
+
+            # ── Queue & Downloads ─────────────────────────────────────────────
+            with TabPane("  Queue & Downloads  ", id="tab-queue-dl"):
+                with Horizontal(classes="h-layout"):
+                    with Vertical(classes="pane pane-40"):
+                        yield Label("Queue Profiles", classes="section-header")
+                        with Vertical(classes="queue-toolbar"):
+                            yield Select([], id="queue-select", prompt="Active profile…")
+                            yield Input(placeholder="New profile name…", id="input-new-queue")
+                            with Horizontal(classes="toolbar-btn-row"):
+                                yield Button("Create", id="btn-create-queue", variant="success")
+                                yield Button("Delete", id="btn-delete-queue", variant="error")
+                        yield DataTable(id="queue-table")
+                        with Horizontal(classes="btn-row"):
+                            yield Button("Remove", id="btn-remove-items", variant="warning")
+                            yield Button("▶  Start", id="btn-start-dl", variant="primary")
+                            yield Button("⏸  Pause", id="btn-pause-dl", variant="error")
+
+                    with VerticalScroll(classes="pane pane-60", id="progress-area"):
+                        yield Label(
+                            "Queue Progress: 0 / 0",
+                            id="lbl-global-progress",
+                            classes="section-header",
                         )
                         yield ProgressBar(id="global-progress", show_eta=True)
-                        yield Label("\n[bold cyan]Active Threads (Real-Time I/O)[/]")
-
-            with TabPane("Library Manager", id="tab-library"):
-                with Horizontal(classes="horizontal-layout"):
-                    with Vertical(classes="pane-library-tree"):
-                        yield Label("[bold cyan]Local Storage[/]")
-                        yield Tree("Scanning library...", id="lib-tree")
-                        yield Button("Delete Selected File/Folder", id="btn-lib-delete", variant="error")
-                    with VerticalScroll(classes="pane-library-ops"):
-                        yield Label("[bold #E5E50F]Operations[/]")
-                        yield Button("Scan & Organize", id="btn-lib-organize")
-                        yield Button("Verify Against Redump DAT", id="btn-lib-dat-audit", variant="primary")
-                        yield Button("Convert to CHD", id="btn-lib-convert")
-                        yield Button("Refresh Status", id="btn-lib-refresh-status")
                         yield Label(
-                            "\n[bold green]✓[/bold green] Validated  "
-                            "[bold red]✗[/bold red] Corrupted  "
-                            "[yellow]~[/yellow] Incomplete"
+                            "[dim]Active downloads appear below[/dim]",
+                            classes="thread-divider",
+                        )
+
+            # ── Library Manager ───────────────────────────────────────────────
+            with TabPane("  Library  ", id="tab-library"):
+                with Horizontal(classes="h-layout"):
+                    with Vertical(classes="pane pane-75"):
+                        yield Label("Local Library", classes="section-header")
+                        yield Tree("Scanning…", id="lib-tree")
+                        with Horizontal(classes="btn-row"):
+                            yield Button(
+                                "🗑  Delete Selected",
+                                id="btn-lib-delete",
+                                variant="error",
+                            )
+
+                    with VerticalScroll(classes="pane pane-25"):
+                        yield Label("Operations", classes="section-header")
+                        yield Button(
+                            "Scan & Organize",
+                            id="btn-lib-organize",
+                            classes="ops-btn",
                         )
                         yield Button(
-                            "Re-queue Failed & Incomplete", 
-                            id="btn-requeue-failed", 
-                            variant="warning"
+                            "Verify vs. Redump DAT",
+                            id="btn-lib-dat-audit",
+                            classes="ops-btn",
                         )
-                        
-                        yield Label("\n[bold cyan]Operation Status[/]")
-                        yield Label("[dim]Idle[/dim]", id="lib-status-label")
+                        yield Button(
+                            "Convert to CHD",
+                            id="btn-lib-convert",
+                            classes="ops-btn",
+                        )
+                        yield Button(
+                            "↺  Refresh Status",
+                            id="btn-lib-refresh-status",
+                            classes="ops-btn",
+                        )
+                        yield Label(
+                            "[bold green]✓[/] Validated  "
+                            "[bold red]✗[/] Corrupted  "
+                            "[yellow]~[/] Incomplete",
+                            classes="legend-label",
+                        )
+                        yield Button(
+                            "Re-queue Failures",
+                            id="btn-requeue-failed",
+                            classes="ops-btn",
+                        )
+                        yield Label("Status", classes="section-header")
+                        yield Label("Idle", id="lib-status-label")
                         yield ProgressBar(id="lib-progress-bar", show_eta=True)
 
-            with TabPane("Settings", id="tab-settings"):
-                with Horizontal(classes="horizontal-layout"):
-                    with VerticalScroll(classes="pane-half"):
-                        yield Label("[bold cyan]System Paths[/]")
-                        yield Label("Library Root Path")
-                        yield Input(value=self.state.settings["library_root"], id="set-lib-path")
-                        yield Label("\nMax Concurrent Threads")
-                        yield Input(value=str(self.state.settings["max_concurrent"]), id="set-threads")
-                        yield Button("Save Config", id="btn-save-settings", variant="success")
-                    with Vertical(classes="pane-half"):
-                        yield Label("[bold green]Regional Filters[/]")
-                        yield SelectionList(
-                            Selection("[white]USA[/white]", "USA"), 
-                            Selection("[white]Europe[/white]", "Europe"), 
-                            Selection("[white]Japan[/white]", "Japan"), 
-                            Selection("[white]World[/white]", "World"), 
-                            id="set-include",
-                            classes="invisible-unchecked"
+            # ── Settings ──────────────────────────────────────────────────────
+            with TabPane("  Settings  ", id="tab-settings"):
+                with Horizontal(classes="h-layout"):
+                    with VerticalScroll(classes="pane pane-50"):
+                        yield Label("Paths & Engine", classes="section-header")
+                        yield Label("Library root path", classes="setting-label")
+                        yield Input(
+                            value=self.state.settings["library_root"],
+                            id="set-lib-path",
                         )
-                        yield Label("[bold red]Type Exclusions[/]")
+                        yield Label("Max concurrent downloads  [dim](1–10)[/dim]", classes="setting-label")
+                        yield Input(
+                            value=str(self.state.settings["max_concurrent"]),
+                            id="set-threads",
+                        )
+                        yield Label("Post-download CHD conversion", classes="setting-label")
+                        from textual.widgets import Switch
+                        yield Switch(
+                            value=self.state.settings.get("auto_convert_chd", False),
+                            id="set-auto-chd",
+                        )
+                        yield Button("Save Settings", id="btn-save-settings", variant="success")
+
+                    with VerticalScroll(classes="pane pane-50"):
+                        yield Label("Regional Include Filter", classes="section-header")
+                        yield Label(
+                            "[dim]Only show games matching these tags (empty = show all)[/dim]",
+                            classes="setting-label",
+                        )
                         yield SelectionList(
-                            Selection("[white]Demo[/white]", "Demo"), 
-                            Selection("[white]Beta[/white]", "Beta"), 
-                            Selection("[white]Proto[/white]", "Proto"), 
+                            Selection("USA",    "USA"),
+                            Selection("Europe", "Europe"),
+                            Selection("Japan",  "Japan"),
+                            Selection("World",  "World"),
+                            id="set-include",
+                            classes="filter-list",
+                        )
+                        yield Label("Type Exclude Filter", classes="section-header")
+                        yield Label(
+                            "[dim]Hide games matching these tags[/dim]",
+                            classes="setting-label",
+                        )
+                        yield SelectionList(
+                            Selection("Demo",  "Demo"),
+                            Selection("Beta",  "Beta"),
+                            Selection("Proto", "Proto"),
                             id="set-exclude",
-                            classes="invisible-unchecked"
+                            classes="filter-list",
                         )
 
-            with TabPane("System Logs", id="tab-logs"):
-                with Vertical(classes="pane-full"):
-                    yield Label("[bold yellow]Engine Background Events[/]")
-                    yield RichLog(id="sys-log", markup=True, wrap=True, max_lines=500)
+            # ── Logs ──────────────────────────────────────────────────────────
+            with TabPane("  Logs  ", id="tab-logs"):
+                with Vertical(classes="pane pane-100"):
+                    yield RichLog(id="sys-log", markup=True, wrap=True, max_lines=1000)
 
         yield Footer()
 
@@ -445,13 +601,23 @@ class MyrientTUI(App):
         try:
             progress_bar = self.query_one("#lib-progress-bar", ProgressBar)
             status_label = self.query_one("#lib-status-label", Label)
-            progress_bar.update(total=message.total, progress=message.completed)
-            
+
+            # Show bar when work is in progress, hide when signalled complete/done
+            is_done = message.current_item.lower() in ("done", "complete", "failed")
+            progress_bar.display = not is_done
+            if not is_done:
+                progress_bar.update(total=message.total, progress=message.completed)
+
             item_display = message.current_item
-            if len(item_display) > 30:
-                item_display = item_display[:27] + "..."
-                
-            status_label.update(f"[bold cyan]{message.task_name}[/]\n[white]{item_display}[/white]")
+            if len(item_display) > 50:
+                item_display = item_display[:47] + "…"
+
+            if is_done:
+                status_label.update(f"[dim]{message.task_name}: {message.current_item}[/dim]")
+            else:
+                status_label.update(
+                    f"[bold]{message.task_name}[/]\n[dim]{item_display}[/dim]"
+                )
         except Exception:
             pass
 
@@ -461,6 +627,13 @@ class MyrientTUI(App):
     def _compile_fuzzy_pattern(query: str) -> re.Pattern:
         """Cache compiled fuzzy patterns — avoids re-compiling the same query on every keystroke frame."""
         return re.compile('.*'.join(re.escape(c) for c in query.lower()), re.IGNORECASE)
+
+    @staticmethod
+    @lru_cache(maxsize=256)
+    def _compile_highlight_pattern(query: str) -> re.Pattern:
+        """Cache compiled highlight patterns — character-by-character alternating capture groups."""
+        pattern_str = "^(.*?)" + "".join(f"({re.escape(c)})(.*?)" for c in query) + "$"
+        return re.compile(pattern_str, re.IGNORECASE)
 
     def fuzzy_match(self, query: str, text: str) -> bool:
         if not query:
@@ -506,11 +679,7 @@ class MyrientTUI(App):
         list_view = self.query_one("#console-list", ListView)
         list_view.clear()
         
-        if query:
-            pattern_str = "^(.*?)" + "".join(f"({re.escape(c)})(.*?)" for c in query) + "$"
-            hl_compiled = re.compile(pattern_str, re.IGNORECASE)
-        else:
-            hl_compiled = None
+        hl_compiled = self._compile_highlight_pattern(query) if query else None
             
         filtered_consoles = [c for c in self._all_consoles_data if self.fuzzy_match(query, c["name"])]
         new_items = []
@@ -527,32 +696,23 @@ class MyrientTUI(App):
             list_view.mount(*new_items)
 
     def _render_games(self, query: str = "") -> None:
-        selection_list = self.query_one("#game-list", SelectionList)
-        if not selection_list:
-            return
-            
-        selection_list.clear_options()
-        
-        if query:
-            search_pattern = '.*'.join(re.escape(c) for c in query.lower())
-            compiled_search = re.compile(search_pattern, re.IGNORECASE)
-            
-            hl_pattern_str = "^(.*?)" + "".join(f"({re.escape(c)})(.*?)" for c in query) + "$"
-            hl_compiled = re.compile(hl_pattern_str, re.IGNORECASE)
-        else:
-            compiled_search = None
-            hl_compiled = None
+        game_list = self.query_one("#game-list", SelectionList)
+        game_list.clear_options()
+
+        fuzzy_pat   = self._compile_fuzzy_pattern(query) if query else None
+        hl_compiled = self._compile_highlight_pattern(query) if query else None
 
         selections = []
         for game in self._all_games_data:
-            if compiled_search is None or compiled_search.search(game["name"]):
-                highlighted_name = self.fuzzy_highlight_fast(game["name"], hl_compiled)
-                selections.append(Selection(highlighted_name, game["url_part"]))
-        
+            if fuzzy_pat is None or fuzzy_pat.search(game["name"]):
+                markup = self.fuzzy_highlight_fast(game["name"], hl_compiled)
+                selections.append(Selection(markup, game["url_part"]))
+
         if not selections and self._all_games_data:
-            selections = [Selection("[white]No matches found for query.[/white]", "EMPTY")]
-            
-        selection_list.add_options(selections)
+            selections = [Selection("[dim]No matches found.[/dim]", "EMPTY")]
+
+        if selections:
+            game_list.add_options(selections)
 
     # --- Queue & Settings Managers ---
     def _refresh_queue_dropdown(self) -> None:
@@ -570,16 +730,23 @@ class MyrientTUI(App):
             table.add_row(item['name'], item['size_str'], item['dest_path'], key=str(i))
 
     def _load_settings_toggles(self) -> None:
+        from textual.widgets import Switch
+        try:
+            self.query_one("#set-auto-chd", Switch).value = \
+                self.state.settings.get("auto_convert_chd", False)
+        except Exception:
+            pass
+
         include_list = self.query_one("#set-include", SelectionList)
         exclude_list = self.query_one("#set-exclude", SelectionList)
-        
-        for tag in self.state.settings.get("filter_include", []): 
+
+        for tag in self.state.settings.get("filter_include", []):
             try:
                 include_list.select(tag)
             except Exception:
                 pass
-                
-        for tag in self.state.settings.get("filter_exclude", []): 
+
+        for tag in self.state.settings.get("filter_exclude", []):
             try:
                 exclude_list.select(tag)
             except Exception:
@@ -593,16 +760,16 @@ class MyrientTUI(App):
 
     async def on_list_view_selected(self, event) -> None:
         list_id = getattr(event.list_view, "id", None)
-        
+
         if list_id == "console-list":
             data = getattr(event.item, 'link_data', None)
             if data:
                 self.selected_console = data
-                
-                games_list = self.query_one("#game-list", SelectionList)
-                games_list.clear_options()
-                games_list.add_options([Selection("[white]Fetching games... please wait...[/white]", "LOADING")])
-                
+
+                game_list = self.query_one("#game-list", SelectionList)
+                game_list.clear_options()
+                game_list.add_options([Selection("[dim]Fetching games… please wait…[/dim]", "LOADING")])
+
                 self.query_one("#search-games", Input).value = ""
                 self.fetch_games(data)
 
@@ -660,24 +827,26 @@ class MyrientTUI(App):
                 
         elif button_id == "btn-save-settings":
             try:
+                from textual.widgets import Switch
                 new_path = Path(self.query_one("#set-lib-path", Input).value).expanduser().resolve()
                 self.state.settings["library_root"] = str(new_path)
-                
+
                 threads_input = self.query_one("#set-threads", Input).value
                 thread_count = int(threads_input) if threads_input.isdigit() else 4
                 self.state.settings["max_concurrent"] = max(1, min(10, thread_count))
-                
+
+                self.state.settings["auto_convert_chd"] = self.query_one("#set-auto-chd", Switch).value
                 self.state.settings["filter_include"] = self.query_one("#set-include", SelectionList).selected
                 self.state.settings["filter_exclude"] = self.query_one("#set-exclude", SelectionList).selected
                 self.state.save()
-                
+
                 new_path.mkdir(parents=True, exist_ok=True)
                 self.run_lib_status_scan()
-                self.notify("Settings Saved")
-                
+                self.notify("Settings saved")
+
                 if self.selected_console:
                     self.fetch_games(self.selected_console)
-                    
+
             except Exception as err:
                 self.notify(f"Error saving settings: {err}", severity="error")
                 
@@ -704,45 +873,47 @@ class MyrientTUI(App):
     def _add_selected_to_queue(self) -> None:
         if not self.selected_console:
             return
-            
-        selection_list = self.query_one("#game-list", SelectionList)
-        selected_urls = selection_list.selected 
+
+        game_list = self.query_one("#game-list", SelectionList)
+        selected_urls = game_list.selected
         if not selected_urls:
             return
-        
+
         library_root = Path(self.state.settings["library_root"])
         console_name = self.selected_console["name"].strip('/')
         base_url = urljoin(BASE_URL, self.selected_console["url_part"])
         current_queue = self.state.get_active_queue()
-        
+
+        added_count = 0
         for url_part in selected_urls:
             if url_part in ["LOADING", "EMPTY"]:
                 continue
-            
+
             data = self._games_lookup.get(url_part)
             if not data:
                 continue
-                
+
             sub_folder = data['name'].replace('.zip', '').strip()
             clean_base = DISC_REGEX.sub('', sub_folder).strip()
-            
+
             if DISC_REGEX.search(sub_folder):
                 dest_path = library_root / console_name / clean_base / sub_folder
             else:
                 dest_path = library_root / console_name / sub_folder
-                
+
             current_queue.append({
                 "id": f"dl_{uuid.uuid4().hex[:8]}",
-                "name": f"[{console_name}] {data['name']}", 
-                "game_url": urljoin(base_url, data["url_part"]), 
-                "dest_path": str(dest_path), 
+                "name": f"[{console_name}] {data['name']}",
+                "game_url": urljoin(base_url, data["url_part"]),
+                "dest_path": str(dest_path),
                 "size_str": data["size_str"]
             })
-            
-        selection_list.deselect_all()
+            added_count += 1
+
+        game_list.deselect_all()
         self.state.update_active_queue(current_queue)
         self._refresh_queue_table()
-        self.notify(f"Queued {len(selected_urls)} items")
+        self.notify(f"Queued {added_count} item(s)")
         self.query_one("#tabs", TabbedContent).active = "tab-queue-dl"
 
     # --- UI Message Receivers ---
@@ -859,9 +1030,11 @@ class MyrientTUI(App):
         
         def init_global_pb() -> None:
             try:
-                self.query_one("#global-progress", ProgressBar).update(total=self.global_total, progress=0)
+                pb = self.query_one("#global-progress", ProgressBar)
+                pb.display = True
+                pb.update(total=self.global_total, progress=0)
                 self.query_one("#lbl-global-progress", Label).update(
-                    f"[bold #E5E50F]Universal Queue Progress: 0/{self.global_total} Games Completed[/]"
+                    f"Queue Progress: 0 / {self.global_total}"
                 )
             except Exception:
                 pass
@@ -885,11 +1058,20 @@ class MyrientTUI(App):
                     
         with self._engine_lock:
             self.engine_running = False
-        
+
+        def _finish_ui(paused: bool) -> None:
+            try:
+                self.query_one("#global-progress", ProgressBar).display = False
+                self.query_one("#lbl-global-progress", Label).update("Queue Progress: 0 / 0")
+            except Exception:
+                pass
+
         if self.cancel_flag.is_set():
             self.post_message(SystemLog("[bold yellow]Downloads Successfully Paused[/]"))
+            self.call_from_thread(lambda: _finish_ui(True))
         else:
             self.post_message(SystemLog("[bold green]Batch Queue Finished[/]"))
+            self.call_from_thread(lambda: _finish_ui(False))
 
     def _download_worker(self, item: Dict[str, str]) -> Dict[str, Any]:
         if self.cancel_flag.is_set():
@@ -1016,6 +1198,10 @@ class MyrientTUI(App):
                     (dest_dir / ".validated").touch()
                 else:
                     raise Exception(f"Unzip failed: {unzip_err}")
+            elif target_file.exists():
+                # Non-ZIP download (direct .bin/.iso/etc.) — still mark validated so re-runs skip it
+                (dest_dir / ".corrupted").unlink(missing_ok=True)
+                (dest_dir / ".validated").touch()
             
             if self.cancel_flag.is_set():
                 return {"success": False, "cancelled": True}
@@ -1099,7 +1285,7 @@ class MyrientTUI(App):
             try:
                 self.query_one("#global-progress", ProgressBar).advance(1)
                 self.query_one("#lbl-global-progress", Label).update(
-                    f"[bold #E5E50F]Universal Queue Progress: {completed_snap}/{self.global_total} Games Completed[/]"
+                    f"Queue Progress: {completed_snap} / {self.global_total}"
                 )
             except Exception:
                 pass
@@ -1117,7 +1303,7 @@ class MyrientTUI(App):
             try:
                 lbl_id = f"lbl_{message.item['id']}"
                 self.query_one(f"#{lbl_id}", Label).update(
-                    f"[bold yellow]Paused[/] | [white]{message.item['name']}[/white]"
+                    f"[yellow]Paused[/]  {message.item['name']}"
                 )
             except Exception:
                 pass
@@ -1214,7 +1400,7 @@ class MyrientTUI(App):
             return
 
         # ── Phase 3: per-console audit ───────────────────────────────────────
-        grand_perfect = grand_misnamed = grand_bad = grand_skipped = 0
+        grand_perfect = grand_misnamed = grand_bad = 0
         dat_cache_root = library / ".dats"
 
         for con_idx, console_dir in enumerate(console_dirs, 1):
@@ -1306,18 +1492,19 @@ class MyrientTUI(App):
                 ))
                 continue
 
-            # ── 3e: hash every file and judge each game dir ──────────────────
+            # ── 3e: hash every file once, log results, cache for marker step ──
+            # hash_results: file_path -> True (known-good) | False (bad/error)
             con_perfect = con_misnamed = con_bad = 0
             all_files = [(gd, fp) for gd, fps in game_dirs.items() for fp in fps]
             total_files = len(all_files)
+            hash_results: Dict[Path, bool] = {}
 
             for f_idx, (game_dir, file_path) in enumerate(all_files, 1):
                 self.post_message(LibraryProgress(
                     f"Hashing {console_name} ({f_idx}/{total_files})",
                     file_path.name, f_idx, total_files
                 ))
-
-                sha1 = hashlib.sha1()
+                sha1 = hashlib.sha1(usedforsecurity=False)
                 try:
                     with open(file_path, 'rb') as fh:
                         while chunk := fh.read(8 * 1024 * 1024):
@@ -1333,35 +1520,24 @@ class MyrientTUI(App):
                             self.post_message(SystemLog(
                                 f"Misnamed [{console_name}]: '{file_path.name}' → '{expected_name}'"
                             ))
+                        hash_results[file_path] = True
                     else:
                         con_bad += 1
                         self.post_message(SystemLog(
                             f"Bad/Unknown [{console_name}]: '{file_path.name}' (SHA1: {file_hash})"
                         ))
+                        hash_results[file_path] = False
                 except Exception as err:
                     con_bad += 1
+                    hash_results[file_path] = False
                     self.post_message(SystemLog(
                         f"Read error [{console_name}]: '{file_path.name}': {err}", True
                     ))
 
-            # ── 3f: write markers per game dir based on its files' results ───
-            # A dir is "validated" only if every file in it is a known-good hash.
-            # Any unknown or unreadable file marks the whole dir corrupted.
+            # ── 3f: write markers using cached results — no re-reading files ──
+            # A dir is validated only if every auditable file in it was a known-good hash.
             for game_dir, files in game_dirs.items():
-                dir_ok = True
-                for fp in files:
-                    sha1 = hashlib.sha1()
-                    try:
-                        with open(fp, 'rb') as fh:
-                            while chunk := fh.read(8 * 1024 * 1024):
-                                sha1.update(chunk)
-                        if sha1.hexdigest().lower() not in dat_by_sha1:
-                            dir_ok = False
-                            break
-                    except Exception:
-                        dir_ok = False
-                        break
-
+                dir_ok = all(hash_results.get(fp, False) for fp in files)
                 if dir_ok:
                     (game_dir / ".corrupted").unlink(missing_ok=True)
                     (game_dir / ".validated").touch()
@@ -1423,40 +1599,67 @@ class MyrientTUI(App):
     def run_lib_status_scan(self) -> None:
         """Scans the library and rebuilds the Tree with color-coded game status nodes."""
         library = Path(self.state.settings['library_root'])
-        
-        # Build the full structure in the thread — no UI calls here
+
         # structure: {console_name: (console_path, [(game_dir, status_str), ...])}
         structure: Dict[str, tuple] = {}
-        
+
+        def _classify_dir(d: Path) -> Optional[str]:
+            """Return 'validated'/'corrupted'/'incomplete'/None (skip) for a candidate game dir."""
+            try:
+                dir_files = [f for f in d.iterdir() if f.is_file() and not f.name.startswith('.')]
+            except PermissionError:
+                return None
+            has_game = any(f.suffix.lower() in ('.bin', '.iso', '.cue', '.chd', '.img') for f in dir_files)
+            has_zip  = any(f.suffix.lower() == '.zip' for f in dir_files)
+            is_empty = len(dir_files) == 0
+            if not (has_game or has_zip or is_empty):
+                return None
+            if (d / ".validated").exists():
+                return "validated"
+            if (d / ".corrupted").exists():
+                return "corrupted"
+            return "incomplete"
+
         if library.exists():
-            for console_dir in sorted(library.iterdir()):
-                if console_dir.is_dir() and not console_dir.name.startswith('.'):
-                    games = []
-                    for item in sorted(console_dir.rglob('*')):
-                        if not item.is_dir() or item.name.startswith('.'):
-                            continue
-                        if any(p.name.startswith('.') for p in item.parents):
-                            continue
-                        # Only include leaf dirs that contain actual game files, partial zips, or are empty
-                        # (an empty folder = the download was started/queued but nothing arrived yet)
+            try:
+                console_entries = sorted(
+                    (e for e in library.iterdir() if e.is_dir() and not e.name.startswith('.')),
+                    key=lambda e: e.name
+                )
+            except PermissionError:
+                console_entries = []
+
+            for console_dir in console_entries:
+                games = []
+                try:
+                    # Depth-1: direct child dirs (simple games)
+                    # Depth-2: children of those dirs (grouped multi-disc games)
+                    depth1 = sorted(
+                        (e for e in console_dir.iterdir() if e.is_dir() and not e.name.startswith('.')),
+                        key=lambda e: e.name
+                    )
+                except PermissionError:
+                    continue
+
+                for child in depth1:
+                    status = _classify_dir(child)
+                    if status is not None:
+                        games.append((child, status))
+                    else:
+                        # May be a grouping folder (multi-disc base) — check its children
                         try:
-                            dir_files = [f for f in item.iterdir() if f.is_file() and not f.name.startswith('.')]
+                            for grandchild in sorted(
+                                (e for e in child.iterdir() if e.is_dir() and not e.name.startswith('.')),
+                                key=lambda e: e.name
+                            ):
+                                gs = _classify_dir(grandchild)
+                                if gs is not None:
+                                    games.append((grandchild, gs))
                         except PermissionError:
-                            continue
-                        has_game = any(f.suffix.lower() in ('.bin', '.iso', '.cue', '.chd', '.img') for f in dir_files)
-                        has_zip  = any(f.suffix.lower() == '.zip' for f in dir_files)
-                        is_empty = len(dir_files) == 0
-                        if not (has_game or has_zip or is_empty):
-                            continue
-                        if (item / ".validated").exists():
-                            status = "validated"
-                        elif (item / ".corrupted").exists():
-                            status = "corrupted"
-                        else:
-                            status = "incomplete"
-                        games.append((item, status))
-                    if games:
-                        structure[console_dir.name] = (console_dir, games)
+                            pass
+
+                if games:
+                    structure[console_dir.name] = (console_dir, games)
 
         def _build_tree() -> None:
             try:
@@ -1500,28 +1703,55 @@ class MyrientTUI(App):
             self.post_message(SystemLog("Re-queue: Library path not found.", True))
             return
 
+        def _dir_status(d: Path) -> Optional[str]:
+            """None = skip, else 'validated'/'corrupted'/'incomplete'."""
+            try:
+                dir_files = [f for f in d.iterdir() if f.is_file() and not f.name.startswith('.')]
+            except PermissionError:
+                return None
+            has_game = any(f.suffix.lower() in ('.bin', '.iso', '.cue', '.chd', '.img') for f in dir_files)
+            has_zip  = any(f.suffix.lower() == '.zip' for f in dir_files)
+            if not (has_game or has_zip or len(dir_files) == 0):
+                return None
+            if (d / ".validated").exists():
+                return "validated"
+            return "corrupted" if (d / ".corrupted").exists() else "incomplete"
+
         targets: List[tuple] = []  # (console_name, game_dir, status)
-        for console_dir in sorted(library.iterdir()):
-            if not console_dir.is_dir() or console_dir.name.startswith('.'):
-                continue
+        try:
+            console_dirs = sorted(
+                (e for e in library.iterdir() if e.is_dir() and not e.name.startswith('.')),
+                key=lambda e: e.name
+            )
+        except PermissionError:
+            console_dirs = []
+
+        for console_dir in console_dirs:
             console_name = console_dir.name
-            for item in sorted(console_dir.rglob('*')):
-                if not item.is_dir() or item.name.startswith('.'):
-                    continue
-                if any(p.name.startswith('.') for p in item.parents):
-                    continue
-                try:
-                    dir_files = [f for f in item.iterdir() if f.is_file() and not f.name.startswith('.')]
-                except PermissionError:
-                    continue
-                has_game = any(f.suffix.lower() in ('.bin', '.iso', '.cue', '.chd', '.img') for f in dir_files)
-                has_zip  = any(f.suffix.lower() == '.zip' for f in dir_files)
-                is_empty = len(dir_files) == 0
-                if not (has_game or has_zip or is_empty):
-                    continue
-                if not (item / ".validated").exists():
-                    status = "corrupted" if (item / ".corrupted").exists() else "incomplete"
-                    targets.append((console_name, item, status))
+            try:
+                depth1 = sorted(
+                    (e for e in console_dir.iterdir() if e.is_dir() and not e.name.startswith('.')),
+                    key=lambda e: e.name
+                )
+            except PermissionError:
+                continue
+
+            for child in depth1:
+                status = _dir_status(child)
+                if status is not None:
+                    if status != "validated":
+                        targets.append((console_name, child, status))
+                else:
+                    try:
+                        for grandchild in sorted(
+                            (e for e in child.iterdir() if e.is_dir() and not e.name.startswith('.')),
+                            key=lambda e: e.name
+                        ):
+                            gs = _dir_status(grandchild)
+                            if gs is not None and gs != "validated":
+                                targets.append((console_name, grandchild, gs))
+                    except PermissionError:
+                        pass
 
         if not targets:
             self.post_message(SystemLog("Re-queue: No incomplete or corrupted games found. Library looks clean!"))
