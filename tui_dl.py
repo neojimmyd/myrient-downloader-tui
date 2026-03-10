@@ -196,81 +196,241 @@ class ConfirmDeleteScreen(ModalScreen[bool]):
 
 # --- Main Application ---
 class MyrientTUI(App):
-    TITLE = "Myrient Library Manager"
-    SUB_TITLE = "Redump · No-Intro · TOSEC"
+    TITLE = "MYRIENT"
+    SUB_TITLE = "ROM Library Manager"
 
     CSS = """
-    /* ── Base ─────────────────────────────────────────────────────────────── */
-    Screen          { background: $surface; }
-    #tabs           { height: 1fr; }
-    Header          { background: $primary-darken-2; }
+    /* ════════════════════════════════════════════════════════════
+       MYRIENT  —  Deep Space Terminal Theme
+       Amber-on-obsidian · sharp edges · semantic color only
+       ════════════════════════════════════════════════════════════ */
 
-    /* ── Layout skeletons ─────────────────────────────────────────────────── */
-    .h-layout       { layout: horizontal; height: 1fr; width: 1fr; }
-    .pane           { height: 1fr; border: round $primary-darken-1; padding: 1 2; }
-    .pane-35        { width: 35%; }
-    .pane-40        { width: 40%; }
-    .pane-60        { width: 60%; }
-    .pane-65        { width: 65%; }
-    .pane-75        { width: 75%; }
-    .pane-25        { width: 25%; }
-    .pane-50        { width: 50%; }
-    .pane-100       { width: 100%; }
+    /* ── Base ──────────────────────────────────────────────────── */
+    Screen {
+        background: #0d1117;
+        color: #e6edf3;
+    }
 
-    /* ── Section headers ──────────────────────────────────────────────────── */
+    /* ── Header ─────────────────────────────────────────────────── */
+    Header {
+        background: #0d1117;
+        color: #e6edf3;
+        border-bottom: solid #e6b73e;
+    }
+
+    /* ── Footer ─────────────────────────────────────────────────── */
+    Footer {
+        background: #0d1117;
+        color: #484f58;
+        border-top: solid #21262d;
+    }
+
+    /* ── Tab strip ──────────────────────────────────────────────── */
+    TabbedContent > Tabs {
+        background: #0d1117;
+        border-bottom: solid #21262d;
+    }
+    TabbedContent > Tabs > Tab {
+        color: #484f58;
+        padding: 0 3;
+        background: #0d1117;
+    }
+    TabbedContent > Tabs > Tab.-active {
+        color: #e6b73e;
+        text-style: bold;
+        background: #0d1117;
+        border-top: tall #e6b73e;
+    }
+    TabbedContent > Tabs > Tab:hover {
+        color: #8b949e;
+        background: #161b22;
+    }
+    #tabs       { height: 1fr; }
+    TabPane     { background: #0d1117; }
+
+    /* ── Layout ─────────────────────────────────────────────────── */
+    .h-layout   { layout: horizontal; height: 1fr; }
+    .panel      {
+        height: 1fr;
+        border: solid #21262d;
+        padding: 1 2;
+        background: #161b22;
+    }
+    .panel-25   { width: 25%; }
+    .panel-30   { width: 30%; }
+    .panel-35   { width: 35%; }
+    .panel-40   { width: 40%; }
+    .panel-50   { width: 50%; }
+    .panel-60   { width: 60%; }
+    .panel-65   { width: 65%; }
+    .panel-70   { width: 70%; }
+    .panel-75   { width: 75%; }
+    .panel-100  { width: 100%; }
+
+    /* ── Section headers ────────────────────────────────────────── */
     .section-header {
         height: auto;
-        color: $text-muted;
+        color: #e6b73e;
         text-style: bold;
+        border-left: thick #e6b73e;
+        padding: 0 0 0 2;
         margin-bottom: 1;
-        border-bottom: solid $primary-darken-1;
-        padding-bottom: 1;
     }
 
-    /* ── Search bars ──────────────────────────────────────────────────────── */
+    /* ── Hint bar (keyboard hints, counts) ──────────────────────── */
+    .hint-bar {
+        height: auto;
+        color: #484f58;
+        margin-top: 1;
+        margin-bottom: 0;
+        text-align: right;
+    }
+
+    /* ── Search / Input ─────────────────────────────────────────── */
     .search-bar     { margin-bottom: 1; }
-
-    /* ── Lists ────────────────────────────────────────────────────────────── */
-    #console-list   { height: 1fr; border: solid $surface-lighten-2; }
-    #queue-table    { height: 1fr; border: solid $surface-lighten-2; }
-    Tree            { height: 1fr; border: solid $surface-lighten-2; margin-bottom: 1; }
-
-    /* ── Filter DataTables (Settings) ────────────────────────────────────── */
-    .filter-table {
-        height: 8;
-        border: solid $surface-lighten-2;
-        margin-bottom: 1;
-        background: $surface-darken-2;
+    Input {
+        background: #0d1117;
+        border: solid #30363d;
+        color: #e6edf3;
     }
-    .filter-table > .datatable--header { display: none; }
-    .filter-table > .datatable--cursor { background: $primary-darken-2; }
+    Input:focus { border: solid #e6b73e; }
 
-    /* ── Game list (DataTable — virtual, handles 10k+ rows) ────────────────
-       Unselected games are dimmed so selected games pop visually.
-       Green bold text + checkmark = selected. Cursor = navigation.         */
+    /* ── ListView (console list) ────────────────────────────────── */
+    #console-list {
+        height: 1fr;
+        border: solid #21262d;
+        background: #0d1117;
+    }
+    ListView > ListItem {
+        background: transparent;
+        padding: 0 1;
+        color: #c9d1d9;
+    }
+    ListView > ListItem.--highlight {
+        background: #1c2128;
+        color: #e6edf3;
+    }
+    ListView:focus > ListItem.--highlight {
+        background: #1c2128;
+        border-left: thick #e6b73e;
+    }
+
+    /* ── Game browser DataTable ─────────────────────────────────── */
     #game-list {
         height: 1fr;
-        border: solid $surface-lighten-2;
-        background: $surface-darken-2;
+        border: solid #21262d;
+        background: #0d1117;
     }
-    #game-list > .datatable--header { display: none; }
-    #game-list > .datatable--cursor { background: $primary-darken-2; }
-    /* Selection counter shown above Queue button */
+    #game-list > .datatable--header  { display: none; }
+    #game-list > .datatable--cursor  { background: #1c2128; }
+
+    /* ── Selection counter ──────────────────────────────────────── */
     #game-selection-count {
         height: auto;
-        color: $success;
+        color: #3fb950;
         text-style: bold;
         margin: 0 0 1 0;
         text-align: right;
     }
 
-    .btn-row        { height: auto; align: center middle; margin-top: 1; }
-    Button          { margin: 0 1; min-width: 16; }
+    /* ── Queue table ────────────────────────────────────────────── */
+    #queue-table {
+        height: 1fr;
+        border: solid #21262d;
+        background: #0d1117;
+    }
 
-    /* ── Queue toolbar ────────────────────────────────────────────────────── */
-    .queue-toolbar  {
+    /* ── Filter DataTables (Settings) ───────────────────────────── */
+    .filter-table {
+        height: 8;
+        border: solid #21262d;
+        margin-bottom: 1;
+        background: #0d1117;
+    }
+    .filter-table > .datatable--header { display: none; }
+    .filter-table > .datatable--cursor { background: #1c2128; }
+
+    /* ── Library tree ───────────────────────────────────────────── */
+    Tree {
+        height: 1fr;
+        border: solid #21262d;
+        background: #0d1117;
+        margin-bottom: 1;
+    }
+    Tree > .tree--guides { color: #30363d; }
+    Tree > .tree--cursor { background: #1c2128; }
+
+    /* ── Buttons ────────────────────────────────────────────────── */
+    Button {
+        background: #161b22;
+        color: #8b949e;
+        border: solid #30363d;
+        margin: 0 1;
+        min-width: 14;
+        text-style: none;
+    }
+    Button:hover {
+        background: #21262d;
+        color: #e6edf3;
+        border: solid #484f58;
+    }
+    Button:focus {
+        border: solid #e6b73e;
+        color: #e6edf3;
+    }
+    Button.-success {
+        background: #0d2318;
+        color: #3fb950;
+        border: solid #238636;
+    }
+    Button.-success:hover {
+        background: #238636;
+        color: #e6edf3;
+        border: solid #2ea043;
+    }
+    Button.-error {
+        background: #2a0e0e;
+        color: #f85149;
+        border: solid #da3633;
+    }
+    Button.-error:hover {
+        background: #da3633;
+        color: #e6edf3;
+        border: solid #f85149;
+    }
+    Button.-warning {
+        background: #271d06;
+        color: #d29922;
+        border: solid #9e6a03;
+    }
+    Button.-warning:hover {
+        background: #9e6a03;
+        color: #e6edf3;
+        border: solid #d29922;
+    }
+    Button.-primary {
+        background: #0d1926;
+        color: #58a6ff;
+        border: solid #1f6feb;
+    }
+    Button.-primary:hover {
+        background: #1f6feb;
+        color: #e6edf3;
+        border: solid #58a6ff;
+    }
+
+    /* ── Button rows ────────────────────────────────────────────── */
+    .btn-row {
         height: auto;
-        border-bottom: solid $surface-lighten-2;
+        align: center middle;
+        margin-top: 1;
+    }
+    .ops-btn { width: 100%; margin: 0 0 1 0; }
+
+    /* ── Queue toolbar ──────────────────────────────────────────── */
+    .queue-toolbar {
+        height: auto;
+        border-bottom: solid #21262d;
         margin-bottom: 1;
         padding: 0 0 1 0;
         layout: grid;
@@ -279,44 +439,66 @@ class MyrientTUI(App):
     }
     .queue-toolbar Select   { column-span: 2; }
     .queue-toolbar Input    { column-span: 2; }
-    .toolbar-btn-row        { column-span: 2; height: auto; align: center middle; }
-
-    /* ── Download progress area ───────────────────────────────────────────── */
-    #progress-area       { padding: 1 2; }
-    #lbl-global-progress { margin-bottom: 1; }
-    #global-progress     { margin-bottom: 1; display: none; }
-    .thread-divider      { margin-top: 1; color: $text-muted; }
-    .progress-container  { height: auto; margin-bottom: 1; padding: 0 0 1 0; border-bottom: solid $surface-darken-1; }
-
-    /* ── Library ops panel ────────────────────────────────────────────────── */
-    .ops-btn          { width: 100%; margin: 0 0 1 0; }
-    .legend-label     { margin: 1 0; color: $text-muted; }
-    #lib-status-label { margin-top: 1; color: $text-muted; }
-    #lib-progress-bar { display: none; }
-
-    /* ── Settings ─────────────────────────────────────────────────────────── */
-    .setting-label  { margin-top: 1; color: $text-muted; }
-
-    /* ── Logs ─────────────────────────────────────────────────────────────── */
-    RichLog         { height: 1fr; border: none; }
-
-    /* ── Confirm dialog ───────────────────────────────────────────────────── */
-    #dialog {
-        grid-size: 2;
-        padding: 1 2;
-        width: 60;
-        height: 10;
-        border: thick $error;
-        background: $surface;
+    .toolbar-btn-row {
+        column-span: 2;
+        height: auto;
         align: center middle;
     }
-    #question { column-span: 2; content-align: center middle; height: 1fr; }
+
+    /* ── Progress ───────────────────────────────────────────────── */
+    #progress-area       { padding: 1 2; background: #0d1117; }
+    #lbl-global-progress { margin-bottom: 1; color: #8b949e; }
+    #global-progress     { margin-bottom: 1; display: none; }
+    .thread-divider      { margin-top: 1; color: #30363d; }
+    .progress-container  {
+        height: auto;
+        margin-bottom: 1;
+        padding: 0 0 1 0;
+        border-bottom: solid #21262d;
+    }
+    #lib-progress-bar { display: none; }
+    ProgressBar > .bar--bar      { color: #e6b73e; }
+    ProgressBar > .bar--complete { color: #3fb950; }
+
+    /* ── Library status panel ───────────────────────────────────── */
+    .legend-label     { margin: 1 0; color: #484f58; }
+    #lib-status-label { margin-top: 1; color: #8b949e; }
+
+    /* ── Settings ───────────────────────────────────────────────── */
+    .setting-label { margin-top: 1; color: #8b949e; }
+    Switch { background: transparent; }
+
+    /* ── Logs ───────────────────────────────────────────────────── */
+    RichLog {
+        height: 1fr;
+        border: none;
+        background: #0d1117;
+        color: #8b949e;
+    }
+
+    /* ── Confirm dialog ─────────────────────────────────────────── */
+    #dialog {
+        grid-size: 2;
+        padding: 2 3;
+        width: 64;
+        height: 11;
+        border: thick #f85149;
+        background: #161b22;
+        align: center middle;
+    }
+    #question {
+        column-span: 2;
+        content-align: center middle;
+        height: 1fr;
+        color: #e6edf3;
+        text-style: bold;
+    }
     """
 
     BINDINGS = [
-        ("q",     "quit",        "Quit"),
-        ("d",     "toggle_dark", "Theme"),
-        ("ctrl+r","app.refresh_browser", "Refresh"),
+        ("ctrl+q", "quit",                  "Quit"),
+        ("ctrl+d", "toggle_dark",           "Theme"),
+        ("ctrl+r", "refresh_browser",       "Refresh"),
     ]
 
     def __init__(self):
@@ -406,78 +588,79 @@ class MyrientTUI(App):
         yield Header(show_clock=True)
         with TabbedContent(id="tabs"):
 
-            # ── Browser ──────────────────────────────────────────────────────
-            with TabPane("  Browser  ", id="tab-browser"):
+            # ── ◈ Browse ─────────────────────────────────────────────────────
+            with TabPane("  ◈ Browse  ", id="tab-browser"):
                 with Horizontal(classes="h-layout"):
-                    with Vertical(classes="pane pane-35"):
-                        yield Label("Consoles", classes="section-header")
+                    with Vertical(classes="panel panel-35"):
+                        yield Label("▸ CONSOLES", classes="section-header")
                         yield Input(
-                            placeholder="Filter consoles…",
+                            placeholder="  filter consoles…",
                             id="search-consoles",
                             classes="search-bar",
                         )
                         yield ListView(id="console-list")
 
-                    with Vertical(classes="pane pane-65"):
-                        yield Label(
-                            "Games  [dim]Space = select · Q = queue selected[/dim]",
-                            classes="section-header",
-                        )
+                    with Vertical(classes="panel panel-65"):
+                        yield Label("▸ GAMES", classes="section-header")
                         yield Input(
-                            placeholder="Search games…",
+                            placeholder="  search games…",
                             id="search-games",
                             classes="search-bar",
                         )
                         yield DataTable(id="game-list", cursor_type="row", zebra_stripes=False)
                         yield Label("", id="game-selection-count")
                         with Horizontal(classes="btn-row"):
-                            yield Button("Queue Selected  [dim](Q)[/dim]", id="btn-add-queue", variant="success")
-                            yield Button("↺  Refresh", id="btn-refresh-games", variant="default")
+                            yield Button("▸ Queue Selected", id="btn-add-queue", variant="success")
+                            yield Button("↺ Refresh", id="btn-refresh-games")
+                        yield Label(
+                            "[dim]Space[/dim] select · [dim]Q[/dim] queue · [dim]↑↓[/dim] navigate",
+                            classes="hint-bar",
+                        )
 
-            # ── Queue & Downloads ─────────────────────────────────────────────
-            with TabPane("  Queue & Downloads  ", id="tab-queue-dl"):
+            # ── ▶ Downloads ──────────────────────────────────────────────────
+            with TabPane("  ▶ Downloads  ", id="tab-queue-dl"):
                 with Horizontal(classes="h-layout"):
-                    with Vertical(classes="pane pane-40"):
-                        yield Label("Queue Profiles", classes="section-header")
+                    with Vertical(classes="panel panel-40"):
+                        yield Label("▸ QUEUE PROFILES", classes="section-header")
                         with Vertical(classes="queue-toolbar"):
-                            yield Select([], id="queue-select", prompt="Active profile…")
-                            yield Input(placeholder="New profile name…", id="input-new-queue")
+                            yield Select([], id="queue-select", prompt="active profile…")
+                            yield Input(placeholder="new profile name…", id="input-new-queue")
                             with Horizontal(classes="toolbar-btn-row"):
                                 yield Button("Create", id="btn-create-queue", variant="success")
                                 yield Button("Delete", id="btn-delete-queue", variant="error")
                         yield DataTable(id="queue-table")
                         with Horizontal(classes="btn-row"):
                             yield Button("Remove", id="btn-remove-items", variant="warning")
-                            yield Button("▶  Start", id="btn-start-dl", variant="primary")
-                            yield Button("⏸  Pause", id="btn-pause-dl", variant="error")
+                            yield Button("▶ Start", id="btn-start-dl", variant="primary")
+                            yield Button("⏸ Pause", id="btn-pause-dl", variant="error")
 
-                    with VerticalScroll(classes="pane pane-60", id="progress-area"):
+                    with VerticalScroll(classes="panel panel-60", id="progress-area"):
                         yield Label(
-                            "Queue Progress: 0 / 0",
+                            "▸ DOWNLOAD PROGRESS",
                             id="lbl-global-progress",
                             classes="section-header",
                         )
                         yield ProgressBar(id="global-progress", show_eta=True)
                         yield Label(
-                            "[dim]Active downloads appear below[/dim]",
+                            "[dim]active threads appear below[/dim]",
                             classes="thread-divider",
                         )
 
-            # ── Library Manager ───────────────────────────────────────────────
-            with TabPane("  Library  ", id="tab-library"):
+            # ── ⬡ Library ────────────────────────────────────────────────────
+            with TabPane("  ⬡ Library  ", id="tab-library"):
                 with Horizontal(classes="h-layout"):
-                    with Vertical(classes="pane pane-75"):
-                        yield Label("Local Library", classes="section-header")
+                    with Vertical(classes="panel panel-75"):
+                        yield Label("▸ LOCAL LIBRARY", classes="section-header")
                         yield Tree("Scanning…", id="lib-tree")
                         with Horizontal(classes="btn-row"):
                             yield Button(
-                                "🗑  Delete Selected",
+                                "✕ Delete Selected",
                                 id="btn-lib-delete",
                                 variant="error",
                             )
 
-                    with VerticalScroll(classes="pane pane-25"):
-                        yield Label("Operations", classes="section-header")
+                    with VerticalScroll(classes="panel panel-25"):
+                        yield Label("▸ OPERATIONS", classes="section-header")
                         yield Button(
                             "Scan & Organize",
                             id="btn-lib-organize",
@@ -494,8 +677,13 @@ class MyrientTUI(App):
                             classes="ops-btn",
                         )
                         yield Button(
-                            "↺  Refresh Status",
+                            "↺ Refresh Status",
                             id="btn-lib-refresh-status",
+                            classes="ops-btn",
+                        )
+                        yield Button(
+                            "Re-queue Failures",
+                            id="btn-requeue-failed",
                             classes="ops-btn",
                         )
                         yield Label(
@@ -504,54 +692,59 @@ class MyrientTUI(App):
                             "[yellow]~[/] Incomplete",
                             classes="legend-label",
                         )
-                        yield Button(
-                            "Re-queue Failures",
-                            id="btn-requeue-failed",
-                            classes="ops-btn",
-                        )
-                        yield Label("Status", classes="section-header")
+                        yield Label("▸ STATUS", classes="section-header")
                         yield Label("Idle", id="lib-status-label")
                         yield ProgressBar(id="lib-progress-bar", show_eta=True)
 
-            # ── Settings ──────────────────────────────────────────────────────
-            with TabPane("  Settings  ", id="tab-settings"):
+            # ── ◎ Settings ───────────────────────────────────────────────────
+            with TabPane("  ◎ Settings  ", id="tab-settings"):
                 with Horizontal(classes="h-layout"):
-                    with VerticalScroll(classes="pane pane-50"):
-                        yield Label("Paths & Engine", classes="section-header")
+                    with VerticalScroll(classes="panel panel-50"):
+                        yield Label("▸ PATHS & ENGINE", classes="section-header")
                         yield Label("Library root path", classes="setting-label")
                         yield Input(
                             value=self.state.settings["library_root"],
                             id="set-lib-path",
                         )
-                        yield Label("Max concurrent downloads  [dim](1–10)[/dim]", classes="setting-label")
+                        yield Label(
+                            "Max concurrent downloads  [dim](1–10)[/dim]",
+                            classes="setting-label",
+                        )
                         yield Input(
                             value=str(self.state.settings["max_concurrent"]),
                             id="set-threads",
                         )
-                        yield Label("Post-download CHD conversion", classes="setting-label")
+                        yield Label(
+                            "Auto-convert to CHD after download",
+                            classes="setting-label",
+                        )
                         yield Switch(
                             value=self.state.settings.get("auto_convert_chd", False),
                             id="set-auto-chd",
                         )
-                        yield Button("Save Settings", id="btn-save-settings", variant="success")
+                        yield Button(
+                            "▸ Save Settings",
+                            id="btn-save-settings",
+                            variant="success",
+                        )
 
-                    with VerticalScroll(classes="pane pane-50"):
-                        yield Label("Regional Include Filter", classes="section-header")
+                    with VerticalScroll(classes="panel panel-50"):
+                        yield Label("▸ REGIONAL INCLUDE FILTER", classes="section-header")
                         yield Label(
-                            "[dim]Only show games matching these tags (empty = show all)[/dim]",
+                            "[dim]Only show games matching these regions  (empty = show all)[/dim]",
                             classes="setting-label",
                         )
                         yield DataTable(id="set-include", classes="filter-table")
-                        yield Label("Type Exclude Filter", classes="section-header")
+                        yield Label("▸ TYPE EXCLUDE FILTER", classes="section-header")
                         yield Label(
                             "[dim]Hide games matching these tags[/dim]",
                             classes="setting-label",
                         )
                         yield DataTable(id="set-exclude", classes="filter-table")
 
-            # ── Logs ──────────────────────────────────────────────────────────
-            with TabPane("  Logs  ", id="tab-logs"):
-                with Vertical(classes="pane pane-100"):
+            # ── ≡ Logs ───────────────────────────────────────────────────────
+            with TabPane("  ≡ Logs  ", id="tab-logs"):
+                with Vertical(classes="panel panel-100"):
                     yield RichLog(id="sys-log", markup=True, wrap=True, max_lines=1000)
 
         yield Footer()
@@ -589,7 +782,7 @@ class MyrientTUI(App):
     def _log(self, msg: str, is_error: bool = False) -> None:
         try:
             log_widget = self.query_one("#sys-log", RichLog)
-            prefix = "[bold red]ERROR:[/]" if is_error else "[dim cyan]INFO:[/]"
+            prefix = "[bold #f85149]✗ ERR[/]" if is_error else "[dim #e6b73e]◈ INF[/]"
             log_widget.write(f"{prefix} {msg}")
         except Exception:
             pass
@@ -1148,7 +1341,7 @@ class MyrientTUI(App):
                 pb.display = True
                 pb.update(total=self.global_total, progress=0)
                 self.query_one("#lbl-global-progress", Label).update(
-                    f"Queue Progress: 0 / {self.global_total}"
+                    f"[dim]▸ DOWNLOAD PROGRESS[/dim]  [#e6b73e]0 / {self.global_total}[/]"
                 )
             except Exception:
                 pass
@@ -1176,7 +1369,7 @@ class MyrientTUI(App):
         def _finish_ui(paused: bool) -> None:
             try:
                 self.query_one("#global-progress", ProgressBar).display = False
-                self.query_one("#lbl-global-progress", Label).update("Queue Progress: 0 / 0")
+                self.query_one("#lbl-global-progress", Label).update("[dim]▸ DOWNLOAD PROGRESS[/dim]  [dim]idle[/dim]")
             except Exception:
                 pass
 
@@ -1376,7 +1569,7 @@ class MyrientTUI(App):
         
         fmt_progress = self._format_size(message.completed)
         fmt_total = self._format_size(message.total)
-        status_text = f"[bold cyan]{message.action}[/] | [white]{message.item_name}[/] [dim]({fmt_progress} / {fmt_total})[/dim]"
+        status_text = f"[bold #e6b73e]{message.action}[/]  [#c9d1d9]{message.item_name}[/]  [dim]{fmt_progress} / {fmt_total}[/dim]"
         
         try: 
             self.query_one(f"#{pb_id}", ProgressBar).update(progress=message.completed, total=message.total)
@@ -1399,7 +1592,7 @@ class MyrientTUI(App):
             try:
                 self.query_one("#global-progress", ProgressBar).advance(1)
                 self.query_one("#lbl-global-progress", Label).update(
-                    f"Queue Progress: {completed_snap} / {self.global_total}"
+                    f"[dim]▸ DOWNLOAD PROGRESS[/dim]  [#e6b73e]{completed_snap} / {self.global_total}[/]"
                 )
             except Exception:
                 pass
@@ -1777,7 +1970,7 @@ class MyrientTUI(App):
             try:
                 tree = self.query_one("#lib-tree", Tree)
                 tree.clear()
-                tree.root.label = f"[bold]{library.name if library.exists() else 'Library'}[/bold]"
+                tree.root.label = f"[bold #e6b73e]{library.name if library.exists() else 'Library'}[/bold]"
 
                 for console_name, (console_path, games) in structure.items():
                     n_ok   = sum(1 for _, s in games if s == "validated")
@@ -1789,7 +1982,7 @@ class MyrientTUI(App):
                         f"[yellow]{n_inc}~[/yellow]" if n_inc else "",
                     ]))
                     console_node = tree.root.add(
-                        f"[bold cyan]{console_name}[/]  {badges}",
+                        f"[bold #e6b73e]{console_name}[/]  {badges}",
                         data=console_path
                     )
                     for game_dir, status in games:
