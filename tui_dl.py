@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, unquote, urljoin
 
 from bs4 import BeautifulSoup
+from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
@@ -179,6 +180,14 @@ class LibraryProgress(Message):
         self.total = total
         super().__init__()
 
+class LibraryTreeReady(Message):
+    """Carries the fully-built library structure to the main thread for Tree rendering."""
+    def __init__(self, structure: dict, library_path: "Path"):
+        self.structure = structure
+        self.library_path = library_path
+        super().__init__()
+
+
 class ConfirmDeleteScreen(ModalScreen[bool]):
     def __init__(self, target_name: str):
         super().__init__()
@@ -221,17 +230,17 @@ class MyrientTUI(App):
     /* ── Footer ─────────────────────────────────────────────────── */
     Footer {
         background: #0d1117;
-        color: #484f58;
-        border-top: solid #21262d;
+        color: #606878;
+        border-top: solid #2a2f3a;
     }
 
     /* ── Tab strip ──────────────────────────────────────────────── */
     TabbedContent > Tabs {
         background: #0d1117;
-        border-bottom: solid #21262d;
+        border-bottom: solid #2a2f3a;
     }
     TabbedContent > Tabs > Tab {
-        color: #484f58;
+        color: #606878;
         padding: 0 3;
         background: #0d1117;
     }
@@ -242,8 +251,8 @@ class MyrientTUI(App):
         border-top: tall #e6b73e;
     }
     TabbedContent > Tabs > Tab:hover {
-        color: #8b949e;
-        background: #161b22;
+        color: #9aa0aa;
+        background: #0d1117;
     }
     #tabs       { height: 1fr; }
     TabPane     { background: #0d1117; }
@@ -252,9 +261,9 @@ class MyrientTUI(App):
     .h-layout   { layout: horizontal; height: 1fr; }
     .panel      {
         height: 1fr;
-        border: solid #21262d;
+        border: solid #2a2f3a;
         padding: 1 2;
-        background: #161b22;
+        background: #0d1117;
     }
     .panel-25   { width: 25%; }
     .panel-30   { width: 30%; }
@@ -280,7 +289,7 @@ class MyrientTUI(App):
     /* ── Hint bar (keyboard hints, counts) ──────────────────────── */
     .hint-bar {
         height: auto;
-        color: #484f58;
+        color: #606878;
         margin-top: 1;
         margin-bottom: 0;
         text-align: right;
@@ -290,7 +299,7 @@ class MyrientTUI(App):
     .search-bar     { margin-bottom: 1; }
     Input {
         background: #0d1117;
-        border: solid #30363d;
+        border: solid #3a4050;
         color: #e6edf3;
     }
     Input:focus { border: solid #e6b73e; }
@@ -298,31 +307,31 @@ class MyrientTUI(App):
     /* ── ListView (console list) ────────────────────────────────── */
     #console-list {
         height: 1fr;
-        border: solid #21262d;
+        border: solid #2a2f3a;
         background: #0d1117;
     }
     ListView > ListItem {
         background: transparent;
         padding: 0 1;
-        color: #c9d1d9;
+        color: #e0e6ee;
     }
     ListView > ListItem.--highlight {
-        background: #1c2128;
+        background: #1a1f2e;
         color: #e6edf3;
     }
     ListView:focus > ListItem.--highlight {
-        background: #1c2128;
+        background: #1a1f2e;
         border-left: thick #e6b73e;
     }
 
     /* ── Game browser DataTable ─────────────────────────────────── */
     #game-list {
         height: 1fr;
-        border: solid #21262d;
+        border: solid #2a2f3a;
         background: #0d1117;
     }
     #game-list > .datatable--header  { display: none; }
-    #game-list > .datatable--cursor  { background: #1c2128; }
+    #game-list > .datatable--cursor  { background: #1a1f2e; }
 
     /* ── Selection counter ──────────────────────────────────────── */
     #game-selection-count {
@@ -336,43 +345,43 @@ class MyrientTUI(App):
     /* ── Queue table ────────────────────────────────────────────── */
     #queue-table {
         height: 1fr;
-        border: solid #21262d;
+        border: solid #2a2f3a;
         background: #0d1117;
     }
 
     /* ── Filter DataTables (Settings) ───────────────────────────── */
     .filter-table {
         height: 8;
-        border: solid #21262d;
+        border: solid #2a2f3a;
         margin-bottom: 1;
         background: #0d1117;
     }
     .filter-table > .datatable--header { display: none; }
-    .filter-table > .datatable--cursor { background: #1c2128; }
+    .filter-table > .datatable--cursor { background: #1a1f2e; }
 
     /* ── Library tree ───────────────────────────────────────────── */
     Tree {
         height: 1fr;
-        border: solid #21262d;
+        border: solid #2a2f3a;
         background: #0d1117;
         margin-bottom: 1;
     }
-    Tree > .tree--guides { color: #30363d; }
-    Tree > .tree--cursor { background: #1c2128; }
+    Tree > .tree--guides { color: #3a4050; }
+    Tree > .tree--cursor { background: #1a1f2e; }
 
     /* ── Buttons ────────────────────────────────────────────────── */
     Button {
-        background: #161b22;
-        color: #8b949e;
-        border: solid #30363d;
+        background: #0d1117;
+        color: #9aa0aa;
+        border: solid #3a4050;
         margin: 0 1;
         min-width: 14;
         text-style: none;
     }
     Button:hover {
-        background: #21262d;
+        background: #2a2f3a;
         color: #e6edf3;
-        border: solid #484f58;
+        border: solid #606878;
     }
     Button:focus {
         border: solid #e6b73e;
@@ -430,7 +439,7 @@ class MyrientTUI(App):
     /* ── Queue toolbar ──────────────────────────────────────────── */
     .queue-toolbar {
         height: auto;
-        border-bottom: solid #21262d;
+        border-bottom: solid #2a2f3a;
         margin-bottom: 1;
         padding: 0 0 1 0;
         layout: grid;
@@ -447,25 +456,25 @@ class MyrientTUI(App):
 
     /* ── Progress ───────────────────────────────────────────────── */
     #progress-area       { padding: 1 2; background: #0d1117; }
-    #lbl-global-progress { margin-bottom: 1; color: #8b949e; }
+    #lbl-global-progress { margin-bottom: 1; color: #9aa0aa; }
     #global-progress     { margin-bottom: 1; display: none; }
-    .thread-divider      { margin-top: 1; color: #30363d; }
+    .thread-divider      { margin-top: 1; color: #3a4050; }
     .progress-container  {
         height: auto;
         margin-bottom: 1;
         padding: 0 0 1 0;
-        border-bottom: solid #21262d;
+        border-bottom: solid #2a2f3a;
     }
     #lib-progress-bar { display: none; }
     ProgressBar > .bar--bar      { color: #e6b73e; }
     ProgressBar > .bar--complete { color: #3fb950; }
 
     /* ── Library status panel ───────────────────────────────────── */
-    .legend-label     { margin: 1 0; color: #484f58; }
-    #lib-status-label { margin-top: 1; color: #8b949e; }
+    .legend-label     { margin: 1 0; color: #606878; }
+    #lib-status-label { margin-top: 1; color: #9aa0aa; }
 
     /* ── Settings ───────────────────────────────────────────────── */
-    .setting-label { margin-top: 1; color: #8b949e; }
+    .setting-label { margin-top: 1; color: #9aa0aa; }
     Switch { background: transparent; }
 
     /* ── Logs ───────────────────────────────────────────────────── */
@@ -473,7 +482,7 @@ class MyrientTUI(App):
         height: 1fr;
         border: none;
         background: #0d1117;
-        color: #8b949e;
+        color: #9aa0aa;
     }
 
     /* ── Confirm dialog ─────────────────────────────────────────── */
@@ -483,7 +492,7 @@ class MyrientTUI(App):
         width: 64;
         height: 11;
         border: thick #f85149;
-        background: #161b22;
+        background: #0d1117;
         align: center middle;
     }
     #question {
@@ -771,7 +780,7 @@ class MyrientTUI(App):
             tbl.add_column("Tag", key="name")
             tbl.show_header = False
             for label, value in opts:
-                tbl.add_row("[dim] [/dim]", f"[dim]{label}[/dim]", key=value)
+                tbl.add_row(Text(" ", style="dim"), Text(label, style="dim"), key=value)
 
         self._refresh_queue_dropdown()
         self._refresh_queue_table()
@@ -782,13 +791,85 @@ class MyrientTUI(App):
     def _log(self, msg: str, is_error: bool = False) -> None:
         try:
             log_widget = self.query_one("#sys-log", RichLog)
-            prefix = "[bold #f85149]✗ ERR[/]" if is_error else "[dim #e6b73e]◈ INF[/]"
-            log_widget.write(f"{prefix} {msg}")
+            # Build a Text object so the message body is NEVER parsed as markup.
+            # Brackets in filenames/exception text (e.g. [USA], [/bold]) are safe.
+            line = Text()
+            if is_error:
+                line.append("✗ ERR", style="bold #f85149")
+            else:
+                line.append("◈ INF", style="dim #e6b73e")
+            line.append(" " + msg)   # plain — no markup parsing
+            log_widget.write(line)
         except Exception:
             pass
 
     def on_system_log(self, message: SystemLog) -> None: 
         self._log(message.message, message.is_error)
+
+    def on_library_tree_ready(self, message: LibraryTreeReady) -> None:
+        """Runs on the main thread — safe to touch the widget tree.
+        Uses rich.text.Text objects for all user-controlled labels so that
+        brackets in game/console names (e.g. [USA], [SLES-00867]) are NEVER
+        parsed as markup tags.
+        """
+        AMBER  = "#e6b73e"
+        GREEN  = "bold green"
+        RED    = "bold red"
+        YELLOW = "yellow"
+        DIM    = "dim"
+
+        def _game_label(name: str, status: str) -> Text:
+            t = Text(no_wrap=True, overflow="ellipsis")
+            if status == "validated":
+                t.append("✓  ", style=GREEN)
+                t.append(name,   style=GREEN)
+            elif status == "corrupted":
+                t.append("✗  ", style=RED)
+                t.append(name,   style=RED)
+            else:
+                t.append("~  ", style=YELLOW)
+                t.append(name,   style=YELLOW)
+            return t
+
+        def _console_label(name: str, n_ok: int, n_bad: int, n_inc: int) -> Text:
+            t = Text(no_wrap=True)
+            t.append(name, style=f"bold {AMBER}")
+            if n_ok:
+                t.append(f"  {n_ok}✓", style=GREEN)
+            if n_bad:
+                t.append(f"  {n_bad}✗", style=RED)
+            if n_inc:
+                t.append(f"  {n_inc}~", style=YELLOW)
+            return t
+
+        try:
+            tree = self.query_one("#lib-tree", Tree)
+            tree.clear()
+            library = message.library_path
+            root_name = library.name if library.exists() else "Library"
+            root_label = Text(root_name, style=f"bold {AMBER}", no_wrap=True)
+            tree.root.label = root_label
+
+            for console_name, (console_path, games) in message.structure.items():
+                n_ok  = sum(1 for _, s in games if s == "validated")
+                n_bad = sum(1 for _, s in games if s == "corrupted")
+                n_inc = sum(1 for _, s in games if s == "incomplete")
+                console_node = tree.root.add(
+                    _console_label(console_name, n_ok, n_bad, n_inc),
+                    data=console_path,
+                )
+                for game_dir, status in games:
+                    console_node.add_leaf(_game_label(game_dir.name, status), data=game_dir)
+
+            if not message.structure:
+                no_games = Text("No consoles found — check library path in Settings", style=DIM)
+                tree.root.add_leaf(no_games)
+
+            tree.root.expand()
+            self.query_one("#lib-status-label", Label).update("[dim]Scan complete[/dim]")
+            self.query_one("#lib-progress-bar", ProgressBar).display = False
+        except Exception as e:
+            self._log(f"Tree build error: {e}", is_error=True)
 
     def on_library_progress(self, message: LibraryProgress) -> None:
         try:
@@ -806,11 +887,15 @@ class MyrientTUI(App):
                 item_display = item_display[:47] + "…"
 
             if is_done:
-                status_label.update(f"[dim]{message.task_name}: {message.current_item}[/dim]")
+                done_text = Text()
+                done_text.append(f"{message.task_name}: {message.current_item}", style="dim")
+                status_label.update(done_text)
             else:
-                status_label.update(
-                    f"[bold]{message.task_name}[/]\n[dim]{item_display}[/dim]"
-                )
+                progress_text = Text()
+                progress_text.append(message.task_name, style="bold")
+                progress_text.append("\n")
+                progress_text.append(item_display, style="dim")
+                status_label.update(progress_text)
         except Exception:
             pass
 
@@ -833,30 +918,23 @@ class MyrientTUI(App):
             return True
         return self._compile_fuzzy_pattern(query).search(text.lower()) is not None
 
-    def fuzzy_highlight_fast(self, text: str, hl_compiled: Optional[re.Pattern]) -> str:
-        """Injects explicit [white] tags so text stays visible against dark backgrounds."""
-        safe_text = text.replace("[", "\\[")
-        
+    def fuzzy_highlight_fast(self, text: str, hl_compiled: Optional[re.Pattern]) -> Text:
+        """Returns a Text object with fuzzy-match characters highlighted.
+        Using Text avoids any markup parsing — brackets in game names are safe."""
         if not hl_compiled:
-            return f"[white]{safe_text}[/white]"
-        
-        # IMPORTANT: search on safe_text so group positions align with the escaped output
-        match = hl_compiled.search(safe_text)
+            return Text(text, style="white", no_wrap=True)
+
+        match = hl_compiled.search(text)
         if not match:
-            return f"[white]{safe_text}[/white]"
-            
-        groups = match.groups()
-        result_array = []
-        
-        for i, group_text in enumerate(groups):
+            return Text(text, style="white", no_wrap=True)
+
+        result = Text(no_wrap=True)
+        for i, group_text in enumerate(match.groups()):
             if not group_text:
                 continue
-            if i % 2 == 1:
-                result_array.append(f"[bold #ff0044]{group_text}[/]")
-            else:
-                result_array.append(f"[white]{group_text}[/white]")
-                
-        return "".join(result_array)
+            # Odd capture groups = matched chars; even = surrounding plain text
+            result.append(group_text, style="bold #e6b73e" if i % 2 == 1 else "white")
+        return result
 
     def on_key(self, event) -> None:
         """Space toggles selections; Q queues games — routing depends on which widget is focused."""
@@ -904,14 +982,12 @@ class MyrientTUI(App):
         if not game_data:
             return
         selected = url_part in self._selected_games
-        sel_mark = "[bold green]✓[/]" if selected else "[dim] [/dim]"
         name_str = game_data["name"]
-        name_markup = (
-            f"[bold green]{name_str}[/]" if selected else f"[dim]{name_str}[/dim]"
-        )
+        sel_cell  = Text("✓", style="bold green") if selected else Text(" ", style="dim")
+        name_cell = Text(name_str, style="bold green", no_wrap=True) if selected else Text(name_str, style="dim", no_wrap=True)
         try:
-            game_table.update_cell(url_part, "sel", sel_mark, update_width=False)
-            game_table.update_cell(url_part, "name", name_markup, update_width=False)
+            game_table.update_cell(url_part, "sel",  sel_cell,  update_width=False)
+            game_table.update_cell(url_part, "name", name_cell, update_width=False)
         except Exception:
             pass
 
@@ -952,11 +1028,11 @@ class MyrientTUI(App):
     def _refresh_filter_row(self, tbl: DataTable, tag: str, sel_set: set) -> None:
         """Re-render a single filter row to reflect its current selection state."""
         selected = tag in sel_set
-        sel_mark   = "[bold cyan]✓[/]"       if selected else "[dim] [/dim]"
-        name_markup = f"[bold cyan]{tag}[/]" if selected else f"[dim]{tag}[/dim]"
+        sel_cell  = Text("✓", style="bold cyan") if selected else Text(" ", style="dim")
+        name_cell = Text(tag, style="bold cyan") if selected else Text(tag, style="dim")
         try:
-            tbl.update_cell(tag, "sel",  sel_mark,    update_width=False)
-            tbl.update_cell(tag, "name", name_markup, update_width=False)
+            tbl.update_cell(tag, "sel",  sel_cell,  update_width=False)
+            tbl.update_cell(tag, "name", name_cell, update_width=False)
         except Exception:
             pass
 
@@ -1012,15 +1088,16 @@ class MyrientTUI(App):
             if fuzzy_pat is not None and not fuzzy_pat.search(name):
                 continue
             selected = url_part in self._selected_games
-            sel_mark   = "[bold green]✓[/]" if selected else "[dim] [/dim]"
-            # Search highlight on unselected; selected rows always show full green bold
+            sel_cell = Text("✓", style="bold green") if selected else Text(" ", style="dim")
             if selected:
-                name_markup = f"[bold green]{name}[/]"
+                name_cell = Text(name, style="bold green", no_wrap=True)
             elif hl_compiled:
-                name_markup = self.fuzzy_highlight_fast(name, hl_compiled)
+                # fuzzy_highlight_fast returns a markup string — wrap in Text.from_markup
+                # but first escape the name portion to neutralise any brackets
+                name_cell = self.fuzzy_highlight_fast(name, hl_compiled)
             else:
-                name_markup = f"[dim]{name}[/dim]"
-            game_table.add_row(sel_mark, name_markup, game["size_str"], key=url_part)
+                name_cell = Text(name, style="dim", no_wrap=True)
+            game_table.add_row(sel_cell, name_cell, game["size_str"], key=url_part)
             found += 1
 
         if found == 0 and self._all_games_data:
@@ -1569,7 +1646,12 @@ class MyrientTUI(App):
         
         fmt_progress = self._format_size(message.completed)
         fmt_total = self._format_size(message.total)
-        status_text = f"[bold #e6b73e]{message.action}[/]  [#c9d1d9]{message.item_name}[/]  [dim]{fmt_progress} / {fmt_total}[/dim]"
+        status_line = Text()
+        status_line.append(message.action, style="bold #e6b73e")
+        status_line.append("  ")
+        status_line.append(message.item_name, style="#c9d1d9")
+        status_line.append(f"  {fmt_progress} / {fmt_total}", style="dim")
+        status_text = status_line
         
         try: 
             self.query_one(f"#{pb_id}", ProgressBar).update(progress=message.completed, total=message.total)
@@ -1902,8 +1984,9 @@ class MyrientTUI(App):
 
     @work(exclusive=True, thread=True)
     def run_lib_status_scan(self) -> None:
-        """Scans the library and rebuilds the Tree with color-coded game status nodes."""
+        """Scans the library and posts LibraryTreeReady for main-thread Tree rebuild."""
         library = Path(self.state.settings['library_root'])
+        self.post_message(LibraryProgress("Library Scan", "Scanning…", 0, 1))
 
         # structure: {console_name: (console_path, [(game_dir, status_str), ...])}
         structure: Dict[str, tuple] = {}
@@ -1966,39 +2049,7 @@ class MyrientTUI(App):
                 if games:
                     structure[console_dir.name] = (console_dir, games)
 
-        def _build_tree() -> None:
-            try:
-                tree = self.query_one("#lib-tree", Tree)
-                tree.clear()
-                tree.root.label = f"[bold #e6b73e]{library.name if library.exists() else 'Library'}[/bold]"
-
-                for console_name, (console_path, games) in structure.items():
-                    n_ok   = sum(1 for _, s in games if s == "validated")
-                    n_bad  = sum(1 for _, s in games if s == "corrupted")
-                    n_inc  = sum(1 for _, s in games if s == "incomplete")
-                    badges = " ".join(filter(None, [
-                        f"[bold green]{n_ok}✓[/]"   if n_ok  else "",
-                        f"[bold red]{n_bad}✗[/]"     if n_bad else "",
-                        f"[yellow]{n_inc}~[/yellow]" if n_inc else "",
-                    ]))
-                    console_node = tree.root.add(
-                        f"[bold #e6b73e]{console_name}[/]  {badges}",
-                        data=console_path
-                    )
-                    for game_dir, status in games:
-                        if status == "validated":
-                            label = f"[bold green]✓  {game_dir.name}[/]"
-                        elif status == "corrupted":
-                            label = f"[bold red]✗  {game_dir.name}[/]"
-                        else:
-                            label = f"[yellow]~  {game_dir.name}[/yellow]"
-                        console_node.add_leaf(label, data=game_dir)
-
-                tree.root.expand()
-            except Exception:
-                pass
-
-        self.call_from_thread(_build_tree)
+        self.post_message(LibraryTreeReady(structure, library))
 
     @work(exclusive=True, thread=True)
     def requeue_failed_games(self) -> None:
