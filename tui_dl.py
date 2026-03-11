@@ -6,9 +6,11 @@ A high-performance Textual application for managing Redump libraries.
 from __future__ import annotations  # enable PEP 604 / lowercase generics on 3.9+
 
 import concurrent.futures
+import datetime
 import hashlib
 import json
 import logging
+import operator
 import os
 import re
 import shutil
@@ -75,6 +77,15 @@ _FLUSH_INTERVAL:     float = 3.0    # seconds between deferred config saves
 
 # Tuple allocated once — _format_size is called twice per progress tick per thread
 _SIZE_UNITS: tuple[str, ...] = ('B', 'KB', 'MB', 'GB', 'TB')
+
+# Dict allocated once — _parse_size_bytes is called per download queue item
+_SIZE_MULTIPLIERS: dict[str, int] = {
+    "B": 1,
+    "K": 1024,
+    "M": 1024 ** 2,
+    "G": 1024 ** 3,
+    "T": 1024 ** 4,
+}
 
 # Frozenset for O(1) membership test in on_library_progress
 _PROGRESS_DONE_STATES: frozenset[str] = frozenset({"done", "complete", "failed"})
@@ -550,11 +561,31 @@ class MyrientTUI(App):
     ProgressBar > .bar--bar      { color: #e6b73e; }
     ProgressBar > .bar--complete { color: #3fb950; }
 
-    /* ── Library status panel ───────────────────────────────────── */
-    .legend-label     { margin: 1 0; color: #606878; }
-    #lib-status-label { margin-top: 1; color: #9aa0aa; }
+    /* ── Library tab layout wrapper ─────────────────────────────── */
+    #lib-tab-wrapper { height: 1fr; }
+
+    /* ── Library status bar (full-width strip, bottom of Library tab) ── */
+    #lib-status-bar {
+        height: 4;
+        padding: 0 2;
+        border-top: solid #2a2f3a;
+        background: #0d1117;
+        layout: horizontal;
+        align: left middle;
+    }
+    #lib-status-label {
+        width: 1fr;
+        height: auto;
+        color: #9aa0aa;
+        content-align: left middle;
+    }
+    #lib-status-bar ProgressBar {
+        width: 35%;
+        display: none;
+    }
 
     /* ── Settings ───────────────────────────────────────────────── */
+    .legend-label  { margin: 1 0; color: #606878; }
     .setting-label { margin-top: 1; color: #9aa0aa; }
     Switch { background: transparent; }
 
@@ -750,51 +781,54 @@ class MyrientTUI(App):
 
             # ── ⬡ Library ────────────────────────────────────────────────────
             with TabPane("  ⬡ Library  ", id="tab-library"):
-                with Horizontal(classes="h-layout"):
-                    with Vertical(classes="panel panel-75"):
-                        yield Label("▸ LOCAL LIBRARY", classes="section-header")
-                        yield Tree("Scanning…", id="lib-tree")
-                        with Horizontal(classes="btn-row"):
+                with Vertical(id="lib-tab-wrapper"):
+                    with Horizontal(classes="h-layout"):
+                        with Vertical(classes="panel panel-75"):
+                            yield Label("▸ LOCAL LIBRARY", classes="section-header")
+                            yield Tree("Scanning…", id="lib-tree")
+                            with Horizontal(classes="btn-row"):
+                                yield Button(
+                                    "✕ Delete Selected",
+                                    id="btn-lib-delete",
+                                    variant="error",
+                                )
+
+                        with VerticalScroll(classes="panel panel-25"):
+                            yield Label("▸ OPERATIONS", classes="section-header")
                             yield Button(
-                                "✕ Delete Selected",
-                                id="btn-lib-delete",
-                                variant="error",
+                                "Scan & Organize",
+                                id="btn-lib-organize",
+                                classes="ops-btn",
+                            )
+                            yield Button(
+                                "Verify vs. Redump DAT",
+                                id="btn-lib-dat-audit",
+                                classes="ops-btn",
+                            )
+                            yield Button(
+                                "Convert to CHD",
+                                id="btn-lib-convert",
+                                classes="ops-btn",
+                            )
+                            yield Button(
+                                "↺ Refresh Status",
+                                id="btn-lib-refresh-status",
+                                classes="ops-btn",
+                            )
+                            yield Button(
+                                "Re-queue Failures",
+                                id="btn-requeue-failed",
+                                classes="ops-btn",
+                            )
+                            yield Label(
+                                "[bold green]✓[/] Validated  "
+                                "[bold red]✗[/] Corrupted  "
+                                "[yellow]~[/] Incomplete",
+                                classes="legend-label",
                             )
 
-                    with VerticalScroll(classes="panel panel-25"):
-                        yield Label("▸ OPERATIONS", classes="section-header")
-                        yield Button(
-                            "Scan & Organize",
-                            id="btn-lib-organize",
-                            classes="ops-btn",
-                        )
-                        yield Button(
-                            "Verify vs. Redump DAT",
-                            id="btn-lib-dat-audit",
-                            classes="ops-btn",
-                        )
-                        yield Button(
-                            "Convert to CHD",
-                            id="btn-lib-convert",
-                            classes="ops-btn",
-                        )
-                        yield Button(
-                            "↺ Refresh Status",
-                            id="btn-lib-refresh-status",
-                            classes="ops-btn",
-                        )
-                        yield Button(
-                            "Re-queue Failures",
-                            id="btn-requeue-failed",
-                            classes="ops-btn",
-                        )
-                        yield Label(
-                            "[bold green]✓[/] Validated  "
-                            "[bold red]✗[/] Corrupted  "
-                            "[yellow]~[/] Incomplete",
-                            classes="legend-label",
-                        )
-                        yield Label("▸ STATUS", classes="section-header")
+                    # ── Full-width status bar spanning the bottom of the tab ──
+                    with Container(id="lib-status-bar"):
                         yield Label("Idle", id="lib-status-label")
                         yield ProgressBar(id="lib-progress-bar", show_eta=True)
 
@@ -887,14 +921,22 @@ class MyrientTUI(App):
     def _log(self, msg: str, is_error: bool = False) -> None:
         try:
             log_widget = self.query_one("#sys-log", RichLog)
-            # Build a Text object so the message body is NEVER parsed as markup.
-            # Brackets in filenames/exception text (e.g. [USA], [/bold]) are safe.
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
             line = Text()
+            line.append(ts, style="dim #606878")
+            line.append("  ")
             if is_error:
-                line.append("✗ ERR", style="bold #f85149")
+                line.append("ERR", style="bold #f85149")
             else:
-                line.append("◈ INF", style="dim #e6b73e")
-            line.append(" " + msg)   # plain — no markup parsing
+                line.append("INF", style="dim #e6b73e")
+            line.append("  ")
+            # Parse Rich markup in the message body — all SystemLog callers are
+            # internal, so [bold], [yellow], etc. render as intended.  Fall back
+            # to plain text if the markup is malformed to avoid swallowing the message.
+            try:
+                line.append_text(Text.from_markup(msg))
+            except Exception:
+                line.append(msg)
             log_widget.write(line)
         except Exception:
             pass
@@ -973,26 +1015,32 @@ class MyrientTUI(App):
             progress_bar = self.query_one("#lib-progress-bar", ProgressBar)
             status_label = self.query_one("#lib-status-label", Label)
 
-            # Show bar when work is in progress, hide when signalled complete/done
             is_done = message.current_item.lower() in _PROGRESS_DONE_STATES
-            progress_bar.display = not is_done
-            if not is_done:
-                progress_bar.update(total=message.total, progress=message.completed)
 
+            # Truncate current item name so it fits on one line next to the bar
             item_display = message.current_item
-            if len(item_display) > 50:
-                item_display = item_display[:47] + "…"
+            if len(item_display) > 60:
+                item_display = item_display[:57] + "…"
 
             if is_done:
-                done_text = Text()
-                done_text.append(f"{message.task_name}: {message.current_item}", style="dim")
+                progress_bar.display = False
+                done_text = Text.assemble(
+                    (message.task_name, "bold #e6b73e"),
+                    ("  ", ""),
+                    (message.current_item, "dim"),
+                )
                 status_label.update(done_text)
             else:
-                progress_text = Text()
-                progress_text.append(message.task_name, style="bold")
-                progress_text.append("\n")
-                progress_text.append(item_display, style="dim")
-                status_label.update(progress_text)
+                progress_bar.display = True
+                progress_bar.update(total=message.total, progress=message.completed)
+                pct = int(message.completed / message.total * 100) if message.total else 0
+                status_text = Text.assemble(
+                    (message.task_name, "bold #e6b73e"),
+                    ("  ", ""),
+                    (f"{message.completed}/{message.total}  ", "dim"),
+                    (item_display, "#9aa0aa"),
+                )
+                status_label.update(status_text)
         except Exception:
             pass
 
@@ -1179,10 +1227,8 @@ class MyrientTUI(App):
             item.link_data = console
             new_items.append(item)
 
-        if hasattr(list_view, "extend"):
+        if new_items:
             list_view.extend(new_items)
-        else:
-            list_view.mount(*new_items)
 
     def _render_games(self, query: str = "") -> None:
         """
@@ -1555,7 +1601,7 @@ class MyrientTUI(App):
                 return
             self.engine_running = True
 
-        queue = self.state.get_active_queue().copy()
+        queue = self.state.get_active_queue()  # already returns a fresh list copy
         max_threads = self.state.settings.get("max_concurrent", 4)
 
         if not queue:
@@ -1937,10 +1983,10 @@ class MyrientTUI(App):
                 break
             self.post_message(LibraryProgress(f"Organizing ({i}/{total_ops})", game_dir.name, i, total_ops))
             parent_dir.mkdir(parents=True, exist_ok=True)
-
-            if game_dir.parent != parent_dir:
-                shutil.move(str(game_dir), str(parent_dir / game_dir.name))
-                moved += 1
+            # game_dir.parent is always console_dir; parent_dir is always console_dir/base_name,
+            # so they are always different — no guard needed.
+            shutil.move(str(game_dir), str(parent_dir / game_dir.name))
+            moved += 1
 
         self.post_message(LibraryProgress("Organize", "Complete", total_ops, total_ops))
         if moved:
@@ -2364,10 +2410,12 @@ class MyrientTUI(App):
         if not library.exists():
             return
 
+        _by_name = operator.attrgetter('name')   # built once per call, not per sorted()
+
         try:
             console_entries = sorted(
                 (e for e in library.iterdir() if e.is_dir() and not e.name.startswith('.')),
-                key=lambda e: e.name,
+                key=_by_name,
             )
         except PermissionError:
             return
@@ -2377,7 +2425,7 @@ class MyrientTUI(App):
             try:
                 depth1 = sorted(
                     (e for e in console_dir.iterdir() if e.is_dir() and not e.name.startswith('.')),
-                    key=lambda e: e.name,
+                    key=_by_name,
                 )
             except PermissionError:
                 continue
@@ -2391,7 +2439,7 @@ class MyrientTUI(App):
                     try:
                         for grandchild in sorted(
                             (e for e in child.iterdir() if e.is_dir() and not e.name.startswith('.')),
-                            key=lambda e: e.name,
+                            key=_by_name,
                         ):
                             gs = MyrientTUI._classify_game_dir(grandchild)
                             if gs is not None:
@@ -2448,7 +2496,7 @@ class MyrientTUI(App):
             plain_status = "corrupted" if status == "corrupted" else "incomplete"
             current_queue.append({
                 "id":        f"dl_{uuid.uuid4().hex[:8]}",
-                "name":      f"[{console_name}] {game_zip} ({plain_status})",
+                "name":      f"{console_name} / {game_zip} ({plain_status})",
                 "game_url":  game_url,
                 "dest_path": str(game_dir),
                 "size_str":  "N/A",
@@ -2477,7 +2525,7 @@ class MyrientTUI(App):
     @staticmethod
     def _parse_size_bytes(size_str: str) -> int:
         """Parse a human-readable size string (e.g. '524.8 MB', '1.2GiB') into bytes.
-        Uses the pre-compiled SIZE_REGEX instead of fragile character-stripping surgery.
+        Uses the pre-compiled SIZE_REGEX and _SIZE_MULTIPLIERS constant.
         """
         if not size_str or size_str == "N/A":
             return 0
@@ -2489,8 +2537,7 @@ class MyrientTUI(App):
             unit_raw = match.group(2).upper()
             # All SI prefixes (K, M, G, T) are exactly one character — take only the first.
             unit_key = unit_raw[0]
-            multipliers = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
-            return int(value * multipliers.get(unit_key, 1))
+            return int(value * _SIZE_MULTIPLIERS.get(unit_key, 1))
         except (ValueError, TypeError):
             return 0
 
