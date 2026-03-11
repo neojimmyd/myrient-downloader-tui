@@ -50,8 +50,9 @@ logging.basicConfig(
     format='%(asctime)s - [%(levelname)s] - %(message)s'
 )
 
-BASE_URL    = "https://myrient.erista.me/files/Redump/"
-CONFIG_FILE = Path("myrient_data.json")
+BASE_URL     = "https://myrient.erista.me/files/Redump/"
+DAT_BASE_URL = "https://myrient.erista.me/dats/Redump/"
+CONFIG_FILE  = Path("myrient_data.json")
 
 # Pre-compiled globally to minimize CPU cycles during tight loops
 SIZE_REGEX      = re.compile(r'(?<!\d)(\d+(?:\.\d+)?)\s*([KMGT]i?B?)', re.IGNORECASE)
@@ -71,6 +72,12 @@ _HASH_CHUNK_BYTES:   int   = 8 * 1024 * 1024   # SHA-1 read chunk size  (8 MiB)
 _LINK_CACHE_TTL:     float = 300.0  # seconds before a cached scrape expires
 _SEARCH_DEBOUNCE:    float = 0.15   # seconds of idle before search fires
 _FLUSH_INTERVAL:     float = 3.0    # seconds between deferred config saves
+
+# Tuple allocated once — _format_size is called twice per progress tick per thread
+_SIZE_UNITS: tuple[str, ...] = ('B', 'KB', 'MB', 'GB', 'TB')
+
+# Frozenset for O(1) membership test in on_library_progress
+_PROGRESS_DONE_STATES: frozenset[str] = frozenset({"done", "complete", "failed"})
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     # Library root is resolved lazily at load time relative to the config file's
@@ -119,8 +126,7 @@ class ConfigManager:
                 logging.error("Config load failed (%s): %s", self.config_path, exc)
                 bak = self.config_path.with_suffix('.bak')
                 try:
-                    import shutil as _sh
-                    _sh.copy2(self.config_path, bak)
+                    shutil.copy2(self.config_path, bak)
                 except OSError:
                     pass
         return base
@@ -634,7 +640,8 @@ class MyrientTUI(App):
 
     def action_refresh_browser(self) -> None:
         """Ctrl+R: re-scrape console list (bypasses cache)."""
-        self._link_cache.clear()
+        with self._link_cache_lock:
+            self._link_cache.clear()
         self._all_games_data = []
         self._games_lookup = {}
         self._selected_games.clear()
@@ -673,7 +680,7 @@ class MyrientTUI(App):
         if size_bytes == 0:
             return "0 B"
         size_float = float(size_bytes)
-        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        for unit in _SIZE_UNITS:
             if size_float < 1024.0:
                 return f"{size_float:.2f} {unit}"
             size_float /= 1024.0
@@ -727,7 +734,7 @@ class MyrientTUI(App):
                         with Horizontal(classes="btn-row"):
                             yield Button("Remove", id="btn-remove-items", variant="warning")
                             yield Button("▶ Start", id="btn-start-dl", variant="primary")
-                            yield Button("⏸ Pause", id="btn-pause-dl", variant="error")
+                            yield Button("■ Pause", id="btn-pause-dl", variant="error")
 
                     with VerticalScroll(classes="panel panel-60", id="progress-area"):
                         yield Label(
@@ -967,7 +974,7 @@ class MyrientTUI(App):
             status_label = self.query_one("#lib-status-label", Label)
 
             # Show bar when work is in progress, hide when signalled complete/done
-            is_done = message.current_item.lower() in ("done", "complete", "failed")
+            is_done = message.current_item.lower() in _PROGRESS_DONE_STATES
             progress_bar.display = not is_done
             if not is_done:
                 progress_bar.update(total=message.total, progress=message.completed)
@@ -991,7 +998,7 @@ class MyrientTUI(App):
 
     # --- Fuzzy Search Engine & Highlighter ---
     @staticmethod
-    def _fuzzy_spans(query: str, text: str) -> Optional[List[Tuple[int, int]]]:
+    def _fuzzy_spans(query: str, text: str) -> list[tuple[int, int]] | None:
         """Return ordered (start, end) match spans for each query character in text,
         or None if any character cannot be found.  O(n·m) with no backtracking risk —
         replaces the prior lru_cache+regex approach that had O(2^n) worst-case behaviour
@@ -999,7 +1006,7 @@ class MyrientTUI(App):
         """
         text_lower = text.lower()
         query_lower = query.lower()
-        spans: List[Tuple[int, int]] = []
+        spans: list[tuple[int, int]] = []
         pos = 0
         for ch in query_lower:
             idx = text_lower.find(ch, pos)
@@ -1016,14 +1023,14 @@ class MyrientTUI(App):
         return MyrientTUI._fuzzy_spans(query, text) is not None
 
     @staticmethod
-    def _build_highlight_text(text: str, spans: List[Tuple[int, int]]) -> Text:
-        """Construct a Text object with matched characters highlighted in amber."""
+    def _build_highlight_text(text: str, spans: list[tuple[int, int]]) -> Text:
+        """Construct a Text object with matched characters highlighted in red."""
         result = Text(no_wrap=True)
         last = 0
         for start, end in spans:
             if start > last:
                 result.append(text[last:start], style="white")
-            result.append(text[start:end], style="bold #e6b73e")
+            result.append(text[start:end], style="bold red")
             last = end
         if last < len(text):
             result.append(text[last:], style="white")
@@ -1063,12 +1070,14 @@ class MyrientTUI(App):
         """Toggle selection on the currently highlighted DataTable row."""
         try:
             game_table = self.query_one("#game-list", DataTable)
-            if game_table.cursor_row is None:
+            cursor = game_table.cursor_row
+            if cursor is None:
                 return
-            rows = list(game_table.ordered_rows)
-            if not rows or game_table.cursor_row >= len(rows):
+            # Access the row directly by position — no full list() materialisation needed.
+            ordered = game_table.ordered_rows
+            if cursor >= len(ordered):
                 return
-            url_part = rows[game_table.cursor_row].key.value
+            url_part = ordered[cursor].key.value
             if not url_part or url_part in ("LOADING", "EMPTY"):
                 return
             if url_part in self._selected_games:
@@ -1112,12 +1121,13 @@ class MyrientTUI(App):
         sel_set = self._filter_include_sel if table_id == "set-include" else self._filter_exclude_sel
         try:
             tbl = self.query_one(f"#{table_id}", DataTable)
-            if tbl.cursor_row is None:
+            cursor = tbl.cursor_row
+            if cursor is None:
                 return
-            rows = list(tbl.ordered_rows)
-            if not rows or tbl.cursor_row >= len(rows):
+            ordered = tbl.ordered_rows
+            if cursor >= len(ordered):
                 return
-            tag = rows[tbl.cursor_row].key.value
+            tag = ordered[cursor].key.value
             if not tag:
                 return
             if tag in sel_set:
@@ -1229,7 +1239,7 @@ class MyrientTUI(App):
         during active downloads, use _remove_queue_row() instead."""
         table = self.query_one("#queue-table", DataTable)
         table.clear()
-        for i, item in enumerate(self.state.get_active_queue()):
+        for item in self.state.get_active_queue():
             table.add_row(item['name'], item['size_str'], item['dest_path'], key=item['id'])
 
     def _remove_queue_row(self, item_id: str) -> None:
@@ -1289,18 +1299,19 @@ class MyrientTUI(App):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id
-        
-        # Dispatch table replaces O(n) if/elif chain with O(1) dict lookup
-        simple_dispatch = {
-            "btn-add-queue":          self._add_selected_to_queue,
-            "btn-lib-organize":       self.run_lib_organize,
-            "btn-lib-dat-audit":      self.run_bulk_dat_audit,
-            "btn-lib-convert":        self.run_lib_convert,
-            "btn-lib-refresh-status": self.run_lib_status_scan,
-            "btn-requeue-failed":     self.requeue_failed_games,
+
+        # Map button IDs to handler method names — looked up once at class definition.
+        # getattr dispatch keeps the handler reference fresh (correct for @work methods).
+        _id_to_method: dict[str, str] = {
+            "btn-add-queue":          "_add_selected_to_queue",
+            "btn-lib-organize":       "run_lib_organize",
+            "btn-lib-dat-audit":      "run_bulk_dat_audit",
+            "btn-lib-convert":        "run_lib_convert",
+            "btn-lib-refresh-status": "run_lib_status_scan",
+            "btn-requeue-failed":     "requeue_failed_games",
         }
-        if button_id in simple_dispatch:
-            simple_dispatch[button_id]()
+        if button_id in _id_to_method:
+            getattr(self, _id_to_method[button_id])()
             return
 
         if button_id == "btn-refresh-games" and self.selected_console:
@@ -1323,11 +1334,19 @@ class MyrientTUI(App):
         elif button_id == "btn-remove-items":
             table = self.query_one("#queue-table", DataTable)
             if table.cursor_row is not None:
-                current_queue = self.state.get_active_queue()
-                if 0 <= table.cursor_row < len(current_queue):
-                    del current_queue[table.cursor_row]
-                    self.state.update_active_queue(current_queue)
-                    self._refresh_queue_table()
+                try:
+                    # Identify by stable row key (item id), not visual cursor_row index.
+                    # cursor_row stops mapping 1:1 to queue positions after surgical removes.
+                    rows = list(table.ordered_rows)
+                    if rows and table.cursor_row < len(rows):
+                        item_id = rows[table.cursor_row].key.value
+                        current_queue = self.state.get_active_queue()
+                        new_queue = [i for i in current_queue if i["id"] != item_id]
+                        if len(new_queue) < len(current_queue):
+                            self.state.update_active_queue(new_queue)
+                            self._remove_queue_row(item_id)
+                except Exception:
+                    pass
                     
         elif button_id == "btn-start-dl":
             if self.state.get_active_queue():
@@ -1396,7 +1415,7 @@ class MyrientTUI(App):
         existing_paths = {i["dest_path"] for i in current_queue}
 
         added_count = 0
-        for url_part in list(self._selected_games):
+        for url_part in self._selected_games:
             data = self._games_lookup.get(url_part)
             if not data:
                 continue
@@ -1416,7 +1435,7 @@ class MyrientTUI(App):
 
             current_queue.append({
                 "id": f"dl_{uuid.uuid4().hex[:8]}",
-                "name": f"[{console_name}] {data['name']}",
+                "name": f"{console_name} / {data['name']}",
                 "game_url": urljoin(base_url, data["url_part"]),
                 "dest_path": str(dest_path),
                 "size_str": data["size_str"]
@@ -1434,11 +1453,11 @@ class MyrientTUI(App):
         self.query_one("#tabs", TabbedContent).active = "tab-queue-dl"
 
     # --- UI Message Receivers ---
-    async def on_consoles_loaded(self, message: ConsolesLoaded) -> None:
+    def on_consoles_loaded(self, message: ConsolesLoaded) -> None:
         self._all_consoles_data = message.consoles
         self._render_consoles(self.query_one("#search-consoles", Input).value)
 
-    async def on_games_loaded(self, message: GamesLoaded) -> None:
+    def on_games_loaded(self, message: GamesLoaded) -> None:
         self._all_games_data = message.games
         # RAM Optimization: Store active dictionary for O(1) queue lookups instead of JSON parsing
         self._games_lookup = {g["url_part"]: g for g in message.games}
@@ -1449,16 +1468,11 @@ class MyrientTUI(App):
     def fetch_consoles(self) -> None:
         self.post_message(SystemLog("Scraping console list..."))
         items = self._scrape_links(BASE_URL)
-        
-        consoles = []
-        for item in items:
-            if item["url_part"].endswith('/'):
-                consoles.append(item)
-                
+        consoles = [i for i in items if i["url_part"].endswith('/')]
         self.post_message(ConsolesLoaded(consoles))
 
     @work(exclusive=True, thread=True)
-    def fetch_games(self, console_data: Dict[str, str]) -> None:
+    def fetch_games(self, console_data: dict[str, str]) -> None:
         url = urljoin(BASE_URL, console_data["url_part"])
         self.post_message(SystemLog(f"Listing games for {console_data['name']}..."))
         items = self._scrape_links(url)
@@ -1561,7 +1575,11 @@ class MyrientTUI(App):
                 pb.display = True
                 pb.update(total=self.global_total, progress=0)
                 self.query_one("#lbl-global-progress", Label).update(
-                    f"[dim]▸ DOWNLOAD PROGRESS[/dim]  [#e6b73e]0 / {self.global_total}[/]"
+                    Text.assemble(
+                        ("▸ DOWNLOAD PROGRESS", "dim"),
+                        "  ",
+                        (f"0 / {self.global_total}", "#e6b73e"),
+                    )
                 )
             except Exception:
                 pass
@@ -1589,7 +1607,9 @@ class MyrientTUI(App):
         def _finish_ui() -> None:
             try:
                 self.query_one("#global-progress", ProgressBar).display = False
-                self.query_one("#lbl-global-progress", Label).update("[dim]▸ DOWNLOAD PROGRESS[/dim]  [dim]idle[/dim]")
+                self.query_one("#lbl-global-progress", Label).update(
+                    Text.assemble(("▸ DOWNLOAD PROGRESS", "dim"), ("  idle", "dim"))
+                )
             except Exception:
                 pass
 
@@ -1829,7 +1849,11 @@ class MyrientTUI(App):
             try:
                 self.query_one("#global-progress", ProgressBar).advance(1)
                 self.query_one("#lbl-global-progress", Label).update(
-                    f"[dim]▸ DOWNLOAD PROGRESS[/dim]  [#e6b73e]{completed_snap} / {self.global_total}[/]"
+                    Text.assemble(
+                        ("▸ DOWNLOAD PROGRESS", "dim"),
+                        "  ",
+                        (f"{completed_snap} / {self.global_total}", "#e6b73e"),
+                    )
                 )
             except Exception:
                 pass
@@ -1857,7 +1881,7 @@ class MyrientTUI(App):
             try:
                 lbl_id = f"lbl_{message.item['id']}"
                 self.query_one(f"#{lbl_id}", Label).update(
-                    Text.assemble(("⏸ Paused  ", "yellow"), (message.item['name'], "dim"))
+                    Text.assemble(("■ Paused  ", "yellow"), (message.item['name'], "dim"))
                 )
                 self.query_one(f"#pb_{message.item['id']}", ProgressBar).display = False
             except Exception:
@@ -1935,7 +1959,6 @@ class MyrientTUI(App):
           4. Reports perfect / misnamed / bad counts per console and a grand total.
         """
         library = Path(self.state.settings['library_root'])
-        dat_base_url = "https://myrient.erista.me/dats/Redump/"
         auditable_exts = {'.bin', '.iso', '.cue', '.img'}
 
         if not library.exists():
@@ -1960,19 +1983,19 @@ class MyrientTUI(App):
         try:
             try:
                 index_html = subprocess.check_output(
-                    ["wget", "-qO-", dat_base_url], text=True, errors="ignore"
+                    ["wget", "-qO-", DAT_BASE_URL], text=True, errors="ignore"
                 )
             except Exception:
                 req = urllib.request.Request(
-                    dat_base_url,
+                    DAT_BASE_URL,
                     headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
                 )
                 with urllib.request.urlopen(req, timeout=20) as res:
                     index_html = res.read().decode('utf-8', errors='ignore')
 
             soup = BeautifulSoup(index_html, 'html.parser', parse_only=_DAT_INDEX_STRAINER)
-            # Build a lookup: console_name_prefix -> href
-            dat_index: Dict[str, str] = {}
+            # Build a lookup: dat filename -> href
+            dat_index: dict[str, str] = {}
             for a_tag in soup.find_all('a'):
                 href = a_tag.get('href', '')
                 name = unquote(href)
@@ -1988,6 +2011,11 @@ class MyrientTUI(App):
         dat_cache_root = library / ".dats"
 
         for con_idx, console_dir in enumerate(console_dirs, 1):
+            # Respect Pause/cancel between consoles — audit can take many minutes
+            if self.cancel_flag.is_set():
+                self.post_message(SystemLog("[yellow]DAT Audit cancelled.[/]"))
+                break
+
             console_name = console_dir.name
             phase_label = f"[{con_idx}/{len(console_dirs)}] {console_name}"
             self.post_message(LibraryProgress(
@@ -2013,7 +2041,7 @@ class MyrientTUI(App):
             dat_path = dat_dir / unquote(dat_href)
 
             if not dat_path.exists():
-                dat_url = urljoin(dat_base_url, dat_href)
+                dat_url = urljoin(DAT_BASE_URL, dat_href)
                 self.post_message(SystemLog(f"DAT Audit [{console_name}]: Downloading DAT..."))
                 dat_tmp = dat_path.with_suffix('.tmp')
                 try:
@@ -2039,7 +2067,7 @@ class MyrientTUI(App):
                         continue
 
             # ── 3c: parse DAT into sha1 → {name, game} ──────────────────────
-            dat_by_sha1: Dict[str, Dict[str, str]] = {}
+            dat_by_sha1: dict[str, dict[str, str]] = {}
             try:
                 context = ET.iterparse(dat_path, events=('start', 'end'))
                 _, xml_root = next(context)
@@ -2066,7 +2094,7 @@ class MyrientTUI(App):
             # ── 3d: collect game dirs and their auditable files ──────────────
             # Use per-extension glob instead of rglob('*') to avoid materialising
             # the entire subtree and then filtering — O(auditable files) not O(all files).
-            game_dirs: Dict[Path, List[Path]] = {}
+            game_dirs: dict[Path, list[Path]] = {}
             for ext in auditable_exts:
                 for item in console_dir.rglob(f'*{ext}'):
                     if (not item.name.startswith('.')
@@ -2084,7 +2112,7 @@ class MyrientTUI(App):
             # A file is considered cached if its mtime AND size match exactly — this
             # is the same heuristic used by rsync and git and is reliable for ROM files.
             sha1_cache_path = dat_cache_root / console_name / ".sha1_cache.json"
-            sha1_cache: Dict[str, Dict[str, Any]] = {}
+            sha1_cache: dict[str, dict[str, Any]] = {}
             try:
                 if sha1_cache_path.exists():
                     with open(sha1_cache_path, 'r', encoding='utf-8') as cf:
@@ -2092,12 +2120,15 @@ class MyrientTUI(App):
             except (json.JSONDecodeError, OSError):
                 sha1_cache = {}
 
-            # ── 3f: hash every file once (or reuse cache), log results ───────
+            # ── 3f: hash every file once (or reuse cache), fix misnamed files ──
             con_perfect = con_misnamed = con_bad = 0
             all_files = [(gd, fp) for gd, fps in game_dirs.items() for fp in fps]
             total_files = len(all_files)
-            hash_results: Dict[Path, bool] = {}
+            hash_results: dict[Path, bool] = {}
             cache_dirty = False
+            # Tracks dirs that lost files to a rename — they get "incomplete"
+            # markers in step 3h rather than "corrupted".
+            renamed_old_dirs: set[Path] = set()
 
             for f_idx, (game_dir, file_path) in enumerate(all_files, 1):
                 self.post_message(LibraryProgress(
@@ -2105,19 +2136,17 @@ class MyrientTUI(App):
                     file_path.name, f_idx, total_files
                 ))
 
-                file_hash: Optional[str] = None
+                file_hash: str | None = None
                 try:
-                    stat     = file_path.stat()
-                    key      = str(file_path)
-                    cached   = sha1_cache.get(key)
+                    stat   = file_path.stat()
+                    key    = str(file_path)
+                    cached = sha1_cache.get(key)
 
                     if (cached
                             and cached.get("mtime") == stat.st_mtime
                             and cached.get("size")  == stat.st_size):
-                        # Cache hit — skip reading the file entirely
                         file_hash = cached["sha1"]
                     else:
-                        # Cache miss — hash and store
                         sha1_obj = hashlib.sha1(usedforsecurity=False)
                         with open(file_path, 'rb') as fh:
                             while chunk := fh.read(_HASH_CHUNK_BYTES):
@@ -2132,18 +2161,68 @@ class MyrientTUI(App):
 
                     if file_hash in dat_by_sha1:
                         expected_name = dat_by_sha1[file_hash]['name']
+                        expected_game = dat_by_sha1[file_hash]['game']
+
                         if file_path.name == expected_name:
                             con_perfect += 1
+                            hash_results[file_path] = True
                         else:
+                            # ── Misnamed: move + rename to the correct location ───
                             con_misnamed += 1
-                            self.post_message(SystemLog(
-                                f"Misnamed [{console_name}]: '{file_path.name}' → '{expected_name}'"
-                            ))
-                        hash_results[file_path] = True
+
+                            # Respect the disc-grouping convention already used by
+                            # the downloader: if the game name contains a Disc/Side
+                            # suffix, nest it under the clean base name.
+                            clean_game = DISC_REGEX.sub('', expected_game).strip()
+                            if clean_game != expected_game:
+                                correct_dir = console_dir / clean_game / expected_game
+                            else:
+                                correct_dir = console_dir / expected_game
+
+                            correct_path = correct_dir / expected_name
+
+                            try:
+                                correct_dir.mkdir(parents=True, exist_ok=True)
+                                shutil.move(str(file_path), str(correct_path))
+
+                                # Port the SHA-1 cache entry to the new path so the
+                                # next audit doesn't re-hash the file.
+                                old_cache_key = str(file_path)
+                                if old_cache_key in sha1_cache:
+                                    sha1_cache[str(correct_path)] = sha1_cache.pop(old_cache_key)
+                                    cache_dirty = True
+
+                                hash_results[correct_path] = True
+
+                                # The destination directory now contains a validated file.
+                                (correct_dir / ".corrupted").unlink(missing_ok=True)
+                                (correct_dir / ".validated").touch()
+
+                                # The source dir lost a file — will be marked incomplete
+                                # in step 3h (not corrupted, since the data was valid).
+                                renamed_old_dirs.add(game_dir)
+
+                                self.post_message(SystemLog(
+                                    f"Fixed [{console_name}]: "
+                                    f"'{file_path.name}' → '{correct_dir.name}/{expected_name}'"
+                                ))
+
+                            except Exception as rename_err:
+                                # Rename failed — log it, but the hash is still valid
+                                # so don't penalise the file as corrupted.
+                                hash_results[file_path] = True
+                                logging.exception(
+                                    "DAT audit rename failed: %s → %s", file_path, correct_path
+                                )
+                                self.post_message(SystemLog(
+                                    f"Rename failed [{console_name}]: "
+                                    f"'{file_path.name}': {rename_err}", True
+                                ))
                     else:
                         con_bad += 1
                         self.post_message(SystemLog(
-                            f"Bad/Unknown [{console_name}]: '{file_path.name}' (SHA1: {file_hash})"
+                            f"Bad/Unknown [{console_name}]: "
+                            f"'{file_path.name}' (SHA1: {file_hash})"
                         ))
                         hash_results[file_path] = False
 
@@ -2155,11 +2234,12 @@ class MyrientTUI(App):
                         f"Read error [{console_name}]: '{file_path.name}': {err}", True
                     ))
 
-            # ── 3g: persist the SHA-1 cache if any new entries were added ────
+            # ── 3g: persist the SHA-1 cache if any entries changed ───────────
             if cache_dirty:
-                # Prune stale entries (files no longer present) before saving
-                present = {str(fp) for fps in game_dirs.values() for fp in fps}
-                sha1_cache = {k: v for k, v in sha1_cache.items() if k in present}
+                # Prune stale entries.  We check existence rather than comparing against
+                # the original `game_dirs` path set, because renames above have already
+                # updated the sha1_cache keys to new paths — the original paths are gone.
+                sha1_cache = {k: v for k, v in sha1_cache.items() if Path(k).exists()}
                 try:
                     sha1_cache_path.parent.mkdir(parents=True, exist_ok=True)
                     tmp_cache = sha1_cache_path.with_suffix('.tmp')
@@ -2169,16 +2249,23 @@ class MyrientTUI(App):
                 except OSError:
                     pass
 
-            # ── 3h: write validation markers using cached results ────────────
-            # A dir is validated only if every auditable file in it was a known-good hash.
+            # ── 3h: write validation markers ─────────────────────────────────
             for game_dir, files in game_dirs.items():
-                dir_ok = all(hash_results.get(fp, False) for fp in files)
-                if dir_ok:
-                    (game_dir / ".corrupted").unlink(missing_ok=True)
-                    (game_dir / ".validated").touch()
-                else:
+                if game_dir in renamed_old_dirs:
+                    # Files were moved out to their correct locations.
+                    # Mark the source dir as incomplete — the data was valid, so it
+                    # is not "corrupted", but it no longer has all its files.
                     (game_dir / ".validated").unlink(missing_ok=True)
-                    (game_dir / ".corrupted").touch()
+                    (game_dir / ".corrupted").unlink(missing_ok=True)
+                else:
+                    # Normal case: every auditable file must have a known-good hash.
+                    dir_ok = all(hash_results.get(fp, False) for fp in files)
+                    if dir_ok:
+                        (game_dir / ".corrupted").unlink(missing_ok=True)
+                        (game_dir / ".validated").touch()
+                    else:
+                        (game_dir / ".validated").unlink(missing_ok=True)
+                        (game_dir / ".corrupted").touch()
 
             self.post_message(SystemLog(
                 f"DAT Audit [{console_name}]: "
@@ -2207,20 +2294,19 @@ class MyrientTUI(App):
 
         # Re-use the shared walker instead of the previous rglob('*') which
         # materialised every file and directory in the entire tree.
-        targets = [
-            game_dir
-            for _, game_dir, status in self._walk_library_game_dirs(library)
-            if status != "corrupted"
-            if not (game_dir / ".corrupted").exists()
-            if any(
-                f.suffix.lower() in ('.bin', '.iso', '.cue')
-                for f in game_dir.iterdir() if f.is_file()
-            )
-            if not any(
-                f.suffix.lower() == '.chd'
-                for f in game_dir.iterdir() if f.is_file()
-            )
-        ]
+        targets = []
+        for _, game_dir, status in self._walk_library_game_dirs(library):
+            if status == "corrupted":
+                continue
+            # Collect files once — used for both source and CHD presence checks below
+            try:
+                dir_files = [f for f in game_dir.iterdir() if f.is_file()]
+            except PermissionError:
+                continue
+            has_source = any(f.suffix.lower() in ('.bin', '.iso', '.cue') for f in dir_files)
+            has_chd    = any(f.suffix.lower() == '.chd'                   for f in dir_files)
+            if has_source and not has_chd:
+                targets.append(game_dir)
 
         total_ops = len(targets)
         if total_ops == 0:
@@ -2242,7 +2328,7 @@ class MyrientTUI(App):
     # ── Shared library-traversal helpers ─────────────────────────────────────
 
     @staticmethod
-    def _classify_game_dir(d: Path) -> Optional[str]:
+    def _classify_game_dir(d: Path) -> str | None:
         """Classify a candidate game directory.
 
         Returns ``'validated'``, ``'corrupted'``, ``'incomplete'``, or ``None``
@@ -2269,7 +2355,7 @@ class MyrientTUI(App):
         return "incomplete"
 
     @staticmethod
-    def _walk_library_game_dirs(library: Path) -> Iterator[Tuple[str, Path, str]]:
+    def _walk_library_game_dirs(library: Path) -> Iterator[tuple[str, Path, str]]:
         """Yield ``(console_name, game_dir, status)`` for every recognised game
         directory under *library* at depth-1 (direct games) and depth-2 (multi-disc
         grouping folders).  Implemented as a generator — no list allocation, constant
@@ -2388,7 +2474,8 @@ class MyrientTUI(App):
             f"{n_corrupted} corrupted, {n_incomplete} incomplete."
         ))
 
-    def _parse_size_bytes(self, size_str: str) -> int:
+    @staticmethod
+    def _parse_size_bytes(size_str: str) -> int:
         """Parse a human-readable size string (e.g. '524.8 MB', '1.2GiB') into bytes.
         Uses the pre-compiled SIZE_REGEX instead of fragile character-stripping surgery.
         """
