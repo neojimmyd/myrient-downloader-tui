@@ -58,26 +58,32 @@ _TOOLS_DIR.mkdir(parents=True, exist_ok=True)
 BASE_URL        = "https://myrient.erista.me/files/Redump/"
 DAT_BASE_URL    = "https://myrient.erista.me/dats/Redump/"
 
-# PS2 Master Disc Patcher v1.0.6 — committed directly to the playstation-disc-burner repo
-# Download the binary and region.ini straight from GitHub raw — no zip extraction needed.
-_PS2MDP_BINARY_NAME = "ps2-master-disc-patcher"
-_PS2MDP_RAW_BASE    = (
-    "https://raw.githubusercontent.com/alex-free/playstation-disc-burner"
-    "/master/ps2-master-disc-patcher-v1.0.6-linux-x86_64-static/"
+# PS2 Master Disc Patcher v1.0.6 — shipped inside the PSDB v1.0.5 release zip from GitHub.
+# The binary lives at:  playstation-disc-burner-v1.0.5-x86_64/<patcher-dir>/ps2-master-disc-patcher
+_PS2MDP_BINARY_NAME  = "ps2-master-disc-patcher"
+_PS2MDP_RELEASE_URL  = (
+    "https://github.com/alex-free/playstation-disc-burner/releases/download/"
+    "v1.0.5/playstation-disc-burner-v1.0.5-x86_64.zip"
 )
-_PS2MDP_BINARY_URL  = _PS2MDP_RAW_BASE + _PS2MDP_BINARY_NAME
-_PS2MDP_REGION_URL  = _PS2MDP_RAW_BASE + "region.ini"
 
 # Consoles whose Redump DAT name does NOT follow the standard
 # "{console_name} - Datfile (N) (date).dat" pattern.  Each entry maps a
 # console folder name to a list of prefix strings to try (in order) when
 # searching the Myrient DAT index.  The first matching prefix wins.
 _DAT_SEARCH_PREFIXES: dict[str, list[str]] = {
-    # Wii and GameCube are distributed as NKit RVZ on Myrient; no plain Datfile exists.
-    "Nintendo - Wii":      ["Nintendo - Wii - NKit RVZ", "Nintendo - Wii -"],
-    "Nintendo - GameCube": ["Nintendo - GameCube - NKit RVZ", "Nintendo - GameCube -"],
+    # Myrient stores Wii/GC games in folders named after the NKit RVZ collection.
+    # The folder on disk is "Nintendo - Wii - NKit RVZ [zstd-19-128k]" or the
+    # shorter variant without the bracket suffix — both need to resolve to the
+    # same DAT.  We key every plausible folder name variant here.
+    "Nintendo - Wii":                        ["Nintendo - Wii - NKit RVZ", "Nintendo - Wii -"],
+    "Nintendo - Wii - NKit RVZ":             ["Nintendo - Wii - NKit RVZ"],
+    "Nintendo - Wii - NKit RVZ [zstd-19-128k]": ["Nintendo - Wii - NKit RVZ"],
+    "Nintendo - GameCube":                   ["Nintendo - GameCube - NKit RVZ", "Nintendo - GameCube -"],
+    "Nintendo - GameCube - NKit RVZ":        ["Nintendo - GameCube - NKit RVZ"],
+    "Nintendo - GameCube - NKit RVZ [zstd-19-128k]": ["Nintendo - GameCube - NKit RVZ"],
     # Wii U uses WUX format on Myrient
-    "Nintendo - Wii U":    ["Nintendo - Wii U - WUX", "Nintendo - Wii U -"],
+    "Nintendo - Wii U":                      ["Nintendo - Wii U - WUX", "Nintendo - Wii U -"],
+    "Nintendo - Wii U - WUX":               ["Nintendo - Wii U - WUX"],
 }
 CONFIG_FILE     = _DATA_DIR / "myrient_config.json"
 SESSION_LOG_DIR = _DATA_DIR / "logs"
@@ -97,7 +103,35 @@ CUE_BIN_REGEX   = re.compile(r'FILE\s+"([^"]+)"')
 WGET_PROG_REGEX   = re.compile(r'(\d+)%')
 WGET_LENGTH_REGEX = re.compile(r'Length:\s+(\d+)')
 
-# Platform-appropriate chdman download URLs (standalone builds)
+# ── Library / conversion constants ───────────────────────────────────────────
+# Frozensets and dicts allocated once at module load — these are called inside
+# tight loops (per-file during scans and conversions) so object allocation
+# inside the loop matters.
+
+# All disc/cart/tape/CHD image extensions recognised on Myrient Redump
+_GAME_EXTS: frozenset[str] = frozenset({
+    '.bin', '.iso', '.cue', '.chd', '.img',
+    '.wbfs', '.rvz', '.gcz', '.gdi',
+    '.nrg', '.mdf', '.mds',
+    '.rom', '.xiso', '.ecm',
+})
+
+# Source extensions that chdman can convert TO .chd
+_CHD_SOURCE_EXTS: frozenset[str] = frozenset({'.bin', '.iso', '.cue', '.gdi'})
+
+# Mapping from source extension to ordered list of chdman subcommands to try.
+# CD images (.cue/.gdi) use createcd.
+# Raw ISOs are most likely DVD-based (Wii, PS2, GC, Xbox) → createdvd first,
+# then createcd as fallback for the rare CD-ROM ISO.
+_CHD_CMD_MAP: dict[str, list[str]] = {
+    '.cue': ['createcd'],
+    '.gdi': ['createcd'],
+    '.iso': ['createdvd', 'createcd'],
+}
+
+# Extensions accepted by ps2-master-disc-patcher (case-sensitive as on Linux FS)
+_PS2_PATCH_EXTS: frozenset[str] = frozenset({'.iso', '.ISO', '.bin', '.BIN'})
+
 import platform as _platform
 _OS = _platform.system().lower()   # 'linux', 'darwin', 'windows'
 # These are the mame-tools package names used by common package managers
@@ -444,21 +478,21 @@ class LibraryStatus:
 # --- Custom UI Components & Messages ---
 
 class GameSearchInput(Input):
-    """Search input that intercepts ↑↓ / Space / Enter before Input consumes them.
+    """Search input that intercepts ↑↓ / Tab / Enter before Input consumes them.
 
     Textual's Input widget handles keys internally in ``_on_key`` before they
-    bubble to the App.  Up/down arrows, space, and enter are all swallowed that
+    bubble to the App.  Up/down arrows and enter are all swallowed that
     way, so App.on_key never sees them when this widget is focused.
 
-    This subclass intercepts exactly those keys and posts lightweight messages
-    so the app can move the game-list cursor, toggle selections, and queue games
-    — all without the user ever leaving the search box.
+    Tab is intercepted here to toggle the highlighted game's selection while
+    keeping focus on the search box, rather than moving focus to the next widget.
+    Space is left alone so users can type multi-word searches freely.
     """
 
-    class NavUp(Message):       pass
-    class NavDown(Message):     pass
-    class ToggleAtCursor(Message): pass
-    class QueueSelected(Message):  pass
+    class NavUp(Message):           pass
+    class NavDown(Message):         pass
+    class ToggleAtCursor(Message):  pass
+    class QueueSelected(Message):   pass
 
     def _on_key(self, event: Key) -> None:
         if event.key == "up":
@@ -469,7 +503,7 @@ class GameSearchInput(Input):
             self.post_message(self.NavDown())
             event.prevent_default()
             event.stop()
-        elif event.key == "space":
+        elif event.key == "tab":
             self.post_message(self.ToggleAtCursor())
             event.prevent_default()
             event.stop()
@@ -1072,10 +1106,10 @@ class MyrientTUI(App):
 
     @work(exclusive=True, thread=True)
     def setup_ps2mdp_auto(self) -> None:
-        """Download ps2-master-disc-patcher v1.0.6 directly from GitHub.
+        """Download ps2-master-disc-patcher v1.0.6 from the PSDB v1.0.5 GitHub release zip.
 
-        The binary lives as a committed file in the playstation-disc-burner repo,
-        so we pull it straight via raw.githubusercontent.com — no zip needed.
+        Extracts only the ps2-master-disc-patcher binary (and region.ini if
+        present) into myrient_data/tools/.  All other PSDB components are ignored.
         """
         self.post_message(SystemLog("PS2 Patcher Setup: Checking for existing installation..."))
         path = self._find_ps2mdp()
@@ -1086,55 +1120,102 @@ class MyrientTUI(App):
             ))
             return
 
-        binary_dest = _TOOLS_DIR / _PS2MDP_BINARY_NAME
-        region_dest = _TOOLS_DIR / "region.ini"
+        self.post_message(SystemLog(
+            "PS2 Patcher Setup: Downloading PSDB release zip…\n"
+            f"  {_PS2MDP_RELEASE_URL}"
+        ))
 
-        def _download(url: str, dest: Path) -> None:
-            """Download *url* to *dest*, trying wget first then urllib fallback."""
+        import zipfile as _zf
+
+        tmp_zip = _TOOLS_DIR / "_ps2mdp_download.zip"
+        try:
+            # ── Download ─────────────────────────────────────────────────────
             try:
                 subprocess.run(
-                    ["wget", "-q", "--timeout=30", "--tries=3",
-                     "-O", str(dest), url],
-                    check=True, timeout=120,
+                    ["wget", "-q", "--timeout=60", "--tries=3",
+                     "-O", str(tmp_zip), _PS2MDP_RELEASE_URL],
+                    check=True, timeout=300,
                 )
             except Exception:
                 req = urllib.request.Request(
-                    url,
+                    _PS2MDP_RELEASE_URL,
                     headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
                 )
-                with urllib.request.urlopen(req, timeout=60) as resp, \
-                        open(dest, "wb") as fout:
+                with urllib.request.urlopen(req, timeout=120) as resp, \
+                        open(tmp_zip, "wb") as fout:
                     shutil.copyfileobj(resp, fout)
 
-        try:
-            # ── Download binary ──────────────────────────────────────────────
-            self.post_message(SystemLog(
-                f"PS2 Patcher Setup: Downloading binary…\n  {_PS2MDP_BINARY_URL}"
-            ))
-            _download(_PS2MDP_BINARY_URL, binary_dest)
-            binary_dest.chmod(binary_dest.stat().st_mode | 0o111)
-            self.post_message(SystemLog(
-                f"PS2 Patcher Setup: Binary saved → [bold]{binary_dest}[/bold]"
-            ))
+            # ── Extract patcher binary + region.ini from the zip ─────────────
+            # Log every entry so failures are diagnosable, then extract by
+            # path-contains match — robust against version-suffix changes in
+            # the binary name (e.g. "ps2-master-disc-patcher-v1.0.6").
+            extracted_binary = False
+            extracted_region = False
+            with _zf.ZipFile(tmp_zip, "r") as zf:
+                all_members = zf.namelist()
+                # Log contents for diagnostics
+                self.post_message(SystemLog(
+                    "PS2 Patcher Setup: Zip contents:\n  " +
+                    "\n  ".join(all_members[:30]) +
+                    ("\n  …" if len(all_members) > 30 else "")
+                ))
 
-            # ── Download region.ini (skip if user already has one) ───────────
-            if not region_dest.exists():
-                self.post_message(SystemLog("PS2 Patcher Setup: Downloading region.ini…"))
-                try:
-                    _download(_PS2MDP_REGION_URL, region_dest)
-                    self.post_message(SystemLog(
-                        f"PS2 Patcher Setup: region.ini saved → [bold]{region_dest}[/bold]"
-                    ))
-                except Exception:
-                    # region.ini may not be in the repo — write a safe default
-                    region_dest.write_text("U\n", encoding="ascii")
-                    self.post_message(SystemLog(
-                        "PS2 Patcher Setup: Created default region.ini (USA). "
-                        "Edit myrient_data/tools/region.ini to change: "
-                        "J=Japan, U=USA, E=Europe, W=World"
-                    ))
+                for member in all_members:
+                    # Skip directories
+                    if member.endswith("/"):
+                        continue
+                    base = Path(member).name
+                    member_path_lower = member.lower()
 
-            # ── Verify ───────────────────────────────────────────────────────
+                    # Match the patcher binary: name starts with "ps2-master-disc-patcher"
+                    # and is not a supporting data file
+                    is_binary = (
+                        base.startswith(_PS2MDP_BINARY_NAME)
+                        and not base.endswith((".ini", ".txt", ".md", ".cfg"))
+                        and "ps2-master-disc-patcher" in member_path_lower
+                    )
+                    is_region = base == "region.ini" and "ps2-master-disc-patcher" in member_path_lower
+
+                    if is_binary and not extracted_binary:
+                        dest = _TOOLS_DIR / _PS2MDP_BINARY_NAME
+                        with zf.open(member) as src, open(dest, "wb") as dst:
+                            shutil.copyfileobj(src, dst)
+                        dest.chmod(dest.stat().st_mode | 0o111)
+                        extracted_binary = True
+                        self.post_message(SystemLog(
+                            f"PS2 Patcher Setup: Extracted binary [bold]{base}[/bold] → {dest}"
+                        ))
+                    elif is_region and not extracted_region:
+                        dest = _TOOLS_DIR / "region.ini"
+                        with zf.open(member) as src, open(dest, "wb") as dst:
+                            shutil.copyfileobj(src, dst)
+                        extracted_region = True
+                        self.post_message(SystemLog(
+                            f"PS2 Patcher Setup: Extracted [bold]region.ini[/bold] → {dest}"
+                        ))
+
+            if not extracted_binary:
+                self.post_message(SystemLog(
+                    "[bold red]PS2 Patcher Setup: binary not found in release zip.[/bold red]\n"
+                    "Check the zip contents log above. Manual install:\n"
+                    f"  1. Download: {_PS2MDP_RELEASE_URL}\n"
+                    f"  2. Extract '{_PS2MDP_BINARY_NAME}' to myrient_data/tools/\n"
+                    "  3. chmod +x myrient_data/tools/ps2-master-disc-patcher",
+                    True,
+                ))
+                return
+
+
+            # Write a default region.ini if the zip didn't include one
+            region_ini = _TOOLS_DIR / "region.ini"
+            if not extracted_region and not region_ini.exists():
+                region_ini.write_text("U\n", encoding="ascii")
+                self.post_message(SystemLog(
+                    "PS2 Patcher Setup: Created default region.ini (USA). "
+                    "Edit myrient_data/tools/region.ini to change region: "
+                    "J=Japan, U=USA, E=Europe, W=World"
+                ))
+
             path = self._find_ps2mdp()
             if path:
                 self._ps2mdp_path = path
@@ -1144,21 +1225,17 @@ class MyrientTUI(App):
                 ))
             else:
                 self.post_message(SystemLog(
-                    "[bold red]Download finished but binary not executable.[/bold red]\n"
-                    f"Try: chmod +x {binary_dest}", True
+                    "[bold red]Setup finished but binary not found — "
+                    "extraction may have failed.[/bold red]", True
                 ))
 
         except Exception as err:
             self.post_message(SystemLog(
-                f"[bold red]PS2 Patcher Setup failed:[/bold red] {err}\n"
-                "Manual install: place the 'ps2-master-disc-patcher' binary "
-                "in myrient_data/tools/ and chmod +x it.",
-                True,
+                f"[bold red]PS2 Patcher Setup failed:[/bold red] {err}", True
             ))
-            # Clean up a partial download so a retry doesn't see a broken binary
+        finally:
             try:
-                if binary_dest.exists() and binary_dest.stat().st_size < 1000:
-                    binary_dest.unlink()
+                tmp_zip.unlink(missing_ok=True)
             except OSError:
                 pass
 
@@ -1220,8 +1297,8 @@ class MyrientTUI(App):
             f"PS2 Master Disc: Patching {len(game_dirs)} game dir(s) in [{scope_label}]…"
         ))
 
-        # Patcher accepts .iso (DVD 2048 B/s) and .bin (CD 2352 B/s)
-        _PATCH_EXTS = frozenset({".iso", ".ISO", ".bin", ".BIN"})
+        # patcher_dir is the working directory for the subprocess — it must run
+        # from its own directory so it can find region.ini alongside the binary.
         patcher_dir = Path(ps2mdp).parent
 
         patched = skipped = failed = 0
@@ -1240,7 +1317,7 @@ class MyrientTUI(App):
                 candidates = [
                     f for f in game_dir.iterdir()
                     if f.is_file()
-                    and f.suffix in _PATCH_EXTS
+                    and f.suffix in _PS2_PATCH_EXTS
                     and "_MD" not in f.stem
                 ]
             except PermissionError:
@@ -1358,7 +1435,7 @@ class MyrientTUI(App):
                             yield Button("▸ Queue Selected", id="btn-add-queue", variant="success")
                             yield Button("↺ Refresh", id="btn-refresh-games")
                         yield Label(
-                            "[dim]↑↓[/dim] navigate · [dim]Space[/dim] select · [dim]Enter[/dim] queue",
+                            "[dim]↑↓[/dim] navigate · [dim]Tab[/dim] select · [dim]Enter[/dim] queue",
                             classes="hint-bar",
                         )
 
@@ -1428,7 +1505,7 @@ class MyrientTUI(App):
                                 classes="ops-btn",
                             )
                             yield Button(
-                                "⚙ Setup chdman",
+                                "Setup chdman",
                                 id="btn-setup-chdman",
                                 classes="ops-btn",
                             )
@@ -1438,7 +1515,7 @@ class MyrientTUI(App):
                                 classes="ops-btn",
                             )
                             yield Button(
-                                "⚙ Setup PS2 Patcher",
+                                "Setup PS2 Patcher",
                                 id="btn-setup-ps2mdp",
                                 classes="ops-btn",
                             )
@@ -1808,7 +1885,7 @@ class MyrientTUI(App):
 
     def on_key(self, event: Key) -> None:
         """Handles keys for game-list and filter tables.
-        search-games keys (↑↓/Space/Enter) are handled by GameSearchInput._on_key
+        search-games keys (↑↓/Tab/Enter) are handled by GameSearchInput._on_key
         before they bubble, so they never reach here.
         """
         focused = self.focused
@@ -2203,16 +2280,18 @@ class MyrientTUI(App):
 
             if node and isinstance(getattr(node, "data", None), Path):
                 node_path: Path = node.data
-                # Resolve: game leaf → its parent console dir; anything else → as-is
-                if node_path.parent.parent == library:
-                    # grandchild — game inside a grouping folder; use the console
-                    scope = node_path.parent.parent
+                # Check from outermost to innermost so short-circuit works correctly:
+                #   root node  → library root → full scan
+                #   console    → direct child of library → scope = console dir
+                #   game/disc  → any deeper node → scope = that dir
+                # (Previous code checked depth-2 first, which caused game nodes to
+                #  resolve to the library root instead of the game dir itself.)
+                if node_path == library:
+                    scope = library
                 elif node_path.parent == library:
                     scope = node_path          # console node
-                elif node_path == library:
-                    scope = library            # root → full scan
                 else:
-                    scope = node_path          # game node (direct child of console)
+                    scope = node_path          # game dir at any depth
             else:
                 scope = library               # nothing selected → full library
 
@@ -2235,6 +2314,11 @@ class MyrientTUI(App):
             def check_delete(confirm: bool) -> None:
                 if confirm and target_path:
                     try:
+                        # Remove status entries for the deleted path (and all children
+                        # if it's a console dir) before wiping from disk, so the JSON
+                        # store doesn't accumulate stale entries.
+                        self._lib_status.remove(target_path)
+                        self._lib_status.prune(Path(self.state.settings['library_root']))
                         if target_path.is_dir():
                             shutil.rmtree(target_path)
                         else:
@@ -2403,6 +2487,12 @@ class MyrientTUI(App):
                 return
             self.engine_running = True
 
+        # Clear cancel flag immediately after acquiring the engine — a prior
+        # cancelled run leaves the flag set, which would cause every new worker
+        # to bail out instantly if we only clear it after the queue check.
+        self.cancel_flag.clear()
+        self._active_progress_containers.clear()   # fresh slate for this batch
+
         queue = self.state.get_active_queue()  # already returns a fresh list copy
         max_threads = self.state.settings.get("max_concurrent", 4)
 
@@ -2410,9 +2500,6 @@ class MyrientTUI(App):
             with self._engine_lock:
                 self.engine_running = False
             return
-
-        self.cancel_flag.clear()
-        self._active_progress_containers.clear()   # fresh slate for this batch
         
         self.global_total = len(queue)
         self.global_completed = 0
@@ -2659,19 +2746,9 @@ class MyrientTUI(App):
     def _convert_to_chd(self, dest_dir: Path, silent: bool = False) -> None:
         chdman = self._chdman_path or shutil.which("chdman") or "chdman"
 
-        # Map each source extension to the chdman subcommands to try (in order).
-        # CD images (.cue/.gdi) use createcd.
-        # Raw ISOs are most likely DVD-based (Wii, PS2, GC, Xbox) → createdvd first,
-        # then createcd as fallback for the rare CD-ROM ISO.
-        _CMD_MAP: dict[str, list[str]] = {
-            '.cue': ['createcd'],
-            '.gdi': ['createcd'],
-            '.iso': ['createdvd', 'createcd'],
-        }
-
         # Collect all convertible source files, skipping those already converted
         conversion_targets: list[Path] = []
-        for ext in _CMD_MAP:
+        for ext in _CHD_CMD_MAP:
             for f in dest_dir.rglob(f'*{ext}'):
                 if not f.with_suffix('.chd').exists():
                     conversion_targets.append(f)
@@ -2681,7 +2758,7 @@ class MyrientTUI(App):
                 return
 
             ext_lower = file_path.suffix.lower()
-            subcommands = _CMD_MAP.get(ext_lower, ['createcd'])
+            subcommands = _CHD_CMD_MAP.get(ext_lower, ['createcd'])
             chd_output  = file_path.with_suffix('.chd')
             succeeded   = False
 
@@ -3348,28 +3425,29 @@ class MyrientTUI(App):
 
         self.post_message(SystemLog(f"CHD Conversion: Scanning {scope_label}…"))
 
-        # Source extensions that chdman can convert to CHD
-        _CHD_SOURCE_EXTS = frozenset({'.bin', '.iso', '.cue', '.gdi'})
-
-        # If scope is a specific game dir, treat it as the only candidate
-        if scope.parent != library and scope != library:
-            game_scope_dirs = [scope]
-        else:
-            game_scope_dirs = None  # use walker
-
+        # If scope is a specific game dir, treat it as the only candidate;
+        # otherwise build targets by walking the library and filtering to scope.
         targets = []
-        if game_scope_dirs is not None:
-            for gd in game_scope_dirs:
-                try:
-                    dir_files = [f for f in gd.iterdir() if f.is_file()]
-                except PermissionError:
-                    continue
-                has_source = any(f.suffix.lower() in _CHD_SOURCE_EXTS for f in dir_files)
-                has_chd    = any(f.suffix.lower() == '.chd'            for f in dir_files)
-                if has_source and not has_chd:
-                    targets.append(gd)
+        if scope != library and scope.parent != library:
+            # Game-level scope (direct child of a console, or multi-disc sub-game)
+            try:
+                dir_files = [f for f in scope.iterdir() if f.is_file()]
+            except PermissionError:
+                dir_files = []
+            has_source = any(f.suffix.lower() in _CHD_SOURCE_EXTS for f in dir_files)
+            has_chd    = any(f.suffix.lower() == '.chd'             for f in dir_files)
+            if has_source and not has_chd:
+                targets.append(scope)
         else:
-            for _, game_dir, status in self._walk_library_game_dirs(scope, self._lib_status):
+            # Full library or console scope — always walk from the library root
+            # and filter by is_relative_to(scope) so console-scoped runs only
+            # process that console's game dirs (the old code passed the console
+            # dir to _walk_library_game_dirs as if it were the library root,
+            # which caused the walker to treat game dirs as consoles and miss
+            # all single-disc games).
+            for _, game_dir, status in self._walk_library_game_dirs(library, self._lib_status):
+                if scope != library and not game_dir.is_relative_to(scope):
+                    continue
                 if status == "corrupted":
                     continue
                 try:
@@ -3377,7 +3455,7 @@ class MyrientTUI(App):
                 except PermissionError:
                     continue
                 has_source = any(f.suffix.lower() in _CHD_SOURCE_EXTS for f in dir_files)
-                has_chd    = any(f.suffix.lower() == '.chd'            for f in dir_files)
+                has_chd    = any(f.suffix.lower() == '.chd'             for f in dir_files)
                 if has_source and not has_chd:
                     targets.append(game_dir)
 
@@ -3525,19 +3603,7 @@ class MyrientTUI(App):
             dir_files = [f for f in d.iterdir() if f.is_file() and not f.name.startswith('.')]
         except PermissionError:
             return None
-        # Broad set covering every disc/cart/tape image format from Myrient Redump:
-        #   CD:   .bin .cue .img .iso .nrg .mdf .mds
-        #   DVD:  .iso (reused)
-        #   Wii/GC: .wbfs .rvz .gcz (Dolphin formats)
-        #   DC:   .gdi
-        #   CHD:  .chd
-        #   Misc: .rom .xiso .ecm
-        _GAME_EXTS = frozenset({
-            '.bin', '.iso', '.cue', '.chd', '.img',
-            '.wbfs', '.rvz', '.gcz', '.gdi',
-            '.nrg', '.mdf', '.mds',
-            '.rom', '.xiso', '.ecm',
-        })
+        # _GAME_EXTS is a module-level frozenset — O(1) membership test
         has_game = any(f.suffix.lower() in _GAME_EXTS for f in dir_files)
         has_zip  = any(f.suffix.lower() == '.zip'     for f in dir_files)
         if not (has_game or has_zip):
