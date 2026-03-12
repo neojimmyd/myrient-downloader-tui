@@ -52,9 +52,10 @@ logging.basicConfig(
     format='%(asctime)s - [%(levelname)s] - %(message)s'
 )
 
-BASE_URL     = "https://myrient.erista.me/files/Redump/"
-DAT_BASE_URL = "https://myrient.erista.me/dats/Redump/"
-CONFIG_FILE  = Path("myrient_data.json")
+BASE_URL      = "https://myrient.erista.me/files/Redump/"
+DAT_BASE_URL  = "https://myrient.erista.me/dats/Redump/"
+CONFIG_FILE   = Path("myrient_data.json")
+SESSION_LOG_DIR = Path("myrient_logs")
 
 # Pre-compiled globally to minimize CPU cycles during tight loops
 SIZE_REGEX      = re.compile(r'(?<!\d)(\d+(?:\.\d+)?)\s*([KMGT]i?B?)', re.IGNORECASE)
@@ -669,6 +670,11 @@ class MyrientTUI(App):
         # Periodic config flush timer
         self._flush_timer: Timer | None = None
 
+        # Session log — opened in on_mount, closed in on_unmount.
+        # All _log() calls are mirrored here as plain text with full timestamps.
+        self._session_log_file: Any = None
+        self._session_log_lock = threading.Lock()
+
     def action_refresh_browser(self) -> None:
         """Ctrl+R: re-scrape console list (bypasses cache)."""
         with self._link_cache_lock:
@@ -820,6 +826,11 @@ class MyrientTUI(App):
                                 id="btn-requeue-failed",
                                 classes="ops-btn",
                             )
+                            yield Button(
+                                "Re-queue Console",
+                                id="btn-requeue-console",
+                                classes="ops-btn",
+                            )
                             yield Label(
                                 "[bold green]✓[/] Validated  "
                                 "[bold red]✗[/] Corrupted  "
@@ -918,6 +929,19 @@ class MyrientTUI(App):
         # in-progress downloads without hammering the disk on every completion.
         self._flush_timer = self.set_interval(_FLUSH_INTERVAL, self.state.flush_if_dirty)
 
+        # Open session log — one file per run, named by wall-clock start time.
+        try:
+            SESSION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_path = SESSION_LOG_DIR / f"myrient_{ts}.log"
+            self._session_log_file = open(log_path, 'w', encoding='utf-8', buffering=1)
+            self._session_log_file.write(
+                f"# Myrient session log — started {datetime.datetime.now().isoformat()}\n"
+            )
+        except OSError as e:
+            self._session_log_file = None
+            self._log(f"Could not open session log file: {e}", is_error=True)
+
     def _log(self, msg: str, is_error: bool = False) -> None:
         try:
             log_widget = self.query_one("#sys-log", RichLog)
@@ -930,9 +954,6 @@ class MyrientTUI(App):
             else:
                 line.append("INF", style="dim #e6b73e")
             line.append("  ")
-            # Parse Rich markup in the message body — all SystemLog callers are
-            # internal, so [bold], [yellow], etc. render as intended.  Fall back
-            # to plain text if the markup is malformed to avoid swallowing the message.
             try:
                 line.append_text(Text.from_markup(msg))
             except Exception:
@@ -940,6 +961,22 @@ class MyrientTUI(App):
             log_widget.write(line)
         except Exception:
             pass
+
+        # Mirror to session log — strip markup to plain text for readability.
+        # Uses a lock because _log can technically be reached from worker threads
+        # via post_message → on_system_log on the main thread, but belt-and-suspenders.
+        if self._session_log_file is not None:
+            try:
+                full_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                level   = "ERR" if is_error else "INF"
+                try:
+                    plain_msg = Text.from_markup(msg).plain
+                except Exception:
+                    plain_msg = msg
+                with self._session_log_lock:
+                    self._session_log_file.write(f"{full_ts}  {level}  {plain_msg}\n")
+            except Exception:
+                pass
 
     def on_system_log(self, message: SystemLog) -> None: 
         self._log(message.message, message.is_error)
@@ -1428,6 +1465,29 @@ class MyrientTUI(App):
             except Exception as err:
                 self.notify(f"Error saving settings: {err}", severity="error")
                 
+        elif button_id == "btn-requeue-console":
+            # Read tree cursor on the main thread before dispatching worker.
+            tree = self.query_one("#lib-tree", Tree)
+            node = tree.cursor_node
+            if not node or not isinstance(getattr(node, 'data', None), Path):
+                self.notify("Select a console or game in the tree first.", severity="warning")
+                return
+            library = Path(self.state.settings['library_root'])
+            node_path: Path = node.data
+            # Resolve to console level — if a game leaf is selected, walk up one level.
+            # Console nodes are direct children of the library root (depth 1).
+            if node_path.parent == library:
+                console_path = node_path
+            elif node_path.parent.parent == library:
+                console_path = node_path.parent
+            else:
+                # Deeper nesting (multi-disc grandchild) — go up two levels
+                console_path = node_path.parent.parent
+            if not console_path.is_dir():
+                self.notify("Could not resolve a console folder from the selected node.", severity="warning")
+                return
+            self.requeue_console_games(console_path.name, console_path)
+
         elif button_id == "btn-lib-delete":
             tree = self.query_one("#lib-tree", Tree)
             if not tree.cursor_node or not isinstance(tree.cursor_node.data, Path):
@@ -2053,7 +2113,7 @@ class MyrientTUI(App):
             return
 
         # ── Phase 3: per-console audit ───────────────────────────────────────
-        grand_perfect = grand_misnamed = grand_bad = 0
+        grand_perfect = grand_misnamed = grand_ambiguous = grand_bad = 0
         dat_cache_root = library / ".dats"
 
         for con_idx, console_dir in enumerate(console_dirs, 1):
@@ -2113,7 +2173,17 @@ class MyrientTUI(App):
                         continue
 
             # ── 3c: parse DAT into sha1 → {name, game} ──────────────────────
+            # PlayStation (and other multi-track formats) have audio tracks that
+            # are binary-identical across many unrelated games (silent tracks,
+            # standard license-area data, etc.).  If we stored only the last game
+            # that had a given SHA-1 the rename logic would wrongly relocate those
+            # shared tracks to whichever game happened to be parsed last in the DAT.
+            #
+            # Strategy: build dat_by_sha1 for unique SHA-1 entries only.
+            # Any SHA-1 seen in more than one game goes into ambiguous_sha1s and is
+            # excluded from renaming — the file is still counted as verified-good.
             dat_by_sha1: dict[str, dict[str, str]] = {}
+            ambiguous_sha1s: set[str] = set()
             try:
                 context = ET.iterparse(dat_path, events=('start', 'end'))
                 _, xml_root = next(context)
@@ -2125,9 +2195,17 @@ class MyrientTUI(App):
                         sha1_val = elem.get('sha1')
                         rom_name = elem.get('name')
                         if sha1_val and rom_name:
-                            dat_by_sha1[sha1_val.lower()] = {
-                                "name": rom_name, "game": current_game
-                            }
+                            sha1_lower = sha1_val.lower()
+                            if sha1_lower in ambiguous_sha1s:
+                                pass  # already flagged — skip
+                            elif sha1_lower in dat_by_sha1:
+                                # Second occurrence → ambiguous; remove from rename map
+                                ambiguous_sha1s.add(sha1_lower)
+                                del dat_by_sha1[sha1_lower]
+                            else:
+                                dat_by_sha1[sha1_lower] = {
+                                    "name": rom_name, "game": current_game
+                                }
                         elem.clear()
                     elif event == 'end' and elem.tag == 'game':
                         xml_root.clear()
@@ -2167,7 +2245,7 @@ class MyrientTUI(App):
                 sha1_cache = {}
 
             # ── 3f: hash every file once (or reuse cache), fix misnamed files ──
-            con_perfect = con_misnamed = con_bad = 0
+            con_perfect = con_misnamed = con_bad = con_ambiguous = 0
             all_files = [(gd, fp) for gd, fps in game_dirs.items() for fp in fps]
             total_files = len(all_files)
             hash_results: dict[Path, bool] = {}
@@ -2205,7 +2283,15 @@ class MyrientTUI(App):
                         }
                         cache_dirty = True
 
-                    if file_hash in dat_by_sha1:
+                    if file_hash in ambiguous_sha1s:
+                        # Hash is shared by multiple games in the DAT (e.g. identical
+                        # silent audio tracks common to many PS1 titles).  The data is
+                        # verified-good but we cannot determine the canonical name, so
+                        # we skip renaming and count the file as verified.
+                        con_ambiguous += 1
+                        hash_results[file_path] = True
+
+                    elif file_hash in dat_by_sha1:
                         expected_name = dat_by_sha1[file_hash]['name']
                         expected_game = dat_by_sha1[file_hash]['game']
 
@@ -2315,10 +2401,12 @@ class MyrientTUI(App):
 
             self.post_message(SystemLog(
                 f"DAT Audit [{console_name}]: "
-                f"Perfect: {con_perfect}  Misnamed: {con_misnamed}  Bad/Unknown: {con_bad}"
+                f"Perfect: {con_perfect}  Fixed: {con_misnamed}  "
+                f"Ambiguous: {con_ambiguous}  Bad/Unknown: {con_bad}"
             ))
             grand_perfect  += con_perfect
             grand_misnamed += con_misnamed
+            grand_ambiguous += con_ambiguous
             grand_bad      += con_bad
 
         # ── Phase 4: finish ──────────────────────────────────────────────────
@@ -2326,7 +2414,8 @@ class MyrientTUI(App):
         self.post_message(SystemLog(
             f"[bold]Bulk DAT Audit Complete[/bold] — "
             f"Perfect: [bold green]{grand_perfect}[/]  "
-            f"Misnamed: [bold yellow]{grand_misnamed}[/]  "
+            f"Fixed: [bold yellow]{grand_misnamed}[/]  "
+            f"Ambiguous: [bold cyan]{grand_ambiguous}[/]  "
             f"Bad/Unknown: [bold red]{grand_bad}[/]"
         ))
         self.run_lib_status_scan()
@@ -2522,6 +2611,66 @@ class MyrientTUI(App):
             f"{n_corrupted} corrupted, {n_incomplete} incomplete."
         ))
 
+    @work(exclusive=True, thread=True)
+    def requeue_console_games(self, console_name: str, console_path: Path) -> None:
+        """Queue every game directory under *console_path* for re-download,
+        regardless of validation status.  Useful for a full console re-download
+        after data loss or after the DAT-rename corruption incident.
+        Already-queued entries are skipped to avoid duplicates.
+        """
+        if not console_path.exists():
+            self.post_message(SystemLog(
+                f"Re-queue Console: path not found: {console_path}", True
+            ))
+            return
+
+        # Walk from the library root but filter to just this console — reuses
+        # the shared walker so grouping-folder / multi-disc handling is consistent.
+        targets = [
+            (cn, gd, s)
+            for cn, gd, s in self._walk_library_game_dirs(console_path.parent)
+            if cn == console_name
+        ]
+
+        if not targets:
+            self.post_message(SystemLog(
+                f"Re-queue Console [{console_name}]: No game directories found."
+            ))
+            return
+
+        current_queue  = self.state.get_active_queue()
+        existing_paths = {i["dest_path"] for i in current_queue}
+        added = skipped = 0
+
+        for _, game_dir, status in targets:
+            if str(game_dir) in existing_paths:
+                skipped += 1
+                continue
+            game_zip = game_dir.name + ".zip"
+            game_url = BASE_URL + quote(console_name, safe="") + "/" + quote(game_zip, safe="")
+            current_queue.append({
+                "id":        f"dl_{uuid.uuid4().hex[:8]}",
+                "name":      f"{console_name} / {game_zip} ({status})",
+                "game_url":  game_url,
+                "dest_path": str(game_dir),
+                "size_str":  "N/A",
+            })
+            existing_paths.add(str(game_dir))
+            added += 1
+
+        if added:
+            self.state.update_active_queue(current_queue, immediate=True)
+            self.call_from_thread(self._refresh_queue_table)
+            self.call_from_thread(
+                lambda: setattr(self.query_one("#tabs", TabbedContent), "active", "tab-queue-dl")
+            )
+
+        self.post_message(SystemLog(
+            f"Re-queue Console [{console_name}]: "
+            f"queued [bold]{added}[/bold] game(s)"
+            + (f", skipped {skipped} already in queue." if skipped else ".")
+        ))
+
     @staticmethod
     def _parse_size_bytes(size_str: str) -> int:
         """Parse a human-readable size string (e.g. '524.8 MB', '1.2GiB') into bytes.
@@ -2544,6 +2693,14 @@ class MyrientTUI(App):
     async def on_unmount(self) -> None:
         self.cleanup_subprocesses()
         self.state.flush_if_dirty()   # persist any deferred queue mutations before exit
+        if self._session_log_file is not None:
+            try:
+                self._session_log_file.write(
+                    f"# Session ended {datetime.datetime.now().isoformat()}\n"
+                )
+                self._session_log_file.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
