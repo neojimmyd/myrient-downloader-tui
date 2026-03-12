@@ -383,6 +383,45 @@ class LibraryStatus:
 
 
 # --- Custom UI Components & Messages ---
+
+class GameSearchInput(Input):
+    """Search input that intercepts ↑↓ / Space / Enter before Input consumes them.
+
+    Textual's Input widget handles keys internally in ``_on_key`` before they
+    bubble to the App.  Up/down arrows, space, and enter are all swallowed that
+    way, so App.on_key never sees them when this widget is focused.
+
+    This subclass intercepts exactly those keys and posts lightweight messages
+    so the app can move the game-list cursor, toggle selections, and queue games
+    — all without the user ever leaving the search box.
+    """
+
+    class NavUp(Message):       pass
+    class NavDown(Message):     pass
+    class ToggleAtCursor(Message): pass
+    class QueueSelected(Message):  pass
+
+    def _on_key(self, event: Key) -> None:
+        if event.key == "up":
+            self.post_message(self.NavUp())
+            event.prevent_default()
+            event.stop()
+        elif event.key == "down":
+            self.post_message(self.NavDown())
+            event.prevent_default()
+            event.stop()
+        elif event.key == "space":
+            self.post_message(self.ToggleAtCursor())
+            event.prevent_default()
+            event.stop()
+        elif event.key == "enter":
+            self.post_message(self.QueueSelected())
+            event.prevent_default()
+            event.stop()
+        else:
+            super()._on_key(event)
+
+
 class SystemLog(Message):
     def __init__(self, message: str, is_error: bool = False):
         self.message = message
@@ -897,7 +936,7 @@ class MyrientTUI(App):
 
                     with Vertical(classes="panel panel-65"):
                         yield Label("▸ GAMES", classes="section-header")
-                        yield Input(
+                        yield GameSearchInput(
                             placeholder="  search games…",
                             id="search-games",
                             classes="search-bar",
@@ -1296,56 +1335,38 @@ class MyrientTUI(App):
             return Text(text, style="white", no_wrap=True)
         return self._build_highlight_text(text, spans)
 
+    # --- GameSearchInput message handlers ---
+    def on_game_search_input_nav_up(self, _: GameSearchInput.NavUp) -> None:
+        try:
+            t = self.query_one("#game-list", DataTable)
+            if t.row_count:
+                t.move_cursor(row=max((t.cursor_row or 0) - 1, 0))
+        except Exception:
+            pass
+
+    def on_game_search_input_nav_down(self, _: GameSearchInput.NavDown) -> None:
+        try:
+            t = self.query_one("#game-list", DataTable)
+            if t.row_count:
+                t.move_cursor(row=min((t.cursor_row or 0) + 1, t.row_count - 1))
+        except Exception:
+            pass
+
+    def on_game_search_input_toggle_at_cursor(self, _: GameSearchInput.ToggleAtCursor) -> None:
+        self._toggle_game_at_cursor()
+
+    def on_game_search_input_queue_selected(self, _: GameSearchInput.QueueSelected) -> None:
+        self._add_selected_to_queue()
+
     def on_key(self, event: Key) -> None:
-        """Route keyboard events so the user can search and select games without
-        ever leaving the search input:
-
-        When ``search-games`` is focused:
-          - Printable characters / backspace / delete → handled by Input normally
-          - ↑ / ↓                                    → move the game table cursor
-          - Space                                     → toggle game at cursor
-          - Enter                                     → queue all selected games
-
-        When ``game-list`` is focused:
-          - Space → toggle game at cursor
-          - Q     → queue all selected games
-
-        When ``set-include`` / ``set-exclude`` is focused:
-          - Space → toggle filter row
+        """Handles keys for game-list and filter tables.
+        search-games keys (↑↓/Space/Enter) are handled by GameSearchInput._on_key
+        before they bubble, so they never reach here.
         """
         focused = self.focused
         fid = getattr(focused, "id", None)
 
-        if fid == "search-games":
-            if event.key in ("up", "down"):
-                # Move the DataTable cursor without stealing focus from the input.
-                try:
-                    game_table = self.query_one("#game-list", DataTable)
-                    row_count  = game_table.row_count
-                    if row_count == 0:
-                        return
-                    cur = game_table.cursor_row or 0
-                    if event.key == "down":
-                        new_row = min(cur + 1, row_count - 1)
-                    else:
-                        new_row = max(cur - 1, 0)
-                    game_table.move_cursor(row=new_row)
-                except Exception:
-                    pass
-                event.prevent_default()
-                event.stop()
-
-            elif event.key == "space":
-                self._toggle_game_at_cursor()
-                event.prevent_default()
-                event.stop()
-
-            elif event.key == "enter":
-                self._add_selected_to_queue()
-                event.prevent_default()
-                event.stop()
-
-        elif fid == "game-list":
+        if fid == "game-list":
             if event.key == "space":
                 self._toggle_game_at_cursor()
                 event.prevent_default()
