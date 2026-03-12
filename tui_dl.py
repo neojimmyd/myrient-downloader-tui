@@ -58,12 +58,15 @@ _TOOLS_DIR.mkdir(parents=True, exist_ok=True)
 BASE_URL        = "https://myrient.erista.me/files/Redump/"
 DAT_BASE_URL    = "https://myrient.erista.me/dats/Redump/"
 
-# PS2 Master Disc Patcher v1.0.6 — standalone release from MottZilla via psx-place
-_PSDB_RELEASE_URL   = (
-    "https://www.psx-place.com/attachments/"
-    "ps2-master-disc-patcher-v1-0-6-linux-x86_64-static-zip.45505/"
+# PS2 Master Disc Patcher v1.0.6 — committed directly to the playstation-disc-burner repo
+# Download the binary and region.ini straight from GitHub raw — no zip extraction needed.
+_PS2MDP_BINARY_NAME = "ps2-master-disc-patcher"
+_PS2MDP_RAW_BASE    = (
+    "https://raw.githubusercontent.com/alex-free/playstation-disc-burner"
+    "/master/ps2-master-disc-patcher-v1.0.6-linux-x86_64-static/"
 )
-_PS2MDP_BINARY_NAME = "ps2-master-disc-patcher"   # binary name inside the zip
+_PS2MDP_BINARY_URL  = _PS2MDP_RAW_BASE + _PS2MDP_BINARY_NAME
+_PS2MDP_REGION_URL  = _PS2MDP_RAW_BASE + "region.ini"
 
 # Consoles whose Redump DAT name does NOT follow the standard
 # "{console_name} - Datfile (N) (date).dat" pattern.  Each entry maps a
@@ -1069,10 +1072,10 @@ class MyrientTUI(App):
 
     @work(exclusive=True, thread=True)
     def setup_ps2mdp_auto(self) -> None:
-        """Download the PS2 Master Disc Patcher binary from the PSDB GitHub release.
+        """Download ps2-master-disc-patcher v1.0.6 directly from GitHub.
 
-        Extracts only the patcher binary (and region.ini if present) into
-        myrient_data/tools/.  The originals are left untouched.
+        The binary lives as a committed file in the playstation-disc-burner repo,
+        so we pull it straight via raw.githubusercontent.com — no zip needed.
         """
         self.post_message(SystemLog("PS2 Patcher Setup: Checking for existing installation..."))
         path = self._find_ps2mdp()
@@ -1083,86 +1086,79 @@ class MyrientTUI(App):
             ))
             return
 
-        self.post_message(SystemLog(
-            "PS2 Patcher Setup: Downloading ps2-master-disc-patcher v1.0.6…\n"
-            f"  Source: {_PSDB_RELEASE_URL}"
-        ))
+        binary_dest = _TOOLS_DIR / _PS2MDP_BINARY_NAME
+        region_dest = _TOOLS_DIR / "region.ini"
 
-        import zipfile as _zf
-
-        tmp_zip = _TOOLS_DIR / "_psdb_download.zip"
-        try:
+        def _download(url: str, dest: Path) -> None:
+            """Download *url* to *dest*, trying wget first then urllib fallback."""
             try:
                 subprocess.run(
-                    ["wget", "-q", "--timeout=60", "--tries=3",
-                     "-O", str(tmp_zip), _PSDB_RELEASE_URL],
-                    check=True, timeout=180,
+                    ["wget", "-q", "--timeout=30", "--tries=3",
+                     "-O", str(dest), url],
+                    check=True, timeout=120,
                 )
             except Exception:
                 req = urllib.request.Request(
-                    _PSDB_RELEASE_URL,
+                    url,
                     headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
                 )
-                with urllib.request.urlopen(req, timeout=90) as resp, \
-                        open(tmp_zip, "wb") as fout:
+                with urllib.request.urlopen(req, timeout=60) as resp, \
+                        open(dest, "wb") as fout:
                     shutil.copyfileobj(resp, fout)
 
-            with _zf.ZipFile(tmp_zip, "r") as zf:
-                extracted_any = False
-                for member in zf.namelist():
-                    base = Path(member).name
-                    if base in (_PS2MDP_BINARY_NAME,
-                                _PS2MDP_BINARY_NAME + ".exe",
-                                "region.ini"):
-                        dest = _TOOLS_DIR / base
-                        with zf.open(member) as src, open(dest, "wb") as dst:
-                            shutil.copyfileobj(src, dst)
-                        if base != "region.ini":
-                            dest.chmod(dest.stat().st_mode | 0o111)
-                        extracted_any = True
-                        self.post_message(SystemLog(
-                            f"PS2 Patcher Setup: Extracted [bold]{base}[/bold] → {dest}"
-                        ))
+        try:
+            # ── Download binary ──────────────────────────────────────────────
+            self.post_message(SystemLog(
+                f"PS2 Patcher Setup: Downloading binary…\n  {_PS2MDP_BINARY_URL}"
+            ))
+            _download(_PS2MDP_BINARY_URL, binary_dest)
+            binary_dest.chmod(binary_dest.stat().st_mode | 0o111)
+            self.post_message(SystemLog(
+                f"PS2 Patcher Setup: Binary saved → [bold]{binary_dest}[/bold]"
+            ))
 
-            if not extracted_any:
-                self.post_message(SystemLog(
-                    "[bold red]PS2 Patcher Setup: binary not found inside the downloaded zip.[/bold red]\n"
-                    "The release layout may have changed. Manual install:\n"
-                    f"  1. Download: {_PSDB_RELEASE_URL}\n"
-                    f"  2. Extract '{_PS2MDP_BINARY_NAME}' to myrient_data/tools/\n"
-                    "  3. chmod +x myrient_data/tools/ps2-master-disc-patcher",
-                    True,
-                ))
-                return
+            # ── Download region.ini (skip if user already has one) ───────────
+            if not region_dest.exists():
+                self.post_message(SystemLog("PS2 Patcher Setup: Downloading region.ini…"))
+                try:
+                    _download(_PS2MDP_REGION_URL, region_dest)
+                    self.post_message(SystemLog(
+                        f"PS2 Patcher Setup: region.ini saved → [bold]{region_dest}[/bold]"
+                    ))
+                except Exception:
+                    # region.ini may not be in the repo — write a safe default
+                    region_dest.write_text("U\n", encoding="ascii")
+                    self.post_message(SystemLog(
+                        "PS2 Patcher Setup: Created default region.ini (USA). "
+                        "Edit myrient_data/tools/region.ini to change: "
+                        "J=Japan, U=USA, E=Europe, W=World"
+                    ))
 
-            # Write a default region.ini (USA) if the zip didn't include one
-            region_ini = _TOOLS_DIR / "region.ini"
-            if not region_ini.exists():
-                region_ini.write_text("U\n", encoding="ascii")
-                self.post_message(SystemLog(
-                    "PS2 Patcher Setup: Created default region.ini (USA). "
-                    "Edit myrient_data/tools/region.ini to change region: "
-                    "J=Japan, U=USA, E=Europe, W=World"
-                ))
-
+            # ── Verify ───────────────────────────────────────────────────────
             path = self._find_ps2mdp()
             if path:
                 self._ps2mdp_path = path
                 self.post_message(SystemLog(
-                    f"[bold green]PS2 Master Disc Patcher ready![/bold green] Path: [bold]{path}[/bold]"
+                    f"[bold green]PS2 Master Disc Patcher ready![/bold green] "
+                    f"Path: [bold]{path}[/bold]"
                 ))
             else:
                 self.post_message(SystemLog(
-                    "[bold red]Setup finished but binary still not found.[/bold red]", True
+                    "[bold red]Download finished but binary not executable.[/bold red]\n"
+                    f"Try: chmod +x {binary_dest}", True
                 ))
 
         except Exception as err:
             self.post_message(SystemLog(
-                f"[bold red]PS2 Patcher Setup failed:[/bold red] {err}", True
+                f"[bold red]PS2 Patcher Setup failed:[/bold red] {err}\n"
+                "Manual install: place the 'ps2-master-disc-patcher' binary "
+                "in myrient_data/tools/ and chmod +x it.",
+                True,
             ))
-        finally:
+            # Clean up a partial download so a retry doesn't see a broken binary
             try:
-                tmp_zip.unlink(missing_ok=True)
+                if binary_dest.exists() and binary_dest.stat().st_size < 1000:
+                    binary_dest.unlink()
             except OSError:
                 pass
 
