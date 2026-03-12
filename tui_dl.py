@@ -3588,7 +3588,7 @@ class MyrientTUI(App):
                 else:
                     # May be a grouping folder (multi-disc base) — check its children
                     try:
-                      for grandchild in sorted(
+                        for grandchild in sorted(
                             (e for e in child.iterdir() if e.is_dir() and not e.name.startswith('.')),
                             key=_by_name,
                         ):
@@ -3606,7 +3606,7 @@ class MyrientTUI(App):
 
         # structure: {console_name: (console_path, [(game_dir, status_str), ...])}
         structure: dict[str, tuple[Path, list[tuple[Path, str]]]] = {}
-        for console_name, game_dir, status in self._walk_library_game_dirs(libra, self._lib_status):
+        for console_name, game_dir, status in self._walk_library_game_dirs(library, self._lib_status):
             if console_name not in structure:
                 structure[console_name] = (library / console_name, [])
             structure[console_name][1].append((game_dir, status))
@@ -3648,7 +3648,7 @@ class MyrientTUI(App):
             current_queue.append({
                 "id":        f"dl_{uuid.uuid4().hex[:8]}",
                 "name":      f"{console_name} / {game_zip} ({plain_status})",
-              "game_url":  game_url,
+                "game_url":  game_url,
                 "dest_path": str(game_dir),
                 "size_str":  "N/A",
             })
@@ -3662,7 +3662,7 @@ class MyrientTUI(App):
 
         if added:
             self.state.update_active_queue(current_queue, immediate=True)
-            self.call_om_thread(self._refresh_queue_table)
+            self.call_from_thread(self._refresh_queue_table)
             # Switch to the queue tab so the user can see what was added
             self.call_from_thread(
                 lambda: setattr(self.query_one("#tabs", TabbedContent), "active", "tab-queue-dl")
@@ -3696,7 +3696,7 @@ class MyrientTUI(App):
 
         if not targets:
             self.post_message(SystemLog(
-                f"Re-queue Console [{console_name}]: No game directories found
+                f"Re-queue Console [{console_name}]: No game directories found."
             ))
             return
 
@@ -3760,7 +3760,7 @@ class MyrientTUI(App):
         self.state.flush_if_dirty()   # persist any deferred queue mutations before exit
         if self._session_log_file is not None:
             try:
-              self._session_log_file.write(
+                self._session_log_file.write(
                     f"# Session ended {datetime.datetime.now().isoformat()}\n"
                 )
                 self._session_log_file.close()
