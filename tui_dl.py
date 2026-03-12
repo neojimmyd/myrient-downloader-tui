@@ -52,6 +52,8 @@ socket.setdefaulttimeout(60)
 _SCRIPT_DIR = Path(__file__).parent.resolve()
 _DATA_DIR   = _SCRIPT_DIR / "myrient_data"
 _DATA_DIR.mkdir(parents=True, exist_ok=True)
+_TOOLS_DIR  = _DATA_DIR / "tools"
+_TOOLS_DIR.mkdir(parents=True, exist_ok=True)
 
 BASE_URL        = "https://myrient.erista.me/files/Redump/"
 DAT_BASE_URL    = "https://myrient.erista.me/dats/Redump/"
@@ -70,7 +72,20 @@ logging.basicConfig(
 SIZE_REGEX      = re.compile(r'(?<!\d)(\d+(?:\.\d+)?)\s*([KMGT]i?B?)', re.IGNORECASE)
 DISC_REGEX      = re.compile(r'\s*\((?:Disc|Disk|Tape|Side)\s+[^)]+\)', re.IGNORECASE)
 CUE_BIN_REGEX   = re.compile(r'FILE\s+"([^"]+)"')
-WGET_PROG_REGEX = re.compile(r'(\d+)%')
+WGET_PROG_REGEX   = re.compile(r'(\d+)%')
+WGET_LENGTH_REGEX = re.compile(r'Length:\s+(\d+)')
+
+# Platform-appropriate chdman download URLs (standalone builds)
+import platform as _platform
+_OS = _platform.system().lower()   # 'linux', 'darwin', 'windows'
+# These are the mame-tools package names used by common package managers
+_PKG_INSTALL_CMDS: list[tuple[str, list[str]]] = [
+    # (label, argv)
+    ("apt-get",  ["apt-get", "install", "-y", "mame-tools"]),
+    ("dnf",      ["dnf",     "install", "-y", "mame-tools"]),
+    ("pacman",   ["pacman",  "-S",  "--noconfirm", "mame-tools"]),
+    ("brew",     ["brew",    "install", "rom-tools"]),
+]
 
 # SoupStrainer shared across all scrape calls — only parse <a> and <tr> tags
 _SCRAPE_STRAINER = SoupStrainer(["a", "tr"])
@@ -106,7 +121,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "filter_include": [],
     "filter_exclude": [],
     "max_concurrent": 4,
-    "auto_convert_chd": False
+    "auto_convert_chd": False,
+    "chdman_path": "",   # empty = search PATH / tools dir at runtime
 }
 
 
@@ -497,15 +513,16 @@ class ConfirmDeleteScreen(ModalScreen[bool]):
         self.target_name = target_name
 
     def compose(self) -> ComposeResult:
-        with Container(id="dialog"):
+        with Vertical(id="dialog"):
             msg = Text.assemble(
                 "Permanently delete ",
                 (self.target_name, "bold red"),
                 "?",
             )
             yield Label(msg, id="question")
-            yield Button("Cancel", variant="primary", id="btn-cancel")
-            yield Button("Delete", variant="error", id="btn-delete")
+            with Horizontal(id="dialog-btn-row"):
+                yield Button("Cancel", variant="primary", id="btn-cancel")
+                yield Button("Delete", variant="error",   id="btn-delete")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "btn-delete")
@@ -814,21 +831,36 @@ class MyrientTUI(App):
     }
 
     /* ── Confirm dialog ─────────────────────────────────────────── */
+    ConfirmDeleteScreen {
+        align: center middle;
+        background: rgba(0, 0, 0, 0.75);
+    }
     #dialog {
-        grid-size: 2;
         padding: 2 3;
-        width: 64;
-        height: 11;
+        width: 72;
+        height: auto;
+        min-height: 10;
         border: thick #f85149;
         background: #0d1117;
         align: center middle;
     }
     #question {
-        column-span: 2;
+        width: 1fr;
         content-align: center middle;
-        height: 1fr;
+        text-align: center;
+        height: auto;
         color: #e6edf3;
         text-style: bold;
+        padding: 1 0 2 0;
+    }
+    #dialog-btn-row {
+        height: auto;
+        align: center middle;
+        width: 1fr;
+    }
+    #dialog-btn-row Button {
+        width: 1fr;
+        margin: 0 1;
     }
     """
 
@@ -857,6 +889,7 @@ class MyrientTUI(App):
         self.proc_lock      = threading.Lock()
         self.active_processes: set = set()
         self.chd_lock       = threading.Lock()
+        self._chdman_path: str = ""   # resolved at startup by _find_chdman()
 
         self.global_total     = 0
         self.global_completed = 0
@@ -926,6 +959,79 @@ class MyrientTUI(App):
                 proc.kill()
             except Exception:
                 pass
+
+    @staticmethod
+    def _find_chdman() -> str:
+        """Locate chdman executable.  Returns full path string or '' if not found.
+        Search order: saved settings path → tools directory → system PATH.
+        """
+        # 1. Local tools directory shipped/downloaded alongside the script
+        local_candidates = [
+            _TOOLS_DIR / "chdman",
+            _TOOLS_DIR / "chdman.exe",
+            _SCRIPT_DIR / "chdman",
+            _SCRIPT_DIR / "chdman.exe",
+        ]
+        for p in local_candidates:
+            if p.is_file() and os.access(p, os.X_OK):
+                return str(p)
+        # 2. System PATH
+        found = shutil.which("chdman")
+        return found or ""
+
+    @work(exclusive=True, thread=True)
+    def setup_chdman_auto(self) -> None:
+        """Try to install chdman automatically via the system package manager.
+        Falls back to detailed instructions if every method fails.
+        """
+        self.post_message(SystemLog("chdman Setup: Checking for existing installation..."))
+
+        # Re-check first — it may have been installed since launch
+        path = self._find_chdman()
+        if path:
+            self._chdman_path = path
+            self.post_message(SystemLog(f"chdman already available at: [bold]{path}[/bold]"))
+            return
+
+        self.post_message(SystemLog("chdman Setup: Attempting package-manager install..."))
+
+        for label, cmd in _PKG_INSTALL_CMDS:
+            mgr = shutil.which(cmd[0])
+            if not mgr:
+                continue
+            self.post_message(SystemLog(f"chdman Setup: Trying [bold]{label}[/bold]…"))
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=120
+                )
+                if result.returncode == 0:
+                    path = self._find_chdman()
+                    if path:
+                        self._chdman_path = path
+                        self.post_message(SystemLog(
+                            f"[bold green]chdman installed successfully![/bold green] "
+                            f"Path: [bold]{path}[/bold]"
+                        ))
+                        return
+                else:
+                    self.post_message(SystemLog(
+                        f"chdman Setup: {label} returned non-zero "
+                        f"(may need sudo). Output: {result.stderr[:120]}", True
+                    ))
+            except (subprocess.TimeoutExpired, OSError) as e:
+                self.post_message(SystemLog(f"chdman Setup: {label} failed — {e}", True))
+
+        # All package managers failed — show manual instructions
+        self.post_message(SystemLog(
+            "[bold yellow]chdman auto-install failed.[/bold yellow] "
+            "Manual options:\n"
+            "  • Linux (Debian/Ubuntu):  sudo apt install mame-tools\n"
+            "  • Linux (Arch):           sudo pacman -S mame-tools\n"
+            "  • Linux (Fedora):         sudo dnf install mame-tools\n"
+            "  • macOS (Homebrew):       brew install rom-tools\n"
+            "  • Windows: download MAME tools from https://www.mamedev.org/release.html\n"
+            "Place chdman(.exe) in the myrient_data/tools/ folder to use it without installing."
+        ))
 
     @staticmethod
     def _format_size(size_bytes: int) -> str:
@@ -1029,6 +1135,16 @@ class MyrientTUI(App):
                             yield Button(
                                 "Convert to CHD",
                                 id="btn-lib-convert",
+                                classes="ops-btn",
+                            )
+                            yield Button(
+                                "CHD → Original",
+                                id="btn-lib-chd-to-orig",
+                                classes="ops-btn",
+                            )
+                            yield Button(
+                                "⚙ Setup chdman",
+                                id="btn-setup-chdman",
                                 classes="ops-btn",
                             )
                             yield Button(
@@ -1151,6 +1267,15 @@ class MyrientTUI(App):
         # Flush deferred config writes every 3 s — catches any dirty state from
         # in-progress downloads without hammering the disk on every completion.
         self._flush_timer = self.set_interval(_FLUSH_INTERVAL, self.state.flush_if_dirty)
+
+        # Resolve chdman path once at startup
+        self._chdman_path = self._find_chdman()
+        if not self._chdman_path:
+            self._log(
+                "[yellow]chdman not found.[/yellow] "
+                "CHD conversion is disabled. Use [bold]'Setup chdman'[/bold] in Library → Operations to install.",
+                is_error=False,
+            )
 
         # Open session log — one file per run, named by wall-clock start time.
         try:
@@ -1644,6 +1769,8 @@ class MyrientTUI(App):
         "btn-lib-organize":       "run_lib_organize",
         "btn-lib-dat-audit":      "run_bulk_dat_audit",
         "btn-lib-convert":        "run_lib_convert",
+        "btn-lib-chd-to-orig":   "run_chd_to_original",
+        "btn-setup-chdman":      "setup_chdman_auto",
         "btn-lib-refresh-status": "run_lib_status_scan",
         "btn-requeue-failed":     "requeue_failed_games",
     }
@@ -2069,11 +2196,22 @@ class MyrientTUI(App):
                         return {"success": False, "cancelled": True}
 
                     stderr_log.append(line.strip())
+
+                    # Grab the real Content-Length from wget's output so the
+                    # progress bar shows accurate byte counts even when the queue
+                    # item's size_str was "N/A" or imprecise.
+                    len_match = WGET_LENGTH_REGEX.search(line)
+                    if len_match:
+                        reported = int(len_match.group(1))
+                        if reported > 0:
+                            size_bytes = reported
+
                     match = WGET_PROG_REGEX.search(line)
                     if match:
                         current_time = time.monotonic()
                         if current_time - last_ui_update > _UI_UPDATE_INTERVAL:
-                            current_bytes = int((float(match.group(1)) / 100.0) * size_bytes)
+                            pct = float(match.group(1))
+                            current_bytes = int((pct / 100.0) * size_bytes)
                             self.post_message(
                                 DownloadProgress(item["id"], item_name, current_bytes, size_bytes, "Downloading")
                             )
@@ -2111,6 +2249,12 @@ class MyrientTUI(App):
 
                 try:
                     with urllib.request.urlopen(req, timeout=30) as response:
+                        # Update size_bytes from Content-Length if available so the
+                        # progress bar shows real byte counts instead of the queue estimate.
+                        cl = response.headers.get("Content-Length")
+                        if cl and cl.isdigit() and int(cl) > 0:
+                            content_length = int(cl)
+                            size_bytes = content_length + downloaded  # total including already-downloaded
                         with open(target_file, open_mode) as file:
                             last_ui_update = 0.0
                             while True:
@@ -2163,8 +2307,14 @@ class MyrientTUI(App):
                 return {"success": False, "cancelled": True}
 
             if self.state.settings.get('auto_convert_chd', False):
-                self.post_message(DownloadProgress(item["id"], item_name, size_bytes, size_bytes, "Converting CHD"))
-                self._convert_to_chd(dest_dir, silent=True)
+                if self._chdman_path or shutil.which("chdman"):
+                    self.post_message(DownloadProgress(item["id"], item_name, size_bytes, size_bytes, "Converting CHD"))
+                    self._convert_to_chd(dest_dir, silent=True)
+                else:
+                    self.post_message(SystemLog(
+                        f"Auto-CHD skipped for {item_name}: chdman not found. "
+                        "Run 'Setup chdman' in Library → Operations."
+                    ))
 
             return {"success": True}
 
@@ -2174,61 +2324,124 @@ class MyrientTUI(App):
             return {"success": False}
 
     def _convert_to_chd(self, dest_dir: Path, silent: bool = False) -> None:
-        # Skip source files where a .chd counterpart already exists (partial/repeated runs)
-        conversion_targets = [
-            f for ext in ('.cue', '.iso')
-            for f in dest_dir.rglob(f'*{ext}')
-            if not f.with_suffix('.chd').exists()
-        ]
-        
+        chdman = self._chdman_path or shutil.which("chdman") or "chdman"
+
+        # Map each source extension to the chdman subcommands to try (in order).
+        # CD images (.cue/.gdi) use createcd.
+        # Raw ISOs are most likely DVD-based (Wii, PS2, GC, Xbox) → createdvd first,
+        # then createcd as fallback for the rare CD-ROM ISO.
+        _CMD_MAP: dict[str, list[str]] = {
+            '.cue': ['createcd'],
+            '.gdi': ['createcd'],
+            '.iso': ['createdvd', 'createcd'],
+        }
+
+        # Collect all convertible source files, skipping those already converted
+        conversion_targets: list[Path] = []
+        for ext in _CMD_MAP:
+            for f in dest_dir.rglob(f'*{ext}'):
+                if not f.with_suffix('.chd').exists():
+                    conversion_targets.append(f)
+
         for file_path in conversion_targets:
             if self.cancel_flag.is_set():
                 return
-                
-            try:
-                proc = subprocess.Popen(
-                    ["chdman", "createcd", "-numprocessors", self._chd_cores,
-                     "-i", str(file_path), "-o", str(file_path.with_suffix('.chd'))],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-                )
-                self._register_process(proc)
-                # NOTE: chd_lock previously wrapped proc.communicate(), fully serializing all CHD work
-                # across threads. The lock is no longer needed here — chdman manages its own file I/O
-                # and -numprocessors already limits CPU contention. We only guard post-conversion
-                # file cleanup to prevent concurrent unlinking of the same .bin files.
-                proc.communicate()
-                self._unregister_process(proc)
-                
-                if proc.returncode == 0:
-                    if file_path.suffix.lower() == '.cue':
-                        try:
-                            with open(file_path, 'r', encoding='utf-8', errors='ignore') as cue_file:
-                                bins = CUE_BIN_REGEX.findall(cue_file.read())
-                            all_bins_removed = True
-                            with self.chd_lock:  # narrow lock: only around concurrent file removal
-                                for bin_name in bins:
-                                    bin_path = file_path.parent / bin_name
-                                    if bin_path.exists():
-                                        try:
-                                            bin_path.unlink()
-                                        except OSError:
-                                            all_bins_removed = False
-                            # Only remove the .cue if every referenced .bin was cleaned up;
-                            # leaving the .cue with missing .bins would produce a broken disc image.
-                            if all_bins_removed:
-                                try:
-                                    file_path.unlink()
-                                except OSError:
-                                    pass
-                        except Exception:
-                            pass
+
+            ext_lower = file_path.suffix.lower()
+            subcommands = _CMD_MAP.get(ext_lower, ['createcd'])
+            chd_output  = file_path.with_suffix('.chd')
+            succeeded   = False
+
+            for subcmd in subcommands:
+                if self.cancel_flag.is_set():
+                    return
+                try:
+                    proc = subprocess.Popen(
+                        [chdman, subcmd,
+                         "-numprocessors", self._chd_cores,
+                         "-i", str(file_path),
+                         "-o", str(chd_output)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                    )
+                    self._register_process(proc)
+                    _, stderr_bytes = proc.communicate()
+                    self._unregister_process(proc)
+
+                    if proc.returncode == 0:
+                        succeeded = True
+                        break
                     else:
+                        # Clean up any partial output before retrying
+                        if chd_output.exists():
+                            try:
+                                chd_output.unlink()
+                            except OSError:
+                                pass
+                        if not silent:
+                            err_snippet = (stderr_bytes.decode('utf-8', errors='replace')
+                                           .strip()[:120])
+                            self.post_message(SystemLog(
+                                f"chdman {subcmd} failed for {file_path.name}: {err_snippet}",
+                                True
+                            ))
+                except Exception as e:
+                    self.post_message(SystemLog(
+                        f"chdman error ({file_path.name}): {e}", True
+                    ))
+                    break
+
+            if not succeeded:
+                if not silent:
+                    self.post_message(SystemLog(
+                        f"CHD conversion failed: {file_path.name} — "
+                        "not a supported disc image format.", True
+                    ))
+                continue
+
+            # ── Post-conversion cleanup ──────────────────────────────────────
+            if ext_lower == '.cue':
+                try:
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as cue_file:
+                        bins = CUE_BIN_REGEX.findall(cue_file.read())
+                    all_bins_removed = True
+                    with self.chd_lock:
+                        for bin_name in bins:
+                            bin_path = file_path.parent / bin_name
+                            if bin_path.exists():
+                                try:
+                                    bin_path.unlink()
+                                except OSError:
+                                    all_bins_removed = False
+                    if all_bins_removed:
                         try:
                             file_path.unlink()
                         except OSError:
                             pass
-            except Exception:
-                pass
+                except Exception:
+                    pass
+            elif ext_lower == '.gdi':
+                # Remove the .gdi descriptor and all raw tracks it references
+                try:
+                    gdi_dir = file_path.parent
+                    for track_file in gdi_dir.glob("*.raw"):
+                        try:
+                            track_file.unlink()
+                        except OSError:
+                            pass
+                    for track_file in gdi_dir.glob("*.bin"):
+                        try:
+                            track_file.unlink()
+                        except OSError:
+                            pass
+                    file_path.unlink()
+                except OSError:
+                    pass
+            else:
+                # .iso or other single-file source
+                try:
+                    file_path.unlink()
+                except OSError:
+                    pass
 
     def on_download_progress(self, message: DownloadProgress) -> None:
         area = self.query_one("#progress-area")
@@ -2398,7 +2611,7 @@ class MyrientTUI(App):
           4. Reports perfect / misnamed / bad counts per console and a grand total.
         """
         library = Path(self.state.settings['library_root'])
-        auditable_exts = {'.bin', '.iso', '.cue', '.img'}
+        auditable_exts = {'.bin', '.iso', '.cue', '.img', '.gdi', '.wbfs', '.rvz', '.gcz', '.nrg', '.mdf'}
 
         if not library.exists():
             self.post_message(SystemLog("DAT Audit: Library path not found.", True))
@@ -2758,22 +2971,29 @@ class MyrientTUI(App):
 
     @work(exclusive=True, thread=True)
     def run_lib_convert(self) -> None:
+        chdman = self._chdman_path or shutil.which("chdman") or ""
+        if not chdman:
+            self.post_message(SystemLog(
+                "[bold red]chdman not found.[/bold red] "
+                "Run 'Setup chdman' first, or install it manually.", True
+            ))
+            return
         self.post_message(SystemLog("Scanning library for CHD conversion targets..."))
         library = Path(self.state.settings['library_root'])
 
-        # Re-use the shared walker instead of the previous rglob('*') which
-        # materialised every file and directory in the entire tree.
+        # Source extensions that chdman can convert to CHD
+        _CHD_SOURCE_EXTS = frozenset({'.bin', '.iso', '.cue', '.gdi'})
+
         targets = []
         for _, game_dir, status in self._walk_library_game_dirs(library, self._lib_status):
             if status == "corrupted":
                 continue
-            # Collect files once — used for both source and CHD presence checks below
             try:
                 dir_files = [f for f in game_dir.iterdir() if f.is_file()]
             except PermissionError:
                 continue
-            has_source = any(f.suffix.lower() in ('.bin', '.iso', '.cue') for f in dir_files)
-            has_chd    = any(f.suffix.lower() == '.chd'                   for f in dir_files)
+            has_source = any(f.suffix.lower() in _CHD_SOURCE_EXTS for f in dir_files)
+            has_chd    = any(f.suffix.lower() == '.chd'            for f in dir_files)
             if has_source and not has_chd:
                 targets.append(game_dir)
 
@@ -2783,16 +3003,121 @@ class MyrientTUI(App):
             self.post_message(LibraryProgress("CHD Conversion", "Done", 100, 100))
             return
 
+        converted = failed = 0
         for i, game_dir in enumerate(targets, 1):
             if self.cancel_flag.is_set():
                 self.post_message(SystemLog("[yellow]CHD conversion cancelled.[/]"))
                 break
             self.post_message(LibraryProgress(f"Converting ({i}/{total_ops})", game_dir.name, i, total_ops))
             self.post_message(SystemLog(f"Converting: {game_dir.name}"))
-            self._convert_to_chd(game_dir, silent=True)
+            before = list(game_dir.rglob("*.chd"))
+            self._convert_to_chd(game_dir, silent=False)
+            after  = list(game_dir.rglob("*.chd"))
+            if len(after) > len(before):
+                converted += 1
+            else:
+                failed += 1
 
         self.post_message(LibraryProgress("CHD Conversion", "Complete", total_ops, total_ops))
-        self.post_message(SystemLog("Bulk CHD Conversion Finished."))
+        self.post_message(SystemLog(
+            f"Bulk CHD Conversion Finished — "
+            f"[bold green]{converted}[/] converted, [bold red]{failed}[/] failed."
+        ))
+
+    @work(exclusive=True, thread=True)
+    def run_chd_to_original(self) -> None:
+        """Convert every .chd file in the library back to its original format.
+
+        Uses ``chdman extractcd`` for CD images (→ .bin/.cue) and
+        ``chdman extracthd`` for hard-disk images (→ .img).
+        Original .chd is removed only on successful extraction.
+        """
+        chdman = self._chdman_path or shutil.which("chdman") or ""
+        if not chdman:
+            self.post_message(SystemLog(
+                "[bold red]chdman not found.[/bold red] "
+                "Run 'Setup chdman' first, or install it manually.", True
+            ))
+            return
+
+        library = Path(self.state.settings['library_root'])
+        self.post_message(SystemLog("Scanning library for .chd files to extract..."))
+
+        # Collect every .chd under the library (skip hidden dirs)
+        chd_files: list[Path] = [
+            f for f in library.rglob("*.chd")
+            if not any(p.name.startswith('.') for p in f.parents)
+        ]
+
+        total_ops = len(chd_files)
+        if total_ops == 0:
+            self.post_message(SystemLog("CHD → Original: No .chd files found in library."))
+            self.post_message(LibraryProgress("CHD → Original", "Done", 100, 100))
+            return
+
+        self.post_message(SystemLog(f"CHD → Original: Extracting {total_ops} file(s)..."))
+        converted = failed = 0
+
+        for i, chd_path in enumerate(chd_files, 1):
+            if self.cancel_flag.is_set():
+                self.post_message(SystemLog("[yellow]CHD extraction cancelled.[/]"))
+                break
+
+            self.post_message(LibraryProgress(
+                f"Extracting ({i}/{total_ops})", chd_path.name, i, total_ops
+            ))
+            self.post_message(SystemLog(f"Extracting: {chd_path.name}"))
+
+            dest_dir = chd_path.parent
+
+            # Try extractcd first (CD images); fall back to extracthd (hard-disk)
+            success = False
+            for subcommand, output_suffix in [("extractcd", ".cue"), ("extracthd", ".img")]:
+                output_file = chd_path.with_suffix(output_suffix)
+                # For extractcd, chdman also writes the .bin alongside the .cue
+                try:
+                    proc = subprocess.Popen(
+                        [chdman, subcommand,
+                         "-i", str(chd_path),
+                         "-o", str(output_file)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                    )
+                    self._register_process(proc)
+                    _, err_out = proc.communicate()
+                    self._unregister_process(proc)
+
+                    if proc.returncode == 0:
+                        success = True
+                        converted += 1
+                        # Remove source .chd only after confirmed successful extraction
+                        try:
+                            chd_path.unlink()
+                        except OSError:
+                            pass
+                        # Update validation status — game is now incomplete until re-verified
+                        self._lib_status.remove(dest_dir)
+                        break
+                    # If extractcd fails it's probably an HD image — try next subcommand
+                except Exception as e:
+                    self.post_message(SystemLog(
+                        f"CHD Extract [{chd_path.name}] {subcommand} error: {e}", True
+                    ))
+                    break
+
+            if not success:
+                failed += 1
+                self.post_message(SystemLog(
+                    f"[red]Failed to extract:[/red] {chd_path.name} "
+                    "(not a CD or HD image, or chdman error)", True
+                ))
+
+        self.post_message(LibraryProgress("CHD → Original", "Complete", total_ops, total_ops))
+        self.post_message(SystemLog(
+            f"CHD → Original complete: "
+            f"[bold green]{converted}[/] extracted, [bold red]{failed}[/] failed."
+        ))
+        if converted:
+            self.run_lib_status_scan()
 
     # ── Shared library-traversal helpers ─────────────────────────────────────
 
@@ -2808,8 +3133,21 @@ class MyrientTUI(App):
             dir_files = [f for f in d.iterdir() if f.is_file() and not f.name.startswith('.')]
         except PermissionError:
             return None
-        has_game = any(f.suffix.lower() in ('.bin', '.iso', '.cue', '.chd', '.img') for f in dir_files)
-        has_zip  = any(f.suffix.lower() == '.zip'                                    for f in dir_files)
+        # Broad set covering every disc/cart/tape image format from Myrient Redump:
+        #   CD:   .bin .cue .img .iso .nrg .mdf .mds
+        #   DVD:  .iso (reused)
+        #   Wii/GC: .wbfs .rvz .gcz (Dolphin formats)
+        #   DC:   .gdi
+        #   CHD:  .chd
+        #   Misc: .rom .xiso .ecm
+        _GAME_EXTS = frozenset({
+            '.bin', '.iso', '.cue', '.chd', '.img',
+            '.wbfs', '.rvz', '.gcz', '.gdi',
+            '.nrg', '.mdf', '.mds',
+            '.rom', '.xiso', '.ecm',
+        })
+        has_game = any(f.suffix.lower() in _GAME_EXTS for f in dir_files)
+        has_zip  = any(f.suffix.lower() == '.zip'     for f in dir_files)
         if not (has_game or has_zip):
             return None
         stored = lib_status.get(d)
