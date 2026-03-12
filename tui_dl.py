@@ -45,17 +45,25 @@ from textual.widgets import (
 # Global socket timeout applies to all urllib connections made by this process.
 socket.setdefaulttimeout(60)
 
+# ── All program data lives in a single subfolder next to the script ──────────
+# Using __file__ guarantees the paths are correct regardless of the working
+# directory the user launches the script from.
+_SCRIPT_DIR = Path(__file__).parent.resolve()
+_DATA_DIR   = _SCRIPT_DIR / "myrient_data"
+_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+BASE_URL        = "https://myrient.erista.me/files/Redump/"
+DAT_BASE_URL    = "https://myrient.erista.me/dats/Redump/"
+CONFIG_FILE     = _DATA_DIR / "myrient_config.json"
+SESSION_LOG_DIR = _DATA_DIR / "logs"
+DAT_CACHE_DIR   = _DATA_DIR / "dats"
+
 # --- Global Configurations & Pre-Compiled Regex ---
 logging.basicConfig(
-    filename='myrient_errors.log',
+    filename=str(_DATA_DIR / 'myrient_errors.log'),
     level=logging.ERROR,
     format='%(asctime)s - [%(levelname)s] - %(message)s'
 )
-
-BASE_URL      = "https://myrient.erista.me/files/Redump/"
-DAT_BASE_URL  = "https://myrient.erista.me/dats/Redump/"
-CONFIG_FILE   = Path("myrient_data.json")
-SESSION_LOG_DIR = Path("myrient_logs")
 
 # Pre-compiled globally to minimize CPU cycles during tight loops
 SIZE_REGEX      = re.compile(r'(?<!\d)(\d+(?:\.\d+)?)\s*([KMGT]i?B?)', re.IGNORECASE)
@@ -92,9 +100,8 @@ _SIZE_MULTIPLIERS: dict[str, int] = {
 _PROGRESS_DONE_STATES: frozenset[str] = frozenset({"done", "complete", "failed"})
 
 DEFAULT_SETTINGS: dict[str, Any] = {
-    # Library root is resolved lazily at load time relative to the config file's
-    # directory — not at import time relative to CWD, which can differ.
-    "library_root": str((CONFIG_FILE.parent / "Myrient_Library").resolve()),
+    # Default library sits next to the script, not inside _DATA_DIR.
+    "library_root": str(_SCRIPT_DIR / "Myrient_Library"),
     "filter_include": [],
     "filter_exclude": [],
     "max_concurrent": 4,
@@ -123,6 +130,14 @@ class ConfigManager:
             "active_queue": "default",
             "queues": {"default": []}
         }
+        # One-time migration: if the new config file doesn't exist yet but the
+        # old CWD-relative one does, copy it into _DATA_DIR before loading.
+        old_path = _SCRIPT_DIR / "myrient_data.json"
+        if not self.config_path.exists() and old_path.exists():
+            try:
+                shutil.copy2(old_path, self.config_path)
+            except OSError:
+                pass
         if self.config_path.exists():
             try:
                 with open(self.config_path, 'r', encoding="utf-8") as file:
@@ -225,6 +240,146 @@ class ConfigManager:
                 self._write_locked()
                 return True
         return False
+
+
+class LibraryStatus:
+    """Thread-safe, file-backed store for game directory validation status.
+
+    Replaces per-directory ``.validated`` / ``.corrupted`` marker files with a
+    single ``library_root/.myrient_status.json`` dict:
+
+        { "Console Name/Game Dir": "validated" | "corrupted" }
+
+    Absence from the dict means ``"incomplete"``.  Keys are POSIX-style paths
+    relative to the library root so the entire file is portable — the library
+    can be moved to a different mount point without invalidating any entries.
+
+    On first load, any existing ``.validated`` / ``.corrupted`` marker files are
+    migrated into the JSON store and then deleted, so the transition is seamless
+    for existing libraries.
+    """
+
+    STATUS_FILE = ".myrient_status.json"
+
+    def __init__(self) -> None:
+        self._lock    = threading.Lock()
+        self._data:   dict[str, str] = {}
+        self._library: Path | None   = None
+        self._path:    Path | None   = None
+        self._dirty   = False
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def load(self, library: Path) -> None:
+        """(Re)load status from *library*.  Safe to call from any thread."""
+        self._library = library
+        self._path    = library / self.STATUS_FILE
+        data: dict[str, str] = {}
+        try:
+            if self._path.exists():
+                with open(self._path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            data = {}
+        with self._lock:
+            self._data  = data
+            self._dirty = False
+        self._migrate_marker_files(library)
+
+    def get(self, path: Path) -> str | None:
+        """Return ``'validated'``, ``'corrupted'``, or ``None`` (incomplete/unknown)."""
+        key = self._key(path)
+        if key is None:
+            return None
+        with self._lock:
+            return self._data.get(key)
+
+    def set_status(self, path: Path, status: str) -> None:
+        """Set *path* to ``'validated'`` or ``'corrupted'`` and flush to disk."""
+        key = self._key(path)
+        if key is None:
+            return
+        with self._lock:
+            self._data[key] = status
+            self._dirty = True
+        self._flush()
+
+    def remove(self, path: Path) -> None:
+        """Remove *path* from the store (marks it incomplete) and flush."""
+        key = self._key(path)
+        if key is None:
+            return
+        with self._lock:
+            self._data.pop(key, None)
+            self._dirty = True
+        self._flush()
+
+    def prune(self, library: Path) -> None:
+        """Drop entries whose directories no longer exist (e.g. after deletion)."""
+        with self._lock:
+            stale = [k for k in self._data if not (library / k).exists()]
+            for k in stale:
+                del self._data[k]
+            if stale:
+                self._dirty = True
+        if stale:
+            self._flush()
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _key(self, path: Path) -> str | None:
+        if self._library is None:
+            return None
+        try:
+            return path.relative_to(self._library).as_posix()
+        except ValueError:
+            return str(path)
+
+    def _flush(self) -> None:
+        """Atomically write the current dict to disk if dirty."""
+        if self._path is None:
+            return
+        with self._lock:
+            if not self._dirty:
+                return
+            snapshot  = dict(self._data)
+            self._dirty = False
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._path.with_suffix('.tmp')
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(snapshot, f, indent=2, sort_keys=True)
+            tmp.replace(self._path)
+        except OSError:
+            pass
+
+    def _migrate_marker_files(self, library: Path) -> None:
+        """One-time migration: scan for legacy ``.validated`` / ``.corrupted``
+        files, import them into the JSON store, then delete them."""
+        if not library.exists():
+            return
+        migrated = 0
+        try:
+            for marker_name, status in ((".validated", "validated"), (".corrupted", "corrupted")):
+                for marker_file in library.rglob(marker_name):
+                    game_dir = marker_file.parent
+                    key = self._key(game_dir)
+                    if key is None:
+                        continue
+                    with self._lock:
+                        # Only import if not already set by the JSON store
+                        if key not in self._data:
+                            self._data[key] = status
+                            self._dirty = True
+                    try:
+                        marker_file.unlink()
+                        migrated += 1
+                    except OSError:
+                        pass
+        except (PermissionError, OSError):
+            pass
+        if migrated:
+            self._flush()
 
 
 # --- Custom UI Components & Messages ---
@@ -626,6 +781,7 @@ class MyrientTUI(App):
     def __init__(self):
         super().__init__()
         self.state = ConfigManager(CONFIG_FILE)
+        self._lib_status = LibraryStatus()
         # TTL-aware cache: stores (data, timestamp) to prevent stale results across long sessions
         self._link_cache: dict[str, tuple[list[dict[str, str]], float]] = {}
         # Lock protects _link_cache from concurrent reads/writes across fetch_consoles
@@ -752,7 +908,7 @@ class MyrientTUI(App):
                             yield Button("▸ Queue Selected", id="btn-add-queue", variant="success")
                             yield Button("↺ Refresh", id="btn-refresh-games")
                         yield Label(
-                            "[dim]Space[/dim] select · [dim]Q[/dim] queue · [dim]↑↓[/dim] navigate",
+                            "[dim]↑↓[/dim] navigate · [dim]Space[/dim] select · [dim]Enter[/dim] queue",
                             classes="hint-bar",
                         )
 
@@ -888,6 +1044,12 @@ class MyrientTUI(App):
                             classes="setting-label",
                         )
                         yield DataTable(id="set-exclude", classes="filter-table")
+                        yield Button(
+                            "✕ Clear Filters",
+                            id="btn-clear-filters",
+                            variant="warning",
+                            classes="ops-btn",
+                        )
 
             # ── ≡ Logs ───────────────────────────────────────────────────────
             with TabPane("  ≡ Logs  ", id="tab-logs"):
@@ -924,6 +1086,8 @@ class MyrientTUI(App):
         self._refresh_queue_table()
         self._load_settings_toggles()
         self.fetch_consoles()
+        # Load library status store before scanning so the tree renders correctly.
+        self._lib_status.load(Path(self.state.settings['library_root']))
         self.run_lib_status_scan()
         # Flush deferred config writes every 3 s — catches any dirty state from
         # in-progress downloads without hammering the disk on every completion.
@@ -1133,18 +1297,64 @@ class MyrientTUI(App):
         return self._build_highlight_text(text, spans)
 
     def on_key(self, event: Key) -> None:
-        """Space toggles selections; Q queues games — routing depends on which widget is focused."""
+        """Route keyboard events so the user can search and select games without
+        ever leaving the search input:
+
+        When ``search-games`` is focused:
+          - Printable characters / backspace / delete → handled by Input normally
+          - ↑ / ↓                                    → move the game table cursor
+          - Space                                     → toggle game at cursor
+          - Enter                                     → queue all selected games
+
+        When ``game-list`` is focused:
+          - Space → toggle game at cursor
+          - Q     → queue all selected games
+
+        When ``set-include`` / ``set-exclude`` is focused:
+          - Space → toggle filter row
+        """
         focused = self.focused
         fid = getattr(focused, "id", None)
-        if fid == "game-list":
+
+        if fid == "search-games":
+            if event.key in ("up", "down"):
+                # Move the DataTable cursor without stealing focus from the input.
+                try:
+                    game_table = self.query_one("#game-list", DataTable)
+                    row_count  = game_table.row_count
+                    if row_count == 0:
+                        return
+                    cur = game_table.cursor_row or 0
+                    if event.key == "down":
+                        new_row = min(cur + 1, row_count - 1)
+                    else:
+                        new_row = max(cur - 1, 0)
+                    game_table.move_cursor(row=new_row)
+                except Exception:
+                    pass
+                event.prevent_default()
+                event.stop()
+
+            elif event.key == "space":
+                self._toggle_game_at_cursor()
+                event.prevent_default()
+                event.stop()
+
+            elif event.key == "enter":
+                self._add_selected_to_queue()
+                event.prevent_default()
+                event.stop()
+
+        elif fid == "game-list":
             if event.key == "space":
                 self._toggle_game_at_cursor()
                 event.prevent_default()
                 event.stop()
-            elif event.key == "q":
+            elif event.key in ("q", "enter"):
                 self._add_selected_to_queue()
                 event.prevent_default()
                 event.stop()
+
         elif fid in ("set-include", "set-exclude"):
             if event.key == "space":
                 self._toggle_filter_at_cursor(fid)
@@ -1441,6 +1651,22 @@ class MyrientTUI(App):
                 self.cancel_flag.set()
                 self.cleanup_subprocesses()
                 
+        elif button_id == "btn-clear-filters":
+            self._filter_include_sel.clear()
+            self._filter_exclude_sel.clear()
+            try:
+                for tbl_id, sel_set in (("set-include", self._filter_include_sel),
+                                        ("set-exclude", self._filter_exclude_sel)):
+                    tbl = self.query_one(f"#{tbl_id}", DataTable)
+                    for row in tbl.ordered_rows:
+                        self._refresh_filter_row(tbl, row.key.value, sel_set)
+            except Exception:
+                pass
+            self.state.settings["filter_include"] = []
+            self.state.settings["filter_exclude"] = []
+            self.state.save()
+            self.notify("Filters cleared")
+
         elif button_id == "btn-save-settings":
             try:
                 new_path = Path(self.query_one("#set-lib-path", Input).value).expanduser().resolve()
@@ -1456,6 +1682,8 @@ class MyrientTUI(App):
                 self.state.save()
 
                 new_path.mkdir(parents=True, exist_ok=True)
+                # Reload status store from the new library root before scanning
+                self._lib_status.load(new_path)
                 self.run_lib_status_scan()
                 self.notify("Settings saved")
 
@@ -1568,6 +1796,12 @@ class MyrientTUI(App):
         # RAM Optimization: Store active dictionary for O(1) queue lookups instead of JSON parsing
         self._games_lookup = {g["url_part"]: g for g in message.games}
         self._render_games(self.query_one("#search-games", Input).value)
+        # Focus the search box so the user can immediately type to filter
+        # and use ↑↓/Space/Enter without clicking anything.
+        try:
+            self.query_one("#search-games", Input).focus()
+        except Exception:
+            pass
 
     # --- Async Background Workers ---
     @work(exclusive=True, thread=True)
@@ -1737,9 +1971,27 @@ class MyrientTUI(App):
 
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)
+
+            # ── Fast-skip if the game is already in good shape ───────────────
+            # CHD-converted games have no source files but are still valid.
             if any(dest_dir.rglob("*.chd")) or target_file.with_suffix('.chd').exists():
-                self.post_message(SystemLog(f"Skipped (Already Exists): {item_name}"))
+                self.post_message(SystemLog(f"Skipped (CHD exists): {item_name}"))
                 return {"success": True}
+            # Non-CHD games: skip if already validated and not corrupted.
+            if self._lib_status.get(dest_dir) == "validated":
+                self.post_message(SystemLog(f"Skipped (Already validated): {item_name}"))
+                return {"success": True}
+
+            # ── Stale-zip cleanup for corrupted games ────────────────────────
+            if self._lib_status.get(dest_dir) == "corrupted":
+                for stale_zip in dest_dir.glob("*.zip"):
+                    try:
+                        stale_zip.unlink()
+                        self.post_message(SystemLog(
+                            f"Removed stale zip before retry: {stale_zip.name}"
+                        ))
+                    except OSError:
+                        pass
 
             # Prevent ZeroDivisionErrors by ensuring byte math is >= 1
             size_bytes = max(self._parse_size_bytes(item["size_str"]), 1)
@@ -1846,15 +2098,12 @@ class MyrientTUI(App):
 
                 if unzip_proc.returncode == 0:
                     target_file.unlink()
-                    (dest_dir / ".corrupted").unlink(missing_ok=True)
-                    (dest_dir / ".validated").touch()
+                    self._lib_status.set_status(dest_dir, "validated")
                 else:
-                    (dest_dir / ".validated").unlink(missing_ok=True)
-                    (dest_dir / ".corrupted").touch()
+                    self._lib_status.set_status(dest_dir, "corrupted")
                     raise Exception(f"Unzip failed: {unzip_err}")
             elif target_file.exists():
-                (dest_dir / ".corrupted").unlink(missing_ok=True)
-                (dest_dir / ".validated").touch()
+                self._lib_status.set_status(dest_dir, "validated")
 
             if self.cancel_flag.is_set():
                 return {"success": False, "cancelled": True}
@@ -2114,7 +2363,7 @@ class MyrientTUI(App):
 
         # ── Phase 3: per-console audit ───────────────────────────────────────
         grand_perfect = grand_misnamed = grand_ambiguous = grand_bad = 0
-        dat_cache_root = library / ".dats"
+        dat_cache_root = DAT_CACHE_DIR
 
         for con_idx, console_dir in enumerate(console_dirs, 1):
             # Respect Pause/cancel between consoles — audit can take many minutes
@@ -2327,11 +2576,9 @@ class MyrientTUI(App):
                                 hash_results[correct_path] = True
 
                                 # The destination directory now contains a validated file.
-                                (correct_dir / ".corrupted").unlink(missing_ok=True)
-                                (correct_dir / ".validated").touch()
+                                self._lib_status.set_status(correct_dir, "validated")
 
-                                # The source dir lost a file — will be marked incomplete
-                                # in step 3h (not corrupted, since the data was valid).
+                                # The source dir lost a file — mark incomplete in step 3h.
                                 renamed_old_dirs.add(game_dir)
 
                                 self.post_message(SystemLog(
@@ -2384,20 +2631,16 @@ class MyrientTUI(App):
             # ── 3h: write validation markers ─────────────────────────────────
             for game_dir, files in game_dirs.items():
                 if game_dir in renamed_old_dirs:
-                    # Files were moved out to their correct locations.
-                    # Mark the source dir as incomplete — the data was valid, so it
-                    # is not "corrupted", but it no longer has all its files.
-                    (game_dir / ".validated").unlink(missing_ok=True)
-                    (game_dir / ".corrupted").unlink(missing_ok=True)
+                    # Files were moved out — mark incomplete (data was valid,
+                    # dir just no longer has all its files).
+                    self._lib_status.remove(game_dir)
                 else:
                     # Normal case: every auditable file must have a known-good hash.
                     dir_ok = all(hash_results.get(fp, False) for fp in files)
                     if dir_ok:
-                        (game_dir / ".corrupted").unlink(missing_ok=True)
-                        (game_dir / ".validated").touch()
+                        self._lib_status.set_status(game_dir, "validated")
                     else:
-                        (game_dir / ".validated").unlink(missing_ok=True)
-                        (game_dir / ".corrupted").touch()
+                        self._lib_status.set_status(game_dir, "corrupted")
 
             self.post_message(SystemLog(
                 f"DAT Audit [{console_name}]: "
@@ -2430,7 +2673,7 @@ class MyrientTUI(App):
         # Re-use the shared walker instead of the previous rglob('*') which
         # materialised every file and directory in the entire tree.
         targets = []
-        for _, game_dir, status in self._walk_library_game_dirs(library):
+        for _, game_dir, status in self._walk_library_game_dirs(library, self._lib_status):
             if status == "corrupted":
                 continue
             # Collect files once — used for both source and CHD presence checks below
@@ -2463,13 +2706,12 @@ class MyrientTUI(App):
     # ── Shared library-traversal helpers ─────────────────────────────────────
 
     @staticmethod
-    def _classify_game_dir(d: Path) -> str | None:
+    def _classify_game_dir(d: Path, lib_status: LibraryStatus) -> str | None:
         """Classify a candidate game directory.
 
         Returns ``'validated'``, ``'corrupted'``, ``'incomplete'``, or ``None``
         (not a recognised game dir — caller should skip it).
-        Consolidated from the two near-identical inner functions previously
-        copy-pasted inside run_lib_status_scan and requeue_failed_games.
+        Status is read from *lib_status* — no marker files are checked.
         """
         try:
             dir_files = [f for f in d.iterdir() if f.is_file() and not f.name.startswith('.')]
@@ -2477,20 +2719,15 @@ class MyrientTUI(App):
             return None
         has_game = any(f.suffix.lower() in ('.bin', '.iso', '.cue', '.chd', '.img') for f in dir_files)
         has_zip  = any(f.suffix.lower() == '.zip'                                    for f in dir_files)
-        # Empty dirs and dirs containing only non-game files are not recognised game dirs.
-        # Previously `len(dir_files) == 0` was included in the pass condition, which
-        # caused empty directories to be classified as "incomplete" and surfaced in the
-        # library tree and re-queue logic.  An empty dir is simply not a game dir.
         if not (has_game or has_zip):
             return None
-        if (d / ".validated").exists():
-            return "validated"
-        if (d / ".corrupted").exists():
-            return "corrupted"
+        stored = lib_status.get(d)
+        if stored in ("validated", "corrupted"):
+            return stored
         return "incomplete"
 
     @staticmethod
-    def _walk_library_game_dirs(library: Path) -> Iterator[tuple[str, Path, str]]:
+    def _walk_library_game_dirs(library: Path, lib_status: LibraryStatus) -> Iterator[tuple[str, Path, str]]:
         """Yield ``(console_name, game_dir, status)`` for every recognised game
         directory under *library* at depth-1 (direct games) and depth-2 (multi-disc
         grouping folders).  Implemented as a generator — no list allocation, constant
@@ -2520,7 +2757,7 @@ class MyrientTUI(App):
                 continue
 
             for child in depth1:
-                status = MyrientTUI._classify_game_dir(child)
+                status = MyrientTUI._classify_game_dir(child, lib_status)
                 if status is not None:
                     yield (console_name, child, status)
                 else:
@@ -2530,7 +2767,7 @@ class MyrientTUI(App):
                             (e for e in child.iterdir() if e.is_dir() and not e.name.startswith('.')),
                             key=_by_name,
                         ):
-                            gs = MyrientTUI._classify_game_dir(grandchild)
+                            gs = MyrientTUI._classify_game_dir(grandchild, lib_status)
                             if gs is not None:
                                 yield (console_name, grandchild, gs)
                     except PermissionError:
@@ -2544,7 +2781,7 @@ class MyrientTUI(App):
 
         # structure: {console_name: (console_path, [(game_dir, status_str), ...])}
         structure: dict[str, tuple[Path, list[tuple[Path, str]]]] = {}
-        for console_name, game_dir, status in self._walk_library_game_dirs(library):
+        for console_name, game_dir, status in self._walk_library_game_dirs(library, self._lib_status):
             if console_name not in structure:
                 structure[console_name] = (library / console_name, [])
             structure[console_name][1].append((game_dir, status))
@@ -2562,7 +2799,7 @@ class MyrientTUI(App):
         # Walk library and keep only non-validated entries; generator means no full list built
         targets = [
             (cn, gd, s)
-            for cn, gd, s in self._walk_library_game_dirs(library)
+            for cn, gd, s in self._walk_library_game_dirs(library, self._lib_status)
             if s != "validated"
         ]
 
@@ -2628,7 +2865,7 @@ class MyrientTUI(App):
         # the shared walker so grouping-folder / multi-disc handling is consistent.
         targets = [
             (cn, gd, s)
-            for cn, gd, s in self._walk_library_game_dirs(console_path.parent)
+            for cn, gd, s in self._walk_library_game_dirs(console_path.parent, self._lib_status)
             if cn == console_name
         ]
 
