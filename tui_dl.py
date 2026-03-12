@@ -58,12 +58,12 @@ _TOOLS_DIR.mkdir(parents=True, exist_ok=True)
 BASE_URL        = "https://myrient.erista.me/files/Redump/"
 DAT_BASE_URL    = "https://myrient.erista.me/dats/Redump/"
 
-# PS2 Master Disc Patcher — bundled inside the PSDB release from alex-free
-_PSDB_RELEASE_URL = (
-    "https://github.com/alex-free/playstation-disc-burner/releases/download/"
-    "v1.0.4/playstation-disc-burner-v1.0.4-x86_64.zip"
+# PS2 Master Disc Patcher v1.0.6 — standalone release from MottZilla via psx-place
+_PSDB_RELEASE_URL   = (
+    "https://www.psx-place.com/attachments/"
+    "ps2-master-disc-patcher-v1-0-6-linux-x86_64-static-zip.45505/"
 )
-_PS2MDP_BINARY_NAME = "ps2-master-disc-patcher"   # name inside the PSDB zip
+_PS2MDP_BINARY_NAME = "ps2-master-disc-patcher"   # binary name inside the zip
 
 # Consoles whose Redump DAT name does NOT follow the standard
 # "{console_name} - Datfile (N) (date).dat" pattern.  Each entry maps a
@@ -1084,7 +1084,7 @@ class MyrientTUI(App):
             return
 
         self.post_message(SystemLog(
-            "PS2 Patcher Setup: Downloading PSDB release to extract patcher binary…\n"
+            "PS2 Patcher Setup: Downloading ps2-master-disc-patcher v1.0.6…\n"
             f"  Source: {_PSDB_RELEASE_URL}"
         ))
 
@@ -1127,7 +1127,7 @@ class MyrientTUI(App):
             if not extracted_any:
                 self.post_message(SystemLog(
                     "[bold red]PS2 Patcher Setup: binary not found inside the downloaded zip.[/bold red]\n"
-                    "The PSDB release layout may have changed. Manual install:\n"
+                    "The release layout may have changed. Manual install:\n"
                     f"  1. Download: {_PSDB_RELEASE_URL}\n"
                     f"  2. Extract '{_PS2MDP_BINARY_NAME}' to myrient_data/tools/\n"
                     "  3. chmod +x myrient_data/tools/ps2-master-disc-patcher",
