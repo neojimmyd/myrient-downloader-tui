@@ -18,6 +18,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -27,7 +28,7 @@ import xml.etree.ElementTree as ET
 import zipfile as _zf
 from collections import Counter, deque
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, TypedDict
 from urllib.parse import quote, unquote, urljoin
 
 from bs4 import BeautifulSoup, SoupStrainer
@@ -57,8 +58,46 @@ except ImportError:
     _FSEventHandler   = object # type: ignore[assignment,misc]
 
 # ── Module-level side effects (after all imports) ────────────────────────────
-# Global socket timeout applies to all urllib connections made by this process.
+# These run at import time, not inside a function, because MyrientTUI is a
+# single-file application entry point (not a library).  If you ever need to
+# import this module in a test without side effects, move these into an
+# _initialize() helper called only from `if __name__ == "__main__"`.
+#
+# socket.setdefaulttimeout: caps all urllib connections made by this process.
+# _DATA_DIR / _TOOLS_DIR: created once so every subsequent open/write can assume
+#   the directories exist without repeating mkdir() at each call site.
+# logging.basicConfig: configures the root logger for error-to-file mirroring.
 socket.setdefaulttimeout(60)
+
+# ── Strongly-typed data structures ───────────────────────────────────────────
+# Using TypedDict over plain dict[str, str] gives IDE auto-complete, mypy
+# type-checking, and catches key typos like item["gameurl"] at analysis time
+# rather than at runtime inside a worker thread.
+
+class ConsoleItem(TypedDict):
+    """One row returned by the Myrient console index scrape."""
+    name:     str   # decoded display name, e.g. "Sony - PlayStation 2/"
+    url_part: str   # href as-scraped (still percent-encoded), e.g. "Sony%20-%20PlayStation%202/"
+    size_str: str   # always "N/A" for directories
+
+class GameItem(TypedDict):
+    """One row returned by a Myrient console-page scrape."""
+    name:     str   # decoded filename, e.g. "Ico (USA).zip"
+    url_part: str   # percent-encoded href fragment
+    size_str: str   # human-readable size, e.g. "2.3GB"
+
+class QueueItem(TypedDict):
+    """One entry persisted in myrient_config.json → queues → <name>."""
+    id:        str   # unique token, e.g. "dl_a1b2c3d4"
+    name:      str   # display label shown in the queue table
+    game_url:  str   # full absolute Myrient download URL
+    dest_path: str   # absolute path of the local game directory
+    size_str:  str   # human-readable file size (may be "N/A")
+
+class RomEntry(TypedDict):
+    """One <rom> element parsed from a Redump DAT file."""
+    name:  str   # filename stored in the DAT (e.g. "Ico (USA).bin")
+    game:  str   # parent <game name="…"> attribute
 
 # ── All program data lives in a single subfolder next to the script ──────────
 # Using __file__ guarantees the paths are correct regardless of the working
@@ -83,10 +122,19 @@ DAT_BASE_URL    = "https://myrient.erista.me/dats/Redump/"
 #     images/
 #
 # The binary is named "ps2_master" (underscore, no version suffix) inside bin/.
-_PS2MDP_BINARY_NAME  = "ps2_master"
+_PS2MDP_BINARY_NAME    = "ps2_master"
+_PS2MDP_RELEASE_VERSION = "v1.0.5"   # update this alongside the URL and SHA-256 below
 _PS2MDP_RELEASE_URL  = (
     "https://github.com/alex-free/playstation-disc-burner/releases/download/"
-    "v1.0.5/playstation-disc-burner-v1.0.5-x86_64.zip"
+    f"{_PS2MDP_RELEASE_VERSION}/playstation-disc-burner-{_PS2MDP_RELEASE_VERSION}-x86_64.zip"
+)
+# SHA-256 of the release zip, verified against the v1.0.5 x86_64 GitHub release.
+# If this hash does not match after download, setup is aborted — guards against
+# MITM attacks or a compromised/replaced GitHub release asset.
+# ─── When upgrading to a new release: update _PS2MDP_RELEASE_VERSION above,
+#     download the new zip, and run: sha256sum playstation-disc-burner-*.zip
+_PS2MDP_RELEASE_SHA256 = (
+    "fa862ff48f7979f9e20d30ace3af5bd1f11bfca04bfe1c354caf38a3ebaf2d5b"
 )
 
 # Consoles whose Redump DAT name does NOT follow the standard
@@ -220,10 +268,6 @@ _CHD_TIMEOUT: int = 7200
 # occasionally stall unzip on corrupted data; this caps the hang.
 _UNZIP_TIMEOUT: int = 600
 
-# DAT files older than this many seconds are re-fetched on the next audit run.
-# 7 days — Redump DATs are updated frequently enough that week-old data is stale.
-_DAT_CACHE_TTL: float = 7 * 24 * 3600.0
-
 # Maximum number of session log files kept in myrient_data/logs/.
 # Oldest files beyond this count are pruned at startup.
 _SESSION_LOG_MAX_FILES: int = 30
@@ -239,6 +283,46 @@ _TREE_GREEN:  str = "bold green"
 _TREE_RED:    str = "bold red"
 _TREE_YELLOW: str = "yellow"
 _TREE_DIM:    str = "dim"
+
+
+def _sha256_file(path: Path) -> str:
+    """Return the lowercase hex SHA-256 digest of *path*.
+    Uses ``_HASH_CHUNK_BYTES`` for I/O buffer size consistency.
+    """
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while chunk := fh.read(_HASH_CHUNK_BYTES):
+            h.update(chunk)
+    return h.hexdigest().lower()
+
+
+def _safe_extractall(zf: "_zf.ZipFile", dest: Path) -> None:
+    """Extract *zf* into *dest* while blocking path-traversal attacks.
+
+    Python < 3.12 does not sanitise member paths in ``ZipFile.extractall``,
+    so a crafted ZIP containing entries like ``../../.bashrc`` can write files
+    outside *dest*.  This helper resolves every member path and raises
+    ``ValueError`` for any entry that would land outside *dest*.
+
+    Python 3.12+ has built-in extraction filters (``filter='data'``); we use
+    those when available so we benefit from any additional hardening they add.
+    """
+    if sys.version_info >= (3, 12):
+        zf.extractall(dest, filter="data")   # type: ignore[call-arg]
+        return
+    dest_resolved = dest.resolve()
+    for member in zf.infolist():
+        # Resolve the target path and check it stays inside dest.
+        # Path.is_relative_to() (Python 3.9+) handles platform path separators
+        # and normalises away any .. components before the comparison.
+        target = (dest / member.filename).resolve()
+        if not (target == dest_resolved or target.is_relative_to(dest_resolved)):
+            raise ValueError(
+                f"ZIP path traversal blocked: {member.filename!r} "
+                f"would land at {target}, outside {dest_resolved}"
+            )
+    zf.extractall(dest)
+
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     # Default library sits next to the script, not inside _DATA_DIR.
@@ -346,18 +430,18 @@ class ConfigManager:
         return self.data["settings"]
 
     @property
-    def queues(self) -> dict[str, list[dict[str, str]]]:
+    def queues(self) -> dict[str, list[QueueItem]]:
         return self.data["queues"]
 
     @property
     def active_queue_name(self) -> str:
         return self.data["active_queue"]
 
-    def get_active_queue(self) -> list[dict[str, str]]:
+    def get_active_queue(self) -> list[QueueItem]:
         with self._lock:
             return list(self.data["queues"].get(self.active_queue_name, []))
 
-    def update_active_queue(self, new_queue: list[dict[str, str]], immediate: bool = True) -> None:
+    def update_active_queue(self, new_queue: list[QueueItem], immediate: bool = True) -> None:
         """Replace the active queue in memory.
         Pass ``immediate=False`` during active download batch runs to defer the
         disk write — the periodic flush timer handles persistence.
@@ -425,8 +509,34 @@ class ConfigManager:
                 self.data["settings"]["queue_settings"] = {}
             self.data["settings"]["queue_settings"][queue_name] = overrides
             self._write_locked()
+
+    def set_setting(self, key: str, value: Any, *, immediate: bool = True) -> None:
+        """Write a single top-level setting key and persist to disk.
+
+        Prefer this over ``self.state.settings[key] = value`` in the UI layer
+        because it holds the lock for the whole read-modify-write and calls
+        ``_write_locked()`` so the change is durable.
+
+        Pass ``immediate=False`` to defer the disk write to the next
+        ``flush_if_dirty()`` cycle (for high-frequency updates like live
+        sliders).
+        """
+        with self._lock:
+            self.data["settings"][key] = value
+            if immediate:
+                self._write_locked()
+            else:
+                self._dirty = True
+
+    def update_settings(self, updates: dict[str, Any]) -> None:
+        """Apply multiple setting keys in a single lock window and flush once.
+
+        Use this in the Settings-save handler instead of assigning to
+        ``self.state.settings[key]`` individually, which bypasses the lock.
+        """
+        with self._lock:
+            self.data["settings"].update(updates)
             self._write_locked()
-            return True
 
 
 class LibraryStatus:
@@ -660,12 +770,12 @@ class SystemLog(Message):
         super().__init__()
 
 class ConsolesLoaded(Message):
-    def __init__(self, consoles: list[dict[str, str]]):
+    def __init__(self, consoles: list[ConsoleItem]):
         self.consoles = consoles
         super().__init__()
 
 class GamesLoaded(Message):
-    def __init__(self, games: list[dict[str, str]]):
+    def __init__(self, games: list[GameItem]):
         self.games = games
         super().__init__()
 
@@ -683,7 +793,7 @@ class DownloadProgress(Message):
         super().__init__()
 
 class DownloadComplete(Message):
-    def __init__(self, item: dict[str, str], success: bool, cancelled: bool = False):
+    def __init__(self, item: QueueItem, success: bool, cancelled: bool = False):
         self.item = item
         self.success = success
         self.cancelled = cancelled
@@ -781,6 +891,721 @@ class HelpModal(ModalScreen):
 
     def on_button_pressed(self, _: Button.Pressed) -> None:
         self.dismiss()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scraper — Myrient HTTP index wrapper
+# Owns the TTL-aware link cache and all HTTP fetch logic so MyrientTUI only
+# needs to call scraper.scrape_links() / scraper.clear_cache().
+# ─────────────────────────────────────────────────────────────────────────────
+class MyrientScraper:
+    """Thread-safe Myrient HTTP index scraper with TTL-aware in-memory cache.
+
+    Extracted from MyrientTUI to satisfy the Single Responsibility Principle.
+    The UI class creates one instance in ``__init__`` and delegates all network
+    fetch + cache logic here; it only calls scraper.scrape_links() / scraper.clear_cache().
+
+    Parameters
+    ----------
+    post_message_fn:
+        Callable that accepts a ``Message`` object and posts it to the Textual
+        app's message queue.  Matches the signature of ``App.post_message``.
+    """
+
+    def __init__(self, post_message_fn: Any) -> None:
+        self._post = post_message_fn
+        # TTL-aware cache: (data, timestamp) | ("_PENDING", timestamp)
+        self._cache: dict[str, tuple[Any, float]] = {}
+        self._lock  = threading.Lock()
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def clear_cache(self) -> None:
+        """Flush the entire link cache (e.g. on Ctrl+R refresh)."""
+        with self._lock:
+            self._cache.clear()
+
+    def scrape_links(self, url: str) -> list[ConsoleItem | GameItem]:
+        """Return the list of items at *url*, served from cache when fresh.
+
+        Thread-safe: a ``_PENDING`` sentinel prevents concurrent threads from
+        issuing duplicate HTTP requests for the same URL.
+
+        Returns an empty list on network error (error is posted as ``SystemLog``).
+        """
+        now = time.monotonic()
+
+        with self._lock:
+            cached = self._cache.get(url)
+            if cached is not None:
+                value, ts = cached
+                if value == "_PENDING":
+                    # Another thread is already fetching — return empty list;
+                    # the first thread's completion will post ConsolesLoaded/GamesLoaded.
+                    return []
+                elif (now - ts) < _LINK_CACHE_TTL:
+                    return value  # type: ignore[return-value]
+            snapshot_items = list(self._cache.items())
+            self._cache[url] = ("_PENDING", now)
+
+        # Evict stale entries outside the lock.
+        expired = [k for k, (_, ts) in snapshot_items if (now - ts) >= _LINK_CACHE_TTL]
+        if expired:
+            with self._lock:
+                for k in expired:
+                    self._cache.pop(k, None)
+
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=15) as res:
+                soup = BeautifulSoup(res.read(), "html.parser", parse_only=_SCRAPE_STRAINER)
+                items: list[ConsoleItem | GameItem] = []
+
+                for a_tag in soup.find_all("a"):
+                    href = a_tag.get("href")
+                    if not href or href.startswith("?") or href in ["../", "./", "/"]:
+                        continue
+                    if "Parent Directory" in a_tag.text:
+                        continue
+
+                    size_str   = "N/A"
+                    parent_row = a_tag.find_parent("tr")
+                    if parent_row:
+                        matches = SIZE_REGEX.findall(parent_row.get_text(separator=" "))
+                        if matches:
+                            size_str = f"{matches[-1][0]}{matches[-1][1]}"
+
+                    items.append({          # type: ignore[misc]
+                        "name":     unquote(href),
+                        "url_part": href,
+                        "size_str": size_str,
+                    })
+
+                with self._lock:
+                    self._cache[url] = (items, time.monotonic())
+                return items
+
+        except Exception as err:
+            with self._lock:
+                if self._cache.get(url, (None,))[0] == "_PENDING":
+                    del self._cache[url]
+            self._post(SystemLog(f"Scrape Error: {err}", True))
+            return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Toolchain — chdman + PS2 Master Disc Patcher setup / invocation
+# Extracted from MyrientTUI so binary discovery, package-manager install, and
+# external-process invocations live in one auditable place.
+# ─────────────────────────────────────────────────────────────────────────────
+class Toolchain:
+    """Manages external tool discovery and invocation (chdman, ps2_master).
+
+    Extracted from MyrientTUI to satisfy the Single Responsibility Principle.
+    MyrientTUI creates one instance and calls its methods; it never directly
+    invokes chdman or ps2_master itself.
+
+    Parameters
+    ----------
+    post_message_fn:
+        Callable matching ``App.post_message`` — used to emit ``SystemLog`` and
+        ``DownloadProgress`` messages from worker threads.
+    cancel_flag:
+        The shared ``threading.Event`` that workers poll to detect pause/cancel.
+    register_process / unregister_process:
+        Callbacks that add/remove a ``subprocess.Popen`` from the app's tracked
+        process set so ``cleanup_subprocesses`` can kill them on quit.
+    chd_lock:
+        Mutex that serialises concurrent .cue/.bin cleanup across CHD workers.
+    """
+
+    def __init__(
+        self,
+        post_message_fn: Any,
+        cancel_flag: threading.Event,
+        register_process: Any,
+        unregister_process: Any,
+        chd_lock: threading.Lock,
+    ) -> None:
+        self._post             = post_message_fn
+        self.cancel_flag       = cancel_flag
+        self._reg_proc         = register_process
+        self._unreg_proc       = unregister_process
+        self.chd_lock          = chd_lock
+        self.chdman_path: str  = ""
+        self.ps2mdp_path: str  = ""
+        # CPU core count — kept for informational logging only.
+        # chdman createcd/createdvd do NOT accept --numprocessors or --threads;
+        # only createhd/createraw do.  We no longer pass it on the command line.
+        _cpu = os.cpu_count()
+        self.chd_cores: int    = max(1, _cpu - 1) if _cpu else 1
+
+    # ── Binary discovery ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def find_chdman() -> str:
+        """Locate chdman. Returns full path string or '' if not found."""
+        local_candidates = [
+            _TOOLS_DIR / "chdman",
+            _TOOLS_DIR / "chdman.exe",
+            _SCRIPT_DIR / "chdman",
+            _SCRIPT_DIR / "chdman.exe",
+        ]
+        for p in local_candidates:
+            if p.is_file() and os.access(p, os.X_OK):
+                return str(p)
+        return shutil.which("chdman") or ""
+
+    @staticmethod
+    def find_ps2mdp() -> str:
+        """Locate ps2_master binary. Returns full path or ''."""
+        candidates = [
+            _TOOLS_DIR / _PS2MDP_BINARY_NAME,
+            _TOOLS_DIR / (_PS2MDP_BINARY_NAME + ".exe"),
+            _SCRIPT_DIR / _PS2MDP_BINARY_NAME,
+            _SCRIPT_DIR / (_PS2MDP_BINARY_NAME + ".exe"),
+        ]
+        for p in candidates:
+            if p.is_file() and os.access(p, os.X_OK):
+                return str(p)
+        return shutil.which(_PS2MDP_BINARY_NAME) or ""
+
+    def refresh_chdman(self) -> None:
+        """Re-resolve chdman path and cache it on self.chdman_path."""
+        self.chdman_path = self.find_chdman()
+
+    def refresh_ps2mdp(self) -> None:
+        """Re-resolve ps2_master path and cache it on self.ps2mdp_path."""
+        self.ps2mdp_path = self.find_ps2mdp()
+
+    # ── chdman setup ──────────────────────────────────────────────────────────
+
+    def setup_chdman_auto(self) -> None:
+        """Try to install chdman via the system package manager."""
+        self._post(SystemLog("chdman Setup: Checking for existing installation..."))
+        path = self.find_chdman()
+        if path:
+            self.chdman_path = path
+            self._post(SystemLog(f"chdman already available at: [bold]{path}[/bold]"))
+            return
+
+        self._post(SystemLog("chdman Setup: Attempting package-manager install..."))
+        for label, cmd in _PKG_INSTALL_CMDS:
+            mgr = shutil.which(cmd[0])
+            if not mgr:
+                continue
+            self._post(SystemLog(f"chdman Setup: Trying [bold]{label}[/bold]…"))
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                if result.returncode == 0:
+                    path = self.find_chdman()
+                    if path:
+                        self.chdman_path = path
+                        self._post(SystemLog(
+                            f"[bold green]chdman installed successfully![/bold green] "
+                            f"Path: [bold]{path}[/bold]"
+                        ))
+                        return
+                else:
+                    self._post(SystemLog(
+                        f"chdman Setup: {label} returned non-zero "
+                        f"(may need sudo). Output: {result.stderr[:120]}", True
+                    ))
+            except (subprocess.TimeoutExpired, OSError) as e:
+                self._post(SystemLog(f"chdman Setup: {label} failed — {e}", True))
+
+        self._post(SystemLog(
+            "[bold yellow]chdman auto-install failed.[/bold yellow] "
+            "Manual options:\n"
+            "  • Linux (Debian/Ubuntu):  sudo apt install mame-tools\n"
+            "  • Linux (Arch):           sudo pacman -S mame-tools\n"
+            "  • Linux (Fedora):         sudo dnf install mame-tools\n"
+            "  • macOS (Homebrew):       brew install rom-tools\n"
+            "  • Windows: download MAME tools from https://www.mamedev.org/release.html\n"
+            "Place chdman(.exe) in the myrient_data/tools/ folder to use it without installing."
+        ))
+
+    # ── PS2 Master Disc Patcher setup ─────────────────────────────────────────
+
+    def setup_ps2mdp_auto(self) -> None:
+        """Download and verify ps2_master from the PSDB v1.0.5 x86_64 release zip."""
+        self._post(SystemLog("PS2 Patcher Setup: Checking for existing installation..."))
+        path = self.find_ps2mdp()
+        if path:
+            self.ps2mdp_path = path
+            self._post(SystemLog(f"ps2_master already available at: [bold]{path}[/bold]"))
+            return
+
+        self._post(SystemLog(
+            "PS2 Patcher Setup: Downloading PSDB v1.0.5 x86_64 release zip…\n"
+            f"  {_PS2MDP_RELEASE_URL}"
+        ))
+
+        tmp_zip = _TOOLS_DIR / "_ps2mdp_download.zip"
+        try:
+            # ── Download ─────────────────────────────────────────────────────
+            try:
+                subprocess.run(
+                    ["wget", "-q", "--timeout=60", "--tries=3",
+                     "-O", str(tmp_zip), _PS2MDP_RELEASE_URL],
+                    check=True, timeout=300,
+                )
+            except Exception:
+                req = urllib.request.Request(
+                    _PS2MDP_RELEASE_URL,
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                )
+                with urllib.request.urlopen(req, timeout=120) as resp, \
+                        open(tmp_zip, "wb") as fout:
+                    shutil.copyfileobj(resp, fout)
+
+            # ── SHA-256 integrity check ───────────────────────────────────────
+            self._post(SystemLog("PS2 Patcher Setup: Verifying download integrity…"))
+            actual_sha256 = _sha256_file(tmp_zip)
+            if actual_sha256 != _PS2MDP_RELEASE_SHA256:
+                self._post(SystemLog(
+                    f"[bold red]PS2 Patcher Setup: SHA-256 mismatch — aborting.[/bold red]\n"
+                    f"  Pinned version : {_PS2MDP_RELEASE_VERSION}\n"
+                    f"  Expected SHA-256: {_PS2MDP_RELEASE_SHA256}\n"
+                    f"  Got SHA-256:      {actual_sha256}\n"
+                    "This usually means the release asset was updated upstream. "
+                    "To upgrade: set _PS2MDP_RELEASE_VERSION to the new tag, update "
+                    "_PS2MDP_RELEASE_URL and _PS2MDP_RELEASE_SHA256 at the top of the source "
+                    "(run 'sha256sum' on the new zip to get the correct digest).",
+                    True,
+                ))
+                return
+
+            # ── Extract ps2_master binary from bin/ in the release zip ────────
+            extracted_binary = False
+            with _zf.ZipFile(tmp_zip, "r") as zf:
+                all_members = zf.namelist()
+                self._post(SystemLog(
+                    f"PS2 Patcher Setup: Zip has {len(all_members)} entries. First 60:\n  " +
+                    "\n  ".join(all_members[:60]) +
+                    ("\n  …" if len(all_members) > 60 else "")
+                ))
+                for member in all_members:
+                    if member.endswith("/"):
+                        continue
+                    base  = Path(member).name
+                    in_bin = "/bin/" in member
+                    if base == _PS2MDP_BINARY_NAME and in_bin and not extracted_binary:
+                        dest = _TOOLS_DIR / _PS2MDP_BINARY_NAME
+                        with zf.open(member) as src, open(dest, "wb") as dst:
+                            shutil.copyfileobj(src, dst)
+                        dest.chmod(dest.stat().st_mode | 0o111)
+                        extracted_binary = True
+                        self._post(SystemLog(
+                            f"PS2 Patcher Setup: Extracted [bold]{base}[/bold] "
+                            f"from [dim]{member}[/dim] → {dest}"
+                        ))
+                        break
+
+            if not extracted_binary:
+                self._post(SystemLog(
+                    "[bold red]PS2 Patcher Setup: binary not found in release zip.[/bold red]\n"
+                    "Check the zip contents log above. Manual install:\n"
+                    f"  1. Download: {_PS2MDP_RELEASE_URL}\n"
+                    f"  2. Extract 'bin/{_PS2MDP_BINARY_NAME}' to myrient_data/tools/\n"
+                    f"  3. chmod +x myrient_data/tools/{_PS2MDP_BINARY_NAME}",
+                    True,
+                ))
+                return
+
+            path = self.find_ps2mdp()
+            if path:
+                self.ps2mdp_path = path
+                self._post(SystemLog(
+                    f"[bold green]PS2 Master Disc Patcher ready![/bold green] "
+                    f"Path: [bold]{path}[/bold]"
+                ))
+            else:
+                self._post(SystemLog(
+                    "[bold red]Setup finished but binary not found — "
+                    "extraction may have failed.[/bold red]", True
+                ))
+
+        except Exception as err:
+            self._post(SystemLog(f"[bold red]PS2 Patcher Setup failed:[/bold red] {err}", True))
+        finally:
+            try:
+                tmp_zip.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    # ── CHD conversion ────────────────────────────────────────────────────────
+
+    def convert_to_chd(self, dest_dir: Path, silent: bool = False) -> tuple[int, int]:
+        """Convert disc images in *dest_dir* to CHD format.
+
+        Returns ``(converted, failed)`` counts.
+        Delegates to the same logic previously inlined in MyrientTUI._convert_to_chd.
+        """
+        if not self.chdman_path:
+            found = shutil.which("chdman")
+            if found:
+                self.chdman_path = found
+        chdman   = self.chdman_path or "chdman"
+        converted = failed = 0
+
+        conversion_targets: list[Path] = []
+        # Collect .cue files first — when a .cue exists, its referenced .bin
+        # files must NOT be converted independently (chdman createcd reads the
+        # .cue and processes all referenced tracks).  Build a set of .bin paths
+        # claimed by .cue sheets so we can skip them.
+        cue_claimed_bins: set[Path] = set()
+        cue_files: list[Path] = []
+        for f in dest_dir.rglob("*.cue"):
+            if not f.with_suffix(".chd").exists():
+                cue_files.append(f)
+                try:
+                    with open(f, "r", encoding="utf-8", errors="ignore") as cf:
+                        for bin_name in CUE_BIN_REGEX.findall(cf.read()):
+                            cue_claimed_bins.add(f.parent / bin_name)
+                except OSError:
+                    pass
+        conversion_targets.extend(cue_files)
+        # Now collect remaining source files, skipping .cue (already added)
+        # and any .bin that is referenced by a .cue sheet.
+        for ext in _CHD_CMD_MAP:
+            if ext == ".cue":
+                continue
+            for f in dest_dir.rglob(f"*{ext}"):
+                if f in cue_claimed_bins:
+                    continue
+                if not f.with_suffix(".chd").exists():
+                    conversion_targets.append(f)
+
+        for file_path in conversion_targets:
+            if self.cancel_flag.is_set():
+                return converted, failed
+
+            ext_lower   = file_path.suffix.lower()
+            subcommands = _CHD_CMD_MAP.get(ext_lower, ["createcd"])
+            chd_output  = file_path.with_suffix(".chd")
+            succeeded   = False
+
+            for subcmd in subcommands:
+                if self.cancel_flag.is_set():
+                    return converted, failed
+                try:
+                    proc = subprocess.Popen(
+                        [chdman, subcmd,
+                         "-i", str(file_path),
+                         "-o", str(chd_output)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                    )
+                    self._reg_proc(proc)
+
+                    stderr_chunks: list[bytes] = []
+                    def _read_stderr(p: subprocess.Popen = proc,
+                                     buf: list[bytes] = stderr_chunks) -> None:
+                        try:
+                            for chunk in iter(lambda: p.stderr.read(4096), b""):
+                                buf.append(chunk)
+                        except OSError:
+                            pass
+
+                    stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+                    stderr_thread.start()
+
+                    deadline = time.monotonic() + _CHD_TIMEOUT
+                    while proc.poll() is None:
+                        if self.cancel_flag.is_set():
+                            proc.kill()
+                            proc.wait()
+                            stderr_thread.join(timeout=2)
+                            self._unreg_proc(proc)
+                            return converted, failed
+                        if time.monotonic() > deadline:
+                            proc.kill()
+                            proc.wait()
+                            stderr_thread.join(timeout=2)
+                            self._unreg_proc(proc)
+                            raise subprocess.TimeoutExpired(proc.args, _CHD_TIMEOUT)
+                        time.sleep(0.5)
+
+                    stderr_thread.join(timeout=5)
+                    stderr_bytes = b"".join(stderr_chunks)
+                    self._unreg_proc(proc)
+
+                    if proc.returncode == 0:
+                        succeeded = True
+                        break
+                    else:
+                        if chd_output.exists():
+                            try:
+                                chd_output.unlink()
+                            except OSError:
+                                pass
+                        if not silent:
+                            err_snippet = (stderr_bytes.decode("utf-8", errors="replace")
+                                           .strip()[:200])
+                            self._post(SystemLog(
+                                f"chdman {subcmd} failed for {file_path.name}: {err_snippet}",
+                                True
+                            ))
+                except subprocess.TimeoutExpired:
+                    if not silent:
+                        self._post(SystemLog(
+                            f"chdman timed out converting {file_path.name} — killed.", True
+                        ))
+                    if chd_output.exists():
+                        try:
+                            chd_output.unlink()
+                        except OSError:
+                            pass
+                    break
+                except Exception as e:
+                    self._post(SystemLog(f"chdman error ({file_path.name}): {e}", True))
+                    break
+
+            if not succeeded:
+                failed += 1
+                if not silent:
+                    self._post(SystemLog(
+                        f"CHD conversion failed: {file_path.name} — "
+                        "not a supported disc image format.", True
+                    ))
+                continue
+
+            converted += 1
+
+            # ── Post-conversion cleanup ──────────────────────────────────────
+            if ext_lower == ".cue":
+                try:
+                    with open(file_path, "r", encoding="utf-8", errors="ignore") as cf:
+                        bins = CUE_BIN_REGEX.findall(cf.read())
+                    all_bins_removed = True
+                    with self.chd_lock:
+                        for bin_name in bins:
+                            bin_path = file_path.parent / bin_name
+                            if bin_path.exists():
+                                try:
+                                    bin_path.unlink()
+                                except OSError as ose:
+                                    logging.error("CHD cleanup: could not delete %s: %s", bin_path, ose)
+                                    self._post(SystemLog(
+                                        f"CHD cleanup: could not delete {bin_path.name}: {ose}", True
+                                    ))
+                                    all_bins_removed = False
+                    if all_bins_removed:
+                        try:
+                            file_path.unlink()
+                        except OSError as ose:
+                            logging.error("CHD cleanup: could not delete cue %s: %s", file_path, ose)
+                            self._post(SystemLog(
+                                f"CHD cleanup: could not delete {file_path.name}: {ose}", True
+                            ))
+                except Exception:
+                    pass
+            elif ext_lower == ".gdi":
+                gdi_dir = file_path.parent
+                for track_file in list(gdi_dir.glob("*.raw")) + list(gdi_dir.glob("*.bin")):
+                    try:
+                        track_file.unlink()
+                    except OSError as ose:
+                        logging.error("CHD cleanup: could not delete track %s: %s", track_file, ose)
+                        self._post(SystemLog(
+                            f"CHD cleanup: could not delete {track_file.name}: {ose}", True
+                        ))
+                try:
+                    file_path.unlink()
+                except OSError as ose:
+                    logging.error("CHD cleanup: could not delete gdi %s: %s", file_path, ose)
+                    self._post(SystemLog(
+                        f"CHD cleanup: could not delete {file_path.name}: {ose}", True
+                    ))
+            else:
+                try:
+                    file_path.unlink()
+                except OSError as ose:
+                    logging.error("CHD cleanup: could not delete source %s: %s", file_path, ose)
+                    self._post(SystemLog(
+                        f"CHD cleanup: could not delete {file_path.name}: {ose}", True
+                    ))
+
+        return converted, failed
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pane widget classes — purely for compose() organisation.
+# All event handling, state, and workers remain on MyrientTUI.
+# Messages bubble up through the DOM normally; query_one() searches all
+# descendants, so nothing changes for the handler layer.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BrowsePane(Vertical):
+    """Console browser + game selection."""
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="browse-layout"):
+            with Vertical(id="browse-left"):
+                yield Label("Consoles", classes="section-header")
+                yield Input(placeholder="  filter consoles…", id="search-consoles", classes="search-bar")
+                yield ListView(id="console-list")
+            with Vertical(id="browse-right"):
+                yield Label("", id="breadcrumb")
+                yield GameSearchInput(placeholder="  search games…", id="search-games", classes="search-bar")
+                yield DataTable(id="game-list", cursor_type="row", zebra_stripes=False)
+                with Horizontal(classes="browse-actions"):
+                    yield Button("▸ Queue Selected", id="btn-add-queue", variant="success")
+                    yield Button("⊠ Select All", id="btn-select-all")
+                    yield Button("↺ Refresh", id="btn-refresh-games")
+                    yield Label("", id="game-selection-count")
+                yield Label(
+                    "[dim]↑↓[/dim] navigate  [dim]Space/Tab[/dim] select  "
+                    "[dim]Enter/q[/dim] queue  [dim]?[/dim] help",
+                    classes="hint-bar",
+                )
+
+
+class DownloadsPane(Vertical):
+    """Queue management + active download progress."""
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="downloads-layout"):
+            with Vertical(id="queue-panel"):
+                yield Label("Queue", classes="section-header")
+                with Vertical(classes="queue-toolbar"):
+                    yield Select([], id="queue-select", prompt="active profile…")
+                    yield Input(placeholder="new profile name…", id="input-new-queue")
+                    with Horizontal(classes="btn-row"):
+                        yield Button("Create", id="btn-create-queue", variant="success")
+                        yield Button("Delete", id="btn-delete-queue", variant="error")
+                yield DataTable(id="queue-table")
+                with Horizontal(classes="queue-controls"):
+                    yield Button("▲", id="btn-queue-up", classes="reorder-btn")
+                    yield Button("▼", id="btn-queue-down", classes="reorder-btn")
+                    yield Button("Remove", id="btn-remove-items", variant="warning")
+                    yield Button("▶ Start", id="btn-start-dl", variant="primary")
+                    yield Button("■ Stop", id="btn-pause-dl", variant="error")
+                with Collapsible(title="Queue Settings", collapsed=True, id="queue-settings-collapsible"):
+                    yield Label("[dim]Per-queue speed limit (MB/s, 0=unlimited)[/dim]")
+                    yield Input(placeholder="0", id="input-queue-speed-limit")
+                    yield Button("Apply to Queue", id="btn-apply-queue-settings")
+                yield Label(
+                    "[dim]Ctrl+J[/dim] jump to console  [dim]?[/dim] help",
+                    classes="hint-bar",
+                )
+
+            with Vertical(id="progress-panel"):
+                yield Label("▸ DOWNLOAD PROGRESS", id="lbl-global-progress")
+                yield ProgressBar(id="global-progress", show_eta=True)
+                with VerticalScroll(id="progress-area"):
+                    with Container(id="progress-grid"):
+                        pass
+
+
+class LibraryPane(Vertical):
+    """Library tree view + operations organised into collapsible groups."""
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="lib-tab-wrapper"):
+            with Horizontal(id="library-main"):
+                with Vertical(id="lib-tree-panel"):
+                    yield Label("Library", classes="section-header")
+                    yield Label("", id="lib-summary-bar")
+                    yield Tree("Library", id="lib-tree")
+                    with Horizontal(classes="btn-row"):
+                        yield Button("✕ Delete", id="btn-lib-delete", variant="error")
+                with VerticalScroll(id="lib-ops-panel"):
+                    yield Label("Operations", classes="section-header")
+                    with Collapsible(title="Verification", collapsed=False, id="ops-verify"):
+                        yield Button("Verify vs. Redump DAT", id="btn-lib-dat-audit", classes="ops-btn")
+                        with Horizontal(classes="btn-row"):
+                            yield Label("Dry Run", classes="setting-label")
+                            yield Switch(value=False, id="sw-dat-dry-run")
+                        yield Button("↺ Refresh Status", id="btn-lib-refresh-status", classes="ops-btn")
+                        yield Button("Find Orphaned Files", id="btn-lib-orphans", classes="ops-btn")
+                    with Collapsible(title="Conversion", collapsed=True, id="ops-convert"):
+                        yield Button("Convert to CHD", id="btn-lib-convert", classes="ops-btn")
+                        yield Button("CHD → Original", id="btn-lib-chd-to-orig", classes="ops-btn")
+                        yield Button("PS2 Master Disc Patch", id="btn-ps2-md-patch", classes="ops-btn")
+                    with Collapsible(title="Organisation", collapsed=True, id="ops-organise"):
+                        yield Button("Scan & Organize", id="btn-lib-organize", classes="ops-btn")
+                        yield Button("Re-queue Failures", id="btn-requeue-failed", classes="ops-btn")
+                        yield Button("Re-queue Console", id="btn-requeue-console", classes="ops-btn")
+                    yield Rule(line_style="heavy")
+                    yield Label(
+                        "[bold green]✓[/] Validated  "
+                        "[bold red]✗[/] Corrupted  "
+                        "[yellow]~[/] Incomplete",
+                        classes="legend-label",
+                    )
+            with Container(id="lib-status-bar"):
+                yield Label("Idle", id="lib-status-label")
+                yield ProgressBar(id="lib-progress-bar", show_eta=True)
+
+
+class SettingsPane(Vertical):
+    """Settings organised into tabbed sections."""
+
+    def compose(self) -> ComposeResult:
+        with TabbedContent(id="settings-tabs"):
+            with TabPane("Engine", id="tab-engine"):
+                with VerticalScroll():
+                    yield Label("Library root path", classes="setting-label")
+                    yield Input(id="set-lib-path")
+                    yield Label("Max concurrent downloads  [dim](1–10)[/dim]", classes="setting-label")
+                    yield Input(id="set-threads")
+                    yield Label("Global speed limit per download  [dim](MB/s, 0=unlimited)[/dim]", classes="setting-label")
+                    yield Input(id="set-speed-limit")
+                    yield Label("DAT cache TTL  [dim](hours, 0=always refresh)[/dim]", classes="setting-label")
+                    yield Input(id="set-dat-ttl")
+                    yield Rule()
+                    yield Label("Auto-convert to CHD after download", classes="setting-label")
+                    yield Switch(id="set-auto-chd")
+                    yield Label("Watch library for changes  [dim](requires watchdog)[/dim]", classes="setting-label")
+                    yield Switch(id="set-watch-library")
+                    yield Label("Desktop notification on batch complete", classes="setting-label")
+                    yield Switch(id="set-notify-batch")
+                    yield Rule()
+                    yield Button("▸ Save Settings", id="btn-save-settings", variant="success")
+            with TabPane("Filters", id="tab-filters"):
+                with VerticalScroll():
+                    yield Label("Regional Include Filter", classes="section-header")
+                    yield Label("[dim]Only show games matching these regions  (empty = show all)[/dim]", classes="setting-label")
+                    yield DataTable(id="set-include", classes="filter-table")
+                    yield Label("Type Exclude Filter", classes="section-header")
+                    yield Label("[dim]Hide games matching these tags[/dim]", classes="setting-label")
+                    yield DataTable(id="set-exclude", classes="filter-table")
+                    yield Button("✕ Clear Filters", id="btn-clear-filters", variant="warning", classes="ops-btn")
+                    yield Rule()
+                    yield Label("Filter Presets", classes="section-header")
+                    yield Label("[dim]Save/load current filter combination as a named preset[/dim]", classes="setting-label")
+                    yield Input(placeholder="preset name…", id="input-preset-name")
+                    with Horizontal(classes="preset-row"):
+                        yield Button("Save Preset", id="btn-save-preset", variant="success")
+                        yield Button("Load Preset", id="btn-load-preset", variant="primary")
+                        yield Button("Del Preset", id="btn-del-preset", variant="error")
+                    yield Select([], id="preset-select", prompt="choose preset…")
+            with TabPane("Tools", id="tab-tools"):
+                with VerticalScroll():
+                    yield Label("[dim]Install or locate conversion / patching tools[/dim]", classes="setting-label")
+                    yield Button("Setup chdman", id="btn-setup-chdman", classes="ops-btn")
+                    yield Button("Setup PS2 Patcher", id="btn-setup-ps2mdp", classes="ops-btn")
+                    yield Rule()
+                    yield Label("[dim]Pre-cache all console game lists for faster browsing[/dim]", classes="setting-label")
+                    yield Button("Prefetch All Consoles", id="btn-prefetch-consoles", classes="ops-btn")
+
+
+class LogsPane(Vertical):
+    """System log + session file browser."""
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="logs-layout"):
+            with Horizontal(id="log-toolbar"):
+                yield Button("All", id="log-filter-all", classes="log-filter-btn")
+                yield Button("Errors", id="log-filter-err", classes="log-filter-btn")
+                yield Input(placeholder="  search logs…", id="log-search")
+                yield Button("↺ Sessions", id="btn-refresh-session-logs")
+            yield RichLog(id="sys-log", markup=True, wrap=True, max_lines=2000)
+            yield Rule(id="sessions-divider")
+            with Horizontal(id="sessions-layout"):
+                yield ListView(id="session-log-list")
+                yield RichLog(id="session-log-view", markup=False, wrap=True, max_lines=5000)
 
 
 # --- Main Application ---
@@ -1222,20 +2047,22 @@ class MyrientTUI(App):
         ("ctrl+r", "refresh_browser","Refresh"),
         ("ctrl+j", "jump_to_console","Jump→Browser"),
         ("question_mark", "show_help", "Help"),
+        ("1", "nav_pane('pane-browse')",    "Browse"),
+        ("2", "nav_pane('pane-downloads')", "Downloads"),
+        ("3", "nav_pane('pane-library')",   "Library"),
+        ("4", "nav_pane('pane-settings')",  "Settings"),
+        ("5", "nav_pane('pane-logs')",      "Logs"),
     ]
 
     def __init__(self):
         super().__init__()
         self.state = ConfigManager(CONFIG_FILE)
         self._lib_status = LibraryStatus()
-        # TTL-aware cache: stores (data, timestamp) to prevent stale results across long sessions.
-        # Values are either (list[dict], float) for resolved results or ("_PENDING", float) for
-        # in-flight requests.  The Any union avoids a needlessly complex generic annotation.
-        self._link_cache: dict[str, tuple[Any, float]] = {}
-        # Lock protects _link_cache from concurrent reads/writes across fetch_consoles
-        # and fetch_games, which can run on separate exclusive workers simultaneously.
-        self._link_cache_lock = threading.Lock()
 
+        # ── Extracted subsystems ───────────────────────────────────────────────
+        # MyrientScraper owns the TTL link cache; MyrientTUI only calls
+        # self.scraper.scrape_links() / self.scraper.clear_cache().
+        self.scraper = MyrientScraper(self.post_message)
         self._all_consoles_data: list[dict[str, str]] = []
         self._all_games_data:    list[dict[str, str]] = []
         self._games_lookup:      dict[str, dict[str, str]] = {}
@@ -1245,26 +2072,30 @@ class MyrientTUI(App):
         self.proc_lock      = threading.Lock()
         self.active_processes: set[subprocess.Popen] = set()
         self.chd_lock       = threading.Lock()
-        self._chdman_path: str = ""   # resolved at startup by _find_chdman()
-        self._ps2mdp_path: str  = ""  # resolved at startup by _find_ps2mdp()
 
-        self.global_total     = 0
-        self.global_completed = 0
-
-        # Engine Control State
+        # Engine Control State — declared early so Toolchain can receive the
+        # actual cancel_flag object (not a dummy Event created by hasattr guard).
         self.engine_running = False
         self._engine_lock   = threading.Lock()
         self.cancel_flag    = threading.Event()
         self._progress_lock = threading.Lock()
 
+        # ── Toolchain subsystem ───────────────────────────────────────────────
+        # Owns binary discovery, package-manager install, chdman conversion, and
+        # PS2 Master Disc Patcher invocation.  MyrientTUI delegates all tool calls
+        # to self.toolchain.* so it never spawns chdman/ps2_master directly.
+        self.toolchain = Toolchain(
+            post_message_fn    = self.post_message,
+            cancel_flag        = self.cancel_flag,
+            register_process   = self._register_process,
+            unregister_process = self._unregister_process,
+            chd_lock           = self.chd_lock,
+        )
+
         # Game / filter selection state
         self._selected_games:      set[str] = set()
         self._filter_include_sel:  set[str] = set()
         self._filter_exclude_sel:  set[str] = set()
-
-        # Cache cpu_count once — os.cpu_count() is a syscall, result never changes
-        _cpu = os.cpu_count()
-        self._chd_cores: str = str(max(1, _cpu - 1)) if _cpu else "1"
 
         # Separate debounce timers per search box
         self._consoles_search_timer: Timer | None = None
@@ -1288,20 +2119,29 @@ class MyrientTUI(App):
         self._batch_succeeded: int = 0
         self._batch_failed:    int = 0
 
+        # Dry-run audit flag — set by run_bulk_dat_audit_dry_run, read by
+        # _run_dat_audit_impl.  Initialised here so attribute always exists.
+        self._dat_dry_run_active: bool = False
+
+        # Cache external-tool availability once at startup.
+        # shutil.which() is a filesystem probe — calling it on every download
+        # attempt (per retry, per concurrent worker) is wasteful and noisy.
+        self._wget_available:  bool = bool(shutil.which("wget"))
+        self._unzip_available: bool = bool(shutil.which("unzip"))
+
         # ── Redesign state ────────────────────────────────────────────────────
         # Active nav pane ID (used to sync highlight on restore)
         self._current_pane: str = "pane-browse"
 
         # Log filtering / search
         self._log_filter: str = "all"           # "all" | "err"
-        self._log_buffer: list[tuple[Any, bool]] = []   # (Text, is_error)
+        self._log_buffer: deque[tuple[Any, bool]] = deque(maxlen=2000)  # (Text, is_error)
         self._log_search_text: str = ""
         self._log_search_timer: Timer | None = None
 
     def action_refresh_browser(self) -> None:
         """Ctrl+R: re-scrape console list (bypasses cache)."""
-        with self._link_cache_lock:
-            self._link_cache.clear()
+        self.scraper.clear_cache()
         self._all_games_data = []
         self._games_lookup = {}
         self._selected_games.clear()
@@ -1316,11 +2156,9 @@ class MyrientTUI(App):
         """Override default toggle_dark to persist the theme choice."""
         super().action_toggle_dark()
         try:
-            self.state.settings["theme"] = "dark" if self.dark else "light"
-            self.state.mark_dirty()
+            self.state.set_setting("theme", "dark" if self.dark else "light", immediate=False)
         except AttributeError:
             pass  # .dark reactive not available in this Textual build
-
     def action_jump_to_console(self) -> None:
         """Ctrl+J: from a selected queue row, open the browser tab and highlight the console."""
         try:
@@ -1367,201 +2205,22 @@ class MyrientTUI(App):
                 proc.wait(timeout=1)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                try:
+                    proc.wait(timeout=1)   # reap zombie — POSIX requires wait() after kill()
+                except Exception:
+                    pass
             except Exception:
                 pass
-
-    @staticmethod
-    def _find_chdman() -> str:
-        """Locate chdman executable.  Returns full path string or '' if not found.
-        Search order: saved settings path → tools directory → system PATH.
-        """
-        # 1. Local tools directory shipped/downloaded alongside the script
-        local_candidates = [
-            _TOOLS_DIR / "chdman",
-            _TOOLS_DIR / "chdman.exe",
-            _SCRIPT_DIR / "chdman",
-            _SCRIPT_DIR / "chdman.exe",
-        ]
-        for p in local_candidates:
-            if p.is_file() and os.access(p, os.X_OK):
-                return str(p)
-        # 2. System PATH
-        found = shutil.which("chdman")
-        return found or ""
 
     @work(exclusive=True, thread=True)
     def setup_chdman_auto(self) -> None:
-        """Try to install chdman automatically via the system package manager.
-        Falls back to detailed instructions if every method fails.
-        """
-        self.post_message(SystemLog("chdman Setup: Checking for existing installation..."))
-
-        # Re-check first — it may have been installed since launch
-        path = self._find_chdman()
-        if path:
-            self._chdman_path = path
-            self.post_message(SystemLog(f"chdman already available at: [bold]{path}[/bold]"))
-            return
-
-        self.post_message(SystemLog("chdman Setup: Attempting package-manager install..."))
-
-        for label, cmd in _PKG_INSTALL_CMDS:
-            mgr = shutil.which(cmd[0])
-            if not mgr:
-                continue
-            self.post_message(SystemLog(f"chdman Setup: Trying [bold]{label}[/bold]…"))
-            try:
-                result = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=120
-                )
-                if result.returncode == 0:
-                    path = self._find_chdman()
-                    if path:
-                        self._chdman_path = path
-                        self.post_message(SystemLog(
-                            f"[bold green]chdman installed successfully![/bold green] "
-                            f"Path: [bold]{path}[/bold]"
-                        ))
-                        return
-                else:
-                    self.post_message(SystemLog(
-                        f"chdman Setup: {label} returned non-zero "
-                        f"(may need sudo). Output: {result.stderr[:120]}", True
-                    ))
-            except (subprocess.TimeoutExpired, OSError) as e:
-                self.post_message(SystemLog(f"chdman Setup: {label} failed — {e}", True))
-
-        # All package managers failed — show manual instructions
-        self.post_message(SystemLog(
-            "[bold yellow]chdman auto-install failed.[/bold yellow] "
-            "Manual options:\n"
-            "  • Linux (Debian/Ubuntu):  sudo apt install mame-tools\n"
-            "  • Linux (Arch):           sudo pacman -S mame-tools\n"
-            "  • Linux (Fedora):         sudo dnf install mame-tools\n"
-            "  • macOS (Homebrew):       brew install rom-tools\n"
-            "  • Windows: download MAME tools from https://www.mamedev.org/release.html\n"
-            "Place chdman(.exe) in the myrient_data/tools/ folder to use it without installing."
-        ))
-
-    @staticmethod
-    def _find_ps2mdp() -> str:
-        """Locate ps2_master binary. Returns full path or ''."""
-        candidates = [
-            _TOOLS_DIR / _PS2MDP_BINARY_NAME,
-            _TOOLS_DIR / (_PS2MDP_BINARY_NAME + ".exe"),
-            _SCRIPT_DIR / _PS2MDP_BINARY_NAME,
-            _SCRIPT_DIR / (_PS2MDP_BINARY_NAME + ".exe"),
-        ]
-        for p in candidates:
-            if p.is_file() and os.access(p, os.X_OK):
-                return str(p)
-        return shutil.which(_PS2MDP_BINARY_NAME) or ""
+        """Delegate chdman setup to Toolchain."""
+        self.toolchain.setup_chdman_auto()
 
     @work(exclusive=True, thread=True)
     def setup_ps2mdp_auto(self) -> None:
-        """Download ps2_master from the PSDB v1.0.5 x86_64 release zip.
-
-        Extracts only the ps2_master binary from the bin/ folder into
-        myrient_data/tools/.  All other PSDB components are ignored.
-        """
-        self.post_message(SystemLog("PS2 Patcher Setup: Checking for existing installation..."))
-        path = self._find_ps2mdp()
-        if path:
-            self._ps2mdp_path = path
-            self.post_message(SystemLog(
-                f"ps2_master already available at: [bold]{path}[/bold]"
-            ))
-            return
-
-        self.post_message(SystemLog(
-            "PS2 Patcher Setup: Downloading PSDB v1.0.5 x86_64 release zip…\n"
-            f"  {_PS2MDP_RELEASE_URL}"
-        ))
-
-        tmp_zip = _TOOLS_DIR / "_ps2mdp_download.zip"
-        try:
-            # ── Download ─────────────────────────────────────────────────────
-            try:
-                subprocess.run(
-                    ["wget", "-q", "--timeout=60", "--tries=3",
-                     "-O", str(tmp_zip), _PS2MDP_RELEASE_URL],
-                    check=True, timeout=300,
-                )
-            except Exception:
-                req = urllib.request.Request(
-                    _PS2MDP_RELEASE_URL,
-                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-                )
-                with urllib.request.urlopen(req, timeout=120) as resp, \
-                        open(tmp_zip, "wb") as fout:
-                    shutil.copyfileobj(resp, fout)
-
-            # ── Extract ps2_master binary from bin/ in the release zip ─────────
-            # The binary lives at:
-            #   playstation-disc-burner-v1.0.5-x86_64/bin/ps2_master
-            # We match by exact filename AND require it to be inside a "bin/"
-            # path component so we never accidentally pick up a same-named file
-            # elsewhere in the archive.
-            extracted_binary = False
-            with _zf.ZipFile(tmp_zip, "r") as zf:
-                all_members = zf.namelist()
-                self.post_message(SystemLog(
-                    f"PS2 Patcher Setup: Zip has {len(all_members)} entries. First 60:\n  " +
-                    "\n  ".join(all_members[:60]) +
-                    ("\n  …" if len(all_members) > 60 else "")
-                ))
-
-                for member in all_members:
-                    if member.endswith("/"):
-                        continue
-                    base = Path(member).name
-                    # Must be exactly "ps2_master" inside a "bin/" directory
-                    in_bin = "/bin/" in member
-                    if base == _PS2MDP_BINARY_NAME and in_bin and not extracted_binary:
-                        dest = _TOOLS_DIR / _PS2MDP_BINARY_NAME
-                        with zf.open(member) as src, open(dest, "wb") as dst:
-                            shutil.copyfileobj(src, dst)
-                        dest.chmod(dest.stat().st_mode | 0o111)
-                        extracted_binary = True
-                        self.post_message(SystemLog(
-                            f"PS2 Patcher Setup: Extracted [bold]{base}[/bold] "
-                            f"from [dim]{member}[/dim] → {dest}"
-                        ))
-                        break  # found what we need — no point scanning further
-
-            if not extracted_binary:
-                self.post_message(SystemLog(
-                    "[bold red]PS2 Patcher Setup: binary not found in release zip.[/bold red]\n"
-                    "Check the zip contents log above. Manual install:\n"
-                    f"  1. Download: {_PS2MDP_RELEASE_URL}\n"
-                    f"  2. Extract 'bin/{_PS2MDP_BINARY_NAME}' to myrient_data/tools/\n"
-                    f"  3. chmod +x myrient_data/tools/{_PS2MDP_BINARY_NAME}",
-                    True,
-                ))
-                return
-
-            path = self._find_ps2mdp()
-            if path:
-                self._ps2mdp_path = path
-                self.post_message(SystemLog(
-                    f"[bold green]PS2 Master Disc Patcher ready![/bold green] "
-                    f"Path: [bold]{path}[/bold]"
-                ))
-            else:
-                self.post_message(SystemLog(
-                    "[bold red]Setup finished but binary not found — "
-                    "extraction may have failed.[/bold red]", True
-                ))
-
-        except Exception as err:
-            self.post_message(SystemLog(
-                f"[bold red]PS2 Patcher Setup failed:[/bold red] {err}", True
-            ))
-        finally:
-            try:
-                tmp_zip.unlink(missing_ok=True)
-            except OSError:
-                pass
+        """Delegate PS2 patcher setup to Toolchain."""
+        self.toolchain.setup_ps2mdp_auto()
 
     @work(exclusive=True, thread=True)
     def run_ps2_master_disc_patch(self) -> None:
@@ -1578,7 +2237,9 @@ class MyrientTUI(App):
         contains DVD_Sectors.Bin.
         Originals are never deleted.
         """
-        ps2mdp = self._ps2mdp_path or self._find_ps2mdp()
+        self.cancel_flag.clear()
+        # Resolve locally — same race-safety rationale as run_lib_convert.
+        ps2mdp = self.toolchain.ps2mdp_path or Toolchain.find_ps2mdp()
         if not ps2mdp:
             self.post_message(SystemLog(
                 "[bold red]ps2_master not found.[/bold red] "
@@ -1787,18 +2448,18 @@ class MyrientTUI(App):
         # in-progress downloads without hammering the disk on every completion.
         self._flush_timer = self.set_interval(_FLUSH_INTERVAL, self.state.flush_if_dirty)
 
-        # Resolve chdman path once at startup
-        self._chdman_path = self._find_chdman()
-        if not self._chdman_path:
+        # Resolve chdman path once at startup via Toolchain
+        self.toolchain.refresh_chdman()
+        if not self.toolchain.chdman_path:
             self._log(
                 "[yellow]chdman not found.[/yellow] "
                 "CHD conversion is disabled. Use [bold]'Setup chdman'[/bold] in Settings to install.",
                 is_error=False,
             )
 
-        # Resolve PS2 Master Disc Patcher path once at startup
-        self._ps2mdp_path = self._find_ps2mdp()
-        if not self._ps2mdp_path:
+        # Resolve PS2 Master Disc Patcher path once at startup via Toolchain
+        self.toolchain.refresh_ps2mdp()
+        if not self.toolchain.ps2mdp_path:
             self._log(
                 "[yellow]ps2_master not found.[/yellow] "
                 "PS2 Master Disc patching disabled. Use [bold]'Setup PS2 Patcher'[/bold] in Settings to install.",
@@ -1807,14 +2468,14 @@ class MyrientTUI(App):
 
         # Probe wget and unzip at startup so users see a clear message before
         # the first download attempt fails with a cryptic OS error.
-        if not shutil.which("wget"):
+        if not self._wget_available:
             self._log(
                 "[yellow]wget not found.[/yellow] "
                 "Downloads will use urllib fallback only. "
                 "Install wget for better resumable-download support.",
                 is_error=False,
             )
-        if not shutil.which("unzip"):
+        if not self._unzip_available:
             self._log(
                 "[yellow]unzip not found.[/yellow] "
                 "ZIP extraction will use Python's built-in zipfile module instead. "
@@ -1883,23 +2544,12 @@ class MyrientTUI(App):
 
     def _nav_switch(self, pane_id: str) -> None:
         """Show the requested content pane and update sidebar nav highlights."""
-        pane_ids = [
-            "pane-browse", "pane-downloads", "pane-library",
-            "pane-settings", "pane-logs",
-        ]
-        btn_map = {
-            "pane-browse":     "nav-btn-browse",
-            "pane-downloads":  "nav-btn-downloads",
-            "pane-library":    "nav-btn-library",
-            "pane-settings":   "nav-btn-settings",
-            "pane-logs":       "nav-btn-logs",
-        }
-        for pid in pane_ids:
+        for pid in self._NAV_PANE_IDS:
             try:
                 self.query_one(f"#{pid}").display = (pid == pane_id)
             except Exception:
                 pass
-        for pid, bid in btn_map.items():
+        for pid, bid in self._NAV_BTN_MAP.items():
             try:
                 btn = self.query_one(f"#{bid}", Button)
                 if pid == pane_id:
@@ -1909,6 +2559,22 @@ class MyrientTUI(App):
             except Exception:
                 pass
         self._current_pane = pane_id
+
+    def action_nav_pane(self, pane_id: str) -> None:
+        """1–5: switch nav pane directly (only when no text Input is focused)."""
+        focused = self.focused
+        if isinstance(focused, Input):
+            return  # let the digit go to the input widget
+        self._nav_switch(pane_id)
+
+    def on_resize(self, event) -> None:
+        """Adjust progress grid columns based on terminal width."""
+        try:
+            grid = self.query_one("#progress-grid", Container)
+            cols = 2 if self.size.width >= 120 else 1
+            grid.styles.grid_size_columns = cols
+        except Exception:
+            pass
 
     def action_show_help(self) -> None:
         """? — open the keyboard shortcut help modal."""
@@ -2019,10 +2685,8 @@ class MyrientTUI(App):
         except Exception:
             line.append(msg)
 
-        # Buffer for re-render on filter/search change (cap at 2000 lines)
+        # Buffer for re-render on filter/search change (deque maxlen=2000 auto-evicts)
         self._log_buffer.append((line, is_error))
-        if len(self._log_buffer) > 2000:
-            self._log_buffer = self._log_buffer[-2000:]
 
         # Only write to widget if it passes the current filter + search
         try:
@@ -2035,6 +2699,7 @@ class MyrientTUI(App):
             if should_show:
                 self.query_one("#sys-log", RichLog).write(line)
         except Exception:
+            # Widget not mounted yet (startup) or already unmounted — normal lifecycle.
             pass
 
         # Mirror to session log — strip markup to plain text for readability.
@@ -2049,8 +2714,8 @@ class MyrientTUI(App):
                 except Exception:
                     plain_msg = msg
                 self._session_log_file.write(f"{full_ts}  {level}  {plain_msg}\n")
-            except Exception:
-                pass
+            except OSError as e:
+                logging.debug("Session log write failed: %s", e)
 
     def on_system_log(self, message: SystemLog) -> None: 
         self._log(message.message, message.is_error)
@@ -2373,6 +3038,11 @@ class MyrientTUI(App):
         except Exception:
             pass
 
+    def on_switch_changed(self, event: Switch.Changed) -> None:
+        """Persist switch state immediately so worker threads can read it safely."""
+        if event.switch.id == "sw-dat-dry-run":
+            self.state.set_setting("dat_dry_run", event.value, immediate=False)
+
     def on_input_changed(self, event: Input.Changed) -> None:
         """Debounces search input to prevent UI stutter during rapid typing.
         Each search box has its own timer so they never cancel each other.
@@ -2488,6 +3158,24 @@ class MyrientTUI(App):
             self._refresh_queue_table()
 
     def _load_settings_toggles(self) -> None:
+        # Each try/except guards a single widget query.  During early startup the
+        # compose() tree may not yet be fully mounted; catching here prevents a
+        # crash while still loading all toggles that are ready.
+
+        # ── Input values (SettingsPane doesn't have access to self.state) ──
+        _input_vals = {
+            "set-lib-path":    self.state.settings["library_root"],
+            "set-threads":     str(self.state.settings["max_concurrent"]),
+            "set-speed-limit": str(self.state.settings.get("speed_limit_mbps", 0)),
+            "set-dat-ttl":     str(self.state.settings.get("dat_cache_ttl_hours", 168)),
+        }
+        for wid, val in _input_vals.items():
+            try:
+                self.query_one(f"#{wid}", Input).value = val
+            except Exception:
+                pass
+
+        # ── Switch toggles ─────────────────────────────────────────────────
         try:
             self.query_one("#set-auto-chd", Switch).value = \
                 self.state.settings.get("auto_convert_chd", False)
@@ -2534,6 +3222,18 @@ class MyrientTUI(App):
                     str(q_settings.get("speed_limit_mbps", 0))
             except Exception:
                 pass
+
+    _NAV_PANE_IDS: tuple[str, ...] = (
+        "pane-browse", "pane-downloads", "pane-library",
+        "pane-settings", "pane-logs",
+    )
+    _NAV_BTN_MAP: dict[str, str] = {
+        "pane-browse":     "nav-btn-browse",
+        "pane-downloads":  "nav-btn-downloads",
+        "pane-library":    "nav-btn-library",
+        "pane-settings":   "nav-btn-settings",
+        "pane-logs":       "nav-btn-logs",
+    }
 
     # Button-ID → method-name dispatch table.  Defined once at class level so it is
     # not re-allocated on every button press.  getattr is used at call time so that
@@ -2670,8 +3370,8 @@ class MyrientTUI(App):
                         if len(new_queue) < len(current_queue):
                             self.state.update_active_queue(new_queue)
                             self._remove_queue_row(item_id)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logging.error("btn-remove-items: unexpected error: %s", e)
                     
         elif button_id == "btn-start-dl":
             if self.state.get_active_queue():
@@ -2694,50 +3394,53 @@ class MyrientTUI(App):
                         self._refresh_filter_row(tbl, row.key.value, sel_set)
             except Exception:
                 pass
-            self.state.settings["filter_include"] = []
-            self.state.settings["filter_exclude"] = []
-            self.state.save()
+            self.state.update_settings({"filter_include": [], "filter_exclude": []})
             self.notify("Filters cleared")
 
         elif button_id == "btn-save-settings":
             try:
                 new_path = Path(self.query_one("#set-lib-path", Input).value).expanduser().resolve()
-                self.state.settings["library_root"] = str(new_path)
 
                 threads_input = self.query_one("#set-threads", Input).value.strip()
                 try:
                     thread_count = int(threads_input)
                 except ValueError:
                     thread_count = 4
-                self.state.settings["max_concurrent"] = max(1, min(10, thread_count))
 
                 speed_str = self.query_one("#set-speed-limit", Input).value.strip()
                 try:
-                    self.state.settings["speed_limit_mbps"] = max(0.0, float(speed_str) if speed_str else 0.0)
+                    speed_limit = max(0.0, float(speed_str) if speed_str else 0.0)
                 except ValueError:
-                    pass
+                    speed_limit = self.state.settings.get("speed_limit_mbps", 0)
 
                 dat_ttl_str = self.query_one("#set-dat-ttl", Input).value.strip()
                 try:
-                    self.state.settings["dat_cache_ttl_hours"] = max(0, int(dat_ttl_str) if dat_ttl_str else 168)
+                    dat_ttl_hours = max(0, int(dat_ttl_str) if dat_ttl_str else 168)
                 except ValueError:
-                    pass
+                    dat_ttl_hours = self.state.settings.get("dat_cache_ttl_hours", 168)
 
-                self.state.settings["auto_convert_chd"]          = self.query_one("#set-auto-chd", Switch).value
-                self.state.settings["watch_library"]              = self.query_one("#set-watch-library", Switch).value
-                self.state.settings["notify_on_batch_complete"]   = self.query_one("#set-notify-batch", Switch).value
-                self.state.settings["filter_include"] = sorted(self._filter_include_sel)
-                self.state.settings["filter_exclude"] = sorted(self._filter_exclude_sel)
-                self.state.save()
+                # Apply all changes in one lock window — prevents other threads
+                # from reading a partially-updated settings dict.
+                self.state.update_settings({
+                    "library_root":             str(new_path),
+                    "max_concurrent":           max(1, min(10, thread_count)),
+                    "speed_limit_mbps":         speed_limit,
+                    "dat_cache_ttl_hours":      dat_ttl_hours,
+                    "auto_convert_chd":         self.query_one("#set-auto-chd", Switch).value,
+                    "watch_library":            self.query_one("#set-watch-library", Switch).value,
+                    "notify_on_batch_complete": self.query_one("#set-notify-batch", Switch).value,
+                    "filter_include":           sorted(self._filter_include_sel),
+                    "filter_exclude":           sorted(self._filter_exclude_sel),
+                })
 
                 new_path.mkdir(parents=True, exist_ok=True)
                 self._lib_status.load(new_path)
                 self.run_lib_status_scan()
                 self.notify("Settings saved")
 
-                # Update DAT cache TTL from the new setting
-                global _DAT_CACHE_TTL
-                _DAT_CACHE_TTL = self.state.settings["dat_cache_ttl_hours"] * 3600.0
+                # Note: dat_cache_ttl_hours is read fresh from self.state.settings
+                # inside _run_dat_audit_impl at the start of each audit run, so
+                # no global mutation is needed here.
 
                 # Restart or stop watchdog based on new setting
                 if self.state.settings.get("watch_library", False):
@@ -2908,19 +3611,15 @@ class MyrientTUI(App):
     @work(exclusive=True, thread=True)
     def fetch_consoles(self) -> None:
         self.post_message(SystemLog("Scraping console list..."))
-        items = self._scrape_links(BASE_URL)
+        items = self.scraper.scrape_links(BASE_URL)
         consoles = [i for i in items if i["url_part"].endswith('/')]
-        self.post_message(ConsolesLoaded(consoles))
+        self.post_message(ConsolesLoaded(consoles))  # type: ignore[arg-type]
 
     @work(exclusive=True, thread=True)
     def prefetch_all_consoles(self) -> None:
-        """Concurrently scrape all console game pages and warm the link cache.
-
-        Bounded by _SCRAPE_CONCURRENCY so we don't hammer the server.
-        Results land in _link_cache; individual fetch_games calls will hit
-        the cache rather than re-fetching from the network.
-        """
-        items = self._scrape_links(BASE_URL)
+        """Concurrently scrape all console game pages and warm the link cache."""
+        self.cancel_flag.clear()
+        items = self.scraper.scrape_links(BASE_URL)
         consoles = [i for i in items if i["url_part"].endswith('/')]
         if not consoles:
             return
@@ -2928,7 +3627,7 @@ class MyrientTUI(App):
         semaphore = threading.Semaphore(_SCRAPE_CONCURRENCY)
         total     = len(consoles)
 
-        def _fetch_one(console: dict[str, str], idx: int) -> None:
+        def _fetch_one(console: ConsoleItem, idx: int) -> None:
             with semaphore:
                 if self.cancel_flag.is_set():
                     return
@@ -2936,13 +3635,10 @@ class MyrientTUI(App):
                 self.post_message(LibraryProgress(
                     "Pre-caching", console["name"].strip('/'), idx, total
                 ))
-                self._scrape_links(url)   # result stored in cache
+                self.scraper.scrape_links(url)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=_SCRAPE_CONCURRENCY) as ex:
-            futures = [
-                ex.submit(_fetch_one, c, i)
-                for i, c in enumerate(consoles, 1)
-            ]
+            futures = [ex.submit(_fetch_one, c, i) for i, c in enumerate(consoles, 1)]  # type: ignore[arg-type]
             for f in concurrent.futures.as_completed(futures):
                 try:
                     f.result()
@@ -2955,20 +3651,18 @@ class MyrientTUI(App):
         ))
 
     @work(exclusive=True, thread=True)
-    def fetch_games(self, console_data: dict[str, str]) -> None:
+    def fetch_games(self, console_data: ConsoleItem) -> None:
         url = urljoin(BASE_URL, console_data["url_part"])
         self.post_message(SystemLog(f"Listing games for {console_data['name']}..."))
-        items = self._scrape_links(url)
+        items = self.scraper.scrape_links(url)
 
         inc_filters = self.state.settings["filter_include"]
         exc_filters = self.state.settings["filter_exclude"]
 
-        # Compile each filter list into a single case-insensitive regex — one search()
-        # per game instead of O(games × tags) individual containment checks.
         inc_rx = re.compile('|'.join(re.escape(t) for t in inc_filters), re.IGNORECASE) if inc_filters else None
         exc_rx = re.compile('|'.join(re.escape(t) for t in exc_filters), re.IGNORECASE) if exc_filters else None
 
-        filtered_games = []
+        filtered_games: list[GameItem] = []
         for game in items:
             if not game["url_part"].lower().endswith('.zip'):
                 continue
@@ -2976,84 +3670,13 @@ class MyrientTUI(App):
                 continue
             if exc_rx and exc_rx.search(game["name"]):
                 continue
-            filtered_games.append(game)
+            filtered_games.append(game)  # type: ignore[arg-type]
 
         self.post_message(GamesLoaded(filtered_games))
 
-    def _scrape_links(self, url: str) -> list[dict[str, str]]:
-        now = time.monotonic()
-
-        # Check cache under lock — fetch_consoles and fetch_games run on separate
-        # exclusive workers and can both call _scrape_links concurrently.
-        # A "_PENDING" sentinel prevents a second thread from issuing a duplicate
-        # HTTP request while the first is still in-flight.
-        with self._link_cache_lock:
-            cached = self._link_cache.get(url)
-            if cached is not None:
-                value, ts = cached
-                if value == "_PENDING":
-                    # Another thread is already fetching this URL — return empty
-                    # list immediately rather than issuing a duplicate HTTP request.
-                    # The caller will display a loading state; the results will
-                    # arrive via the first thread's ConsolesLoaded/GamesLoaded message.
-                    return []
-                elif (now - ts) < _LINK_CACHE_TTL:
-                    return value  # type: ignore[return-value]
-            # Snapshot keys for stale-entry eviction — computed outside the lock
-            # (below) to avoid holding it during a potentially long dict iteration.
-            snapshot_items = list(self._link_cache.items())
-            # Mark this URL as in-flight so concurrent callers skip a duplicate fetch
-            self._link_cache[url] = ("_PENDING", now)
-
-        # Evict stale entries outside the lock — prevents blocking concurrent readers.
-        # Both expired results (list values) and long-lived _PENDING sentinels (string
-        # values where the original fetch died without cleanup) are removed.
-        expired = [
-            k for k, (v, ts) in snapshot_items
-            if (now - ts) >= _LINK_CACHE_TTL
-        ]
-        if expired:
-            with self._link_cache_lock:
-                for k in expired:
-                    self._link_cache.pop(k, None)
-
-        try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=15) as res:
-                soup = BeautifulSoup(res.read(), 'html.parser', parse_only=_SCRAPE_STRAINER)
-                items = []
-
-                for a_tag in soup.find_all('a'):
-                    href = a_tag.get('href')
-                    if not href or href.startswith('?') or href in ['../', './', '/']:
-                        continue
-                    if 'Parent Directory' in a_tag.text:
-                        continue
-
-                    size_str   = "N/A"
-                    parent_row = a_tag.find_parent('tr')
-                    if parent_row:
-                        matches = SIZE_REGEX.findall(parent_row.get_text(separator=' '))
-                        if matches:
-                            size_str = f"{matches[-1][0]}{matches[-1][1]}"
-
-                    items.append({
-                        "name":     unquote(href),
-                        "url_part": href,
-                        "size_str": size_str,
-                    })
-
-                with self._link_cache_lock:
-                    self._link_cache[url] = (items, time.monotonic())
-                return items
-
-        except Exception as err:
-            # Remove the pending sentinel so retries aren't permanently blocked
-            with self._link_cache_lock:
-                if self._link_cache.get(url, (None,))[0] == "_PENDING":
-                    del self._link_cache[url]
-            self.post_message(SystemLog(f"Scrape Error: {err}", True))
-            return []
+    def _scrape_links(self, url: str) -> list[ConsoleItem | GameItem]:
+        """Thin backward-compat shim → MyrientScraper.scrape_links()."""
+        return self.scraper.scrape_links(url)
 
     @work(exclusive=True, thread=True)
     def start_download_engine(self) -> None:
@@ -3157,20 +3780,336 @@ class MyrientTUI(App):
                 failed=self._batch_failed,
             ))
 
-    def _download_worker(self, item: dict[str, str]) -> dict[str, Any]:
+    # ──────────────────────────────────────────────────────────────────────────
+    # Download-worker sub-methods
+    # Extracted from the old monolithic _download_worker to satisfy SRP and
+    # make each phase independently testable.
+    # ──────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _compute_speed(
+        cur_bytes: int,
+        size_bytes: int,
+        speed_samples: "deque[tuple[float, int]]",
+    ) -> tuple[float, float]:
+        """Return ``(speed_bps, eta_secs)`` from a rolling sample window.
+
+        Appends the current snapshot to *speed_samples*, evicts entries older
+        than ``_SPEED_WINDOW``, then computes an instantaneous speed and ETA.
+        Returns ``(0.0, -1.0)`` when there are fewer than two samples.
+        """
+        now = time.monotonic()
+        speed_samples.append((now, cur_bytes))
+        cutoff = now - _SPEED_WINDOW
+        while speed_samples and speed_samples[0][0] < cutoff:
+            speed_samples.popleft()
+        if len(speed_samples) < 2:
+            return 0.0, -1.0
+        dt = speed_samples[-1][0] - speed_samples[0][0]
+        db = speed_samples[-1][1] - speed_samples[0][1]
+        if dt <= 0:
+            return 0.0, -1.0
+        spd = db / dt
+        remaining = size_bytes - cur_bytes
+        eta = (remaining / spd) if spd > 0 and remaining > 0 else -1.0
+        return spd, eta
+
+    def _run_wget(
+        self,
+        item: QueueItem,
+        target_file: Path,
+        item_name: str,
+        size_bytes: int,
+        speed_limit_bps: int,
+        speed_samples: "deque[tuple[float, int]]",
+    ) -> tuple[bool, int]:
+        """Run wget for one download attempt.
+
+        Returns ``(True, updated_size_bytes)`` on success (rc=0).
+        Returns ``(False, size_bytes)`` on any failure so the caller can fall
+        through to the urllib fallback on the same attempt.
+
+        Side effects: posts ``DownloadProgress`` messages; terminates process
+        and returns early on cancel.
+        """
+        cmd = [
+            "wget", "--progress=dot:mega", "-c", "--timeout=20", "--tries=1",
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "-e", "robots=off", "-O", str(target_file), item["game_url"],
+        ]
+        if speed_limit_bps > 0:
+            cmd.insert(1, f"--limit-rate={speed_limit_bps}")
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True, env={**os.environ, "LC_ALL": "C"},
+        )
+        self._register_process(proc)
+
+        stderr_log    = deque(maxlen=5)
+        last_ui_update = 0.0
+
+        try:
+            for line in proc.stderr:
+                if self.cancel_flag.is_set():
+                    proc.terminate()
+                    return False, size_bytes
+
+                stderr_log.append(line.strip())
+
+                len_match = WGET_LENGTH_REGEX.search(line)
+                if len_match:
+                    reported = int(len_match.group(1))
+                    if reported > 0:
+                        size_bytes = reported
+
+                match = WGET_PROG_REGEX.search(line)
+                if match:
+                    current_time = time.monotonic()
+                    if current_time - last_ui_update > _UI_UPDATE_INTERVAL:
+                        pct = float(match.group(1))
+                        current_bytes = int((pct / 100.0) * size_bytes)
+                        spd, eta = self._compute_speed(current_bytes, size_bytes, speed_samples)
+                        self.post_message(
+                            DownloadProgress(item["id"], item_name, current_bytes,
+                                             size_bytes, "Downloading", spd, eta)
+                        )
+                        last_ui_update = current_time
+        finally:
+            proc.wait()
+            self._unregister_process(proc)
+
+        if self.cancel_flag.is_set():
+            return False, size_bytes
+
+        if proc.returncode == 0:
+            return True, size_bytes
+
+        error_msg = " | ".join(stderr_log)
+        self.post_message(SystemLog(
+            f"wget failed for {item_name}. "
+            f"Falling back to urllib… ({error_msg})", True
+        ))
+        return False, size_bytes
+
+    def _run_urllib_fallback(
+        self,
+        item: QueueItem,
+        target_file: Path,
+        item_name: str,
+        size_bytes: int,
+        speed_limit_bps: int,
+        speed_samples: "deque[tuple[float, int]]",
+    ) -> tuple[bool, int]:
+        """Stream the download via urllib with optional token-bucket throttling.
+
+        Supports HTTP range-resume if *target_file* already exists and is
+        smaller than *size_bytes*.
+
+        Returns ``(True, updated_size_bytes)`` on success.
+        Returns ``(False, size_bytes)`` and lets the caller handle the exception
+        (i.e. the retry-loop ``last_error`` is set by the caller's try/except).
+        """
+        req = urllib.request.Request(
+            item["game_url"],
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+        )
+
+        if target_file.exists():
+            existing_size = target_file.stat().st_size
+            if existing_size < size_bytes:
+                req.add_header("Range", f"bytes={existing_size}-")
+                open_mode      = "ab"
+                downloaded     = existing_size
+                _resume_offset = existing_size   # used to verify 206 below
+            else:
+                open_mode      = "wb"
+                downloaded     = 0
+                _resume_offset = 0
+        else:
+            open_mode      = "wb"
+            downloaded     = 0
+            _resume_offset = 0
+
+        with urllib.request.urlopen(req, timeout=30) as response:
+            # If we sent a Range header but the server returned 200 (not 206),
+            # it is sending the full file from byte 0.  Opening in "ab" would
+            # prepend the already-downloaded bytes, corrupting the file.
+            # Detect this and restart the write from scratch.
+            actual_status = response.status
+            if _resume_offset > 0 and actual_status != 206:
+                open_mode  = "wb"
+                downloaded = 0
+            cl = response.headers.get("Content-Length")
+            if cl and cl.isdigit() and int(cl) > 0:
+                size_bytes = downloaded + int(cl)
+            with open(target_file, open_mode) as file:
+                last_ui_update = 0.0
+                # Anchor the token-bucket to connection-open so that bytes
+                # already on disk are included in the elapsed-time budget.
+                # This prevents an immediate burst when resuming a partial file.
+                _chunk_start    = time.monotonic()
+                _bytes_at_start = downloaded
+                while True:
+                    if self.cancel_flag.is_set():
+                        return False, size_bytes
+                    chunk = response.read(_DL_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    file.write(chunk)
+                    downloaded += len(chunk)
+
+                    # ── Token-bucket throttle ─────────────────────────────────
+                    # Sleep only when the gap exceeds 100 ms to stay above the
+                    # Windows 15.6 ms timer granularity noise floor.
+                    if speed_limit_bps > 0:
+                        new_bytes = downloaded - _bytes_at_start
+                        elapsed   = time.monotonic() - _chunk_start
+                        expected  = new_bytes / speed_limit_bps
+                        sleep_for = expected - elapsed
+                        if sleep_for > 0.1:
+                            time.sleep(sleep_for)
+
+                    current_time = time.monotonic()
+                    if current_time - last_ui_update > _UI_UPDATE_INTERVAL:
+                        spd, eta = self._compute_speed(
+                            downloaded, max(size_bytes, downloaded), speed_samples
+                        )
+                        self.post_message(
+                            DownloadProgress(
+                                item["id"], item_name, downloaded,
+                                max(size_bytes, downloaded), "Downloading", spd, eta,
+                            )
+                        )
+                        last_ui_update = current_time
+
+        return True, size_bytes
+
+    def _run_extraction(
+        self,
+        target_file: Path,
+        dest_dir: Path,
+        item_name: str,
+    ) -> bool:
+        """Extract *target_file* (ZIP) into *dest_dir*.
+
+        Tries the ``unzip`` system binary first for speed; falls back to
+        Python's ``zipfile`` module on timeout or non-zero exit.
+
+        Updates ``_lib_status`` to ``"validated"`` on success or
+        ``"corrupted"`` on failure.  Posts ``SystemLog`` on errors.
+
+        Returns ``True`` on success, raises ``Exception`` on failure.
+        """
+        if not (target_file.exists() and target_file.suffix.lower() == ".zip"):
+            # Non-zip payload (e.g. bare ISO/CHD): mark validated and return
+            if target_file.exists():
+                self._lib_status.set_status(dest_dir, "validated")
+            return True
+
+        extracted_ok  = False
+        unzip_err_msg = ""
+
+        if self._unzip_available:
+            unzip_proc = subprocess.Popen(
+                ["unzip", "-q", "-o", str(target_file), "-d", str(dest_dir)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            )
+            self._register_process(unzip_proc)
+            try:
+                _, unzip_err_msg = unzip_proc.communicate(timeout=_UNZIP_TIMEOUT)
+                if unzip_proc.returncode == 0:
+                    extracted_ok = True
+                else:
+                    self.post_message(SystemLog(
+                        f"unzip failed for {item_name} (rc={unzip_proc.returncode}), "
+                        "falling back to Python zipfile…"
+                    ))
+            except subprocess.TimeoutExpired:
+                unzip_proc.kill()
+                unzip_proc.wait()
+                self.post_message(SystemLog(
+                    f"unzip timed out for {item_name}, falling back to Python zipfile…"
+                ))
+            finally:
+                self._unregister_process(unzip_proc)
+
+        if not extracted_ok:
+            try:
+                with _zf.ZipFile(target_file, "r") as zf:
+                    _safe_extractall(zf, dest_dir)
+                extracted_ok = True
+            except (_zf.BadZipFile, OSError, ValueError) as zf_err:
+                unzip_err_msg = str(zf_err)
+
+        if extracted_ok:
+            try:
+                target_file.unlink()
+            except OSError as ose:
+                self.post_message(SystemLog(
+                    f"Extraction succeeded but could not delete zip "
+                    f"{target_file.name}: {ose}", True
+                ))
+            self._lib_status.set_status(dest_dir, "validated")
+            return True
+        else:
+            self._lib_status.set_status(dest_dir, "corrupted")
+            raise Exception(f"Extraction failed: {unzip_err_msg}")
+
+    def _run_chd_auto(
+        self,
+        item: QueueItem,
+        item_name: str,
+        dest_dir: Path,
+        size_bytes: int,
+    ) -> None:
+        """Trigger auto-CHD conversion if enabled in settings.
+
+        No-ops when ``auto_convert_chd`` is False or chdman is not available.
+        Posts a ``DownloadProgress`` message with action "Converting CHD" so
+        the progress bar shows the conversion phase while chdman runs.
+        """
+        if not self.state.settings.get("auto_convert_chd", False):
+            return
+        # Resolve locally rather than writing back to the shared Toolchain attribute —
+        # multiple concurrent workers calling this method would race on that write.
+        chdman = self.toolchain.chdman_path or Toolchain.find_chdman()
+        if chdman:
+            self.post_message(
+                DownloadProgress(item["id"], item_name, size_bytes, size_bytes, "Converting CHD")
+            )
+            self._convert_to_chd(dest_dir, silent=True)
+        else:
+            self.post_message(SystemLog(
+                f"Auto-CHD skipped for {item_name}: chdman not found. "
+                "Run 'Setup chdman' in Settings."
+            ))
+
+    def _download_worker(self, item: QueueItem) -> dict[str, Any]:
+        """Orchestrate a single download: skip-check → retry-loop → extract → CHD.
+
+        Each network phase is delegated to a focused sub-method:
+          * ``_run_wget``          — wget subprocess with progress parsing
+          * ``_run_urllib_fallback`` — urllib streaming with token-bucket throttle
+          * ``_run_extraction``    — ZIP extraction (unzip binary or zipfile fallback)
+          * ``_run_chd_auto``      — optional post-download CHD conversion
+
+        Returns ``{"success": True}`` on completion, ``{"success": False}`` on
+        unrecoverable error, or ``{"success": False, "cancelled": True}`` when
+        the cancel flag fires.
+        """
         if self.cancel_flag.is_set():
             return {"success": False, "cancelled": True}
 
-        dest_dir    = Path(item['dest_path'])
-        _url_path   = urllib.parse.urlparse(item['game_url']).path
-        target_file = dest_dir / unquote(_url_path.split('/')[-1])
+        dest_dir    = Path(item["dest_path"])
+        _url_path   = urllib.parse.urlparse(item["game_url"]).path
+        target_file = dest_dir / unquote(_url_path.split("/")[-1])
         item_name   = item["name"]
 
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)
 
             # ── Fast-skip if the game is already in good shape ───────────────
-            if any(dest_dir.rglob("*.chd")) or target_file.with_suffix('.chd').exists():
+            if any(dest_dir.rglob("*.chd")) or target_file.with_suffix(".chd").exists():
                 self.post_message(SystemLog(f"Skipped (CHD exists): {item_name}"))
                 return {"success": True}
             if self._lib_status.get(dest_dir) == "validated":
@@ -3185,46 +4124,25 @@ class MyrientTUI(App):
                         self.post_message(SystemLog(
                             f"Removed stale zip before retry: {stale_zip.name}"
                         ))
-                    except OSError:
-                        pass
+                    except OSError as ose:
+                        self.post_message(SystemLog(
+                            f"Could not remove stale zip {stale_zip.name}: {ose} "
+                            "(file may be locked — retry may fail)", True
+                        ))
 
             size_bytes = max(self._parse_size_bytes(item["size_str"]), 1)
 
-            # ── Resolve per-queue speed limit ────────────────────────────────
-            q_settings    = self.state.get_queue_settings(self.state.active_queue_name)
+            # ── Resolve per-queue speed limit (convert MB/s → B/s) ───────────
+            q_settings      = self.state.get_queue_settings(self.state.active_queue_name)
             speed_limit_bps = (q_settings.get("speed_limit_mbps", 0) or
                                self.state.settings.get("speed_limit_mbps", 0))
-            speed_limit_bps = int(speed_limit_bps * 1024 * 1024)  # convert MB/s → B/s
+            speed_limit_bps = int(speed_limit_bps * 1024 * 1024)
 
-            # ── Rolling speed window ─────────────────────────────────────────
-            # Deque of (monotonic_time, cumulative_bytes) snapshots
             speed_samples: deque[tuple[float, int]] = deque()
-            _total_downloaded = 0
-
-            def _update_speed(cur_bytes: int) -> tuple[float, float]:
-                """Return (speed_bps, eta_secs) from rolling window."""
-                nonlocal _total_downloaded
-                _total_downloaded = cur_bytes
-                now = time.monotonic()
-                speed_samples.append((now, cur_bytes))
-                # Prune samples older than the window
-                cutoff = now - _SPEED_WINDOW
-                while speed_samples and speed_samples[0][0] < cutoff:
-                    speed_samples.popleft()
-                if len(speed_samples) < 2:
-                    return 0.0, -1.0
-                dt = speed_samples[-1][0] - speed_samples[0][0]
-                db = speed_samples[-1][1] - speed_samples[0][1]
-                if dt <= 0:
-                    return 0.0, -1.0
-                spd = db / dt
-                remaining = size_bytes - cur_bytes
-                eta = (remaining / spd) if spd > 0 and remaining > 0 else -1.0
-                return spd, eta
 
             # ── Retry loop with exponential backoff + jitter ─────────────────
-            attempt           = 0
-            download_success  = False
+            attempt          = 0
+            download_success = False
             last_error: Exception | None = None
 
             while attempt < _RETRY_MAX_ATTEMPTS:
@@ -3240,7 +4158,6 @@ class MyrientTUI(App):
                         f"Retry {attempt}/{_RETRY_MAX_ATTEMPTS - 1} for {item_name} "
                         f"(backoff {delay:.1f}s)…"
                     ))
-                    # Respect cancel during backoff sleep
                     deadline = time.monotonic() + delay
                     while time.monotonic() < deadline:
                         if self.cancel_flag.is_set():
@@ -3250,200 +4167,56 @@ class MyrientTUI(App):
                 attempt += 1
                 speed_samples.clear()
 
-                # ── Try wget first ───────────────────────────────────────────
-                cmd = [
-                    "wget", "--progress=dot:mega", "-c", "--timeout=20", "--tries=1",
-                    "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-                    "-e", "robots=off", "-O", str(target_file), item['game_url']
-                ]
-
-                proc = subprocess.Popen(
-                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                    text=True, env={**os.environ, "LC_ALL": "C"}
-                )
-                self._register_process(proc)
-
-                stderr_log    = deque(maxlen=5)
-                last_ui_update = 0.0
-
-                try:
-                    for line in proc.stderr:
-                        if self.cancel_flag.is_set():
-                            proc.terminate()
-                            return {"success": False, "cancelled": True}
-
-                        stderr_log.append(line.strip())
-
-                        len_match = WGET_LENGTH_REGEX.search(line)
-                        if len_match:
-                            reported = int(len_match.group(1))
-                            if reported > 0:
-                                size_bytes = reported
-
-                        match = WGET_PROG_REGEX.search(line)
-                        if match:
-                            current_time = time.monotonic()
-                            if current_time - last_ui_update > _UI_UPDATE_INTERVAL:
-                                pct = float(match.group(1))
-                                current_bytes = int((pct / 100.0) * size_bytes)
-                                spd, eta = _update_speed(current_bytes)
-                                self.post_message(
-                                    DownloadProgress(item["id"], item_name, current_bytes,
-                                                     size_bytes, "Downloading", spd, eta)
-                                )
-                                last_ui_update = current_time
-                finally:
-                    proc.wait()
-                    self._unregister_process(proc)
-
-                if self.cancel_flag.is_set():
-                    return {"success": False, "cancelled": True}
-
-                if proc.returncode == 0:
-                    download_success = True
-                    break
-
-                error_msg = " | ".join(stderr_log)
-                last_error = Exception(f"wget rc={proc.returncode}: {error_msg}")
-
-                # 503 / network error → retry; other non-zero → fall through to urllib
-                self.post_message(SystemLog(
-                    f"wget failed for {item_name} (attempt {attempt}). "
-                    f"Falling back to urllib… ({error_msg})", True
-                ))
-
-                # ── urllib fallback (also subject to retry loop) ─────────────
-                req = urllib.request.Request(
-                    item['game_url'],
-                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-                )
-
-                if target_file.exists():
-                    existing_size = target_file.stat().st_size
-                    if existing_size < size_bytes:
-                        req.add_header('Range', f'bytes={existing_size}-')
-                        open_mode  = 'ab'
-                        downloaded = existing_size
-                    else:
-                        open_mode  = 'wb'
-                        downloaded = 0
+                # ── Phase 1: wget ────────────────────────────────────────────
+                # Skip entirely when wget is not installed — avoids a failing
+                # Popen call (FileNotFoundError) on every retry attempt.
+                if self._wget_available:
+                    ok, size_bytes = self._run_wget(
+                        item, target_file, item_name, size_bytes,
+                        speed_limit_bps, speed_samples,
+                    )
+                    if self.cancel_flag.is_set():
+                        return {"success": False, "cancelled": True}
+                    if ok:
+                        download_success = True
+                        break
                 else:
-                    open_mode  = 'wb'
-                    downloaded = 0
+                    ok = False
 
+                # ── Phase 2: urllib fallback ─────────────────────────────────
                 try:
-                    with urllib.request.urlopen(req, timeout=30) as response:
-                        cl = response.headers.get("Content-Length")
-                        if cl and cl.isdigit() and int(cl) > 0:
-                            size_bytes = downloaded + int(cl)
-                        with open(target_file, open_mode) as file:
-                            last_ui_update = 0.0
-                            _chunk_start   = time.monotonic()  # for throttle token bucket
-                            while True:
-                                if self.cancel_flag.is_set():
-                                    return {"success": False, "cancelled": True}
-                                chunk = response.read(_DL_CHUNK_BYTES)
-                                if not chunk:
-                                    break
-                                file.write(chunk)
-                                downloaded += len(chunk)
-
-                                # ── Speed throttling (token-bucket) ──────────
-                                if speed_limit_bps > 0:
-                                    elapsed   = time.monotonic() - _chunk_start
-                                    expected  = downloaded / speed_limit_bps
-                                    sleep_for = expected - elapsed
-                                    if sleep_for > 0.01:
-                                        time.sleep(sleep_for)
-
-                                current_time = time.monotonic()
-                                if current_time - last_ui_update > _UI_UPDATE_INTERVAL:
-                                    spd, eta = _update_speed(downloaded)
-                                    self.post_message(
-                                        DownloadProgress(
-                                            item["id"], item_name, downloaded,
-                                            max(size_bytes, downloaded), "Downloading", spd, eta
-                                        )
-                                    )
-                                    last_ui_update = current_time
-                    download_success = True
-                    break  # urllib succeeded — exit retry loop
+                    ok, size_bytes = self._run_urllib_fallback(
+                        item, target_file, item_name,
+                        size_bytes, speed_limit_bps, speed_samples,
+                    )
+                    if self.cancel_flag.is_set():
+                        return {"success": False, "cancelled": True}
+                    if ok:
+                        download_success = True
+                        break
                 except Exception as err:
                     last_error = err
-                    # Loop continues — next iteration will retry with backoff
+                    # Loop continues — next iteration retries with backoff
 
             if not download_success:
-                raise Exception(f"All {_RETRY_MAX_ATTEMPTS} attempts failed: {last_error}") from last_error
+                raise Exception(
+                    f"All {_RETRY_MAX_ATTEMPTS} attempts failed: {last_error}"
+                ) from last_error
 
             if self.cancel_flag.is_set():
                 return {"success": False, "cancelled": True}
 
-            self.post_message(DownloadProgress(item["id"], item_name, size_bytes, size_bytes, "Extracting ZIP"))
-
-            if target_file.exists() and target_file.suffix.lower() == '.zip':
-                extracted_ok = False
-                unzip_err_msg = ""
-
-                if shutil.which("unzip"):
-                    unzip_proc = subprocess.Popen(
-                        ["unzip", "-q", "-o", str(target_file), "-d", str(dest_dir)],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
-                    )
-                    self._register_process(unzip_proc)
-                    try:
-                        _, unzip_err_msg = unzip_proc.communicate(timeout=_UNZIP_TIMEOUT)
-                        if unzip_proc.returncode == 0:
-                            extracted_ok = True
-                        else:
-                            self.post_message(SystemLog(
-                                f"unzip failed for {item_name} (rc={unzip_proc.returncode}), "
-                                "falling back to Python zipfile…"
-                            ))
-                    except subprocess.TimeoutExpired:
-                        unzip_proc.kill()
-                        unzip_proc.wait()
-                        self.post_message(SystemLog(
-                            f"unzip timed out for {item_name}, falling back to Python zipfile…"
-                        ))
-                    finally:
-                        self._unregister_process(unzip_proc)
-
-                if not extracted_ok:
-                    try:
-                        with _zf.ZipFile(target_file, 'r') as zf:
-                            zf.extractall(dest_dir)
-                        extracted_ok = True
-                    except (_zf.BadZipFile, OSError) as zf_err:
-                        unzip_err_msg = str(zf_err)
-
-                if extracted_ok:
-                    try:
-                        target_file.unlink()
-                    except OSError:
-                        pass
-                    self._lib_status.set_status(dest_dir, "validated")
-                else:
-                    self._lib_status.set_status(dest_dir, "corrupted")
-                    raise Exception(f"Extraction failed: {unzip_err_msg}")
-            elif target_file.exists():
-                self._lib_status.set_status(dest_dir, "validated")
+            # ── Phase 3: extraction ──────────────────────────────────────────
+            self.post_message(
+                DownloadProgress(item["id"], item_name, size_bytes, size_bytes, "Extracting ZIP")
+            )
+            self._run_extraction(target_file, dest_dir, item_name)
 
             if self.cancel_flag.is_set():
                 return {"success": False, "cancelled": True}
 
-            if self.state.settings.get('auto_convert_chd', False):
-                if not self._chdman_path:
-                    found = shutil.which("chdman")
-                    if found:
-                        self._chdman_path = found
-                if self._chdman_path:
-                    self.post_message(DownloadProgress(item["id"], item_name, size_bytes, size_bytes, "Converting CHD"))
-                    self._convert_to_chd(dest_dir, silent=True)
-                else:
-                    self.post_message(SystemLog(
-                        f"Auto-CHD skipped for {item_name}: chdman not found. "
-                        "Run 'Setup chdman' in Settings."
-                    ))
+            # ── Phase 4: optional auto-CHD conversion ────────────────────────
+            self._run_chd_auto(item, item_name, dest_dir, size_bytes)
 
             return {"success": True}
 
@@ -3453,174 +4226,16 @@ class MyrientTUI(App):
             return {"success": False}
 
     def _convert_to_chd(self, dest_dir: Path, silent: bool = False) -> tuple[int, int]:
-        """Convert disc images in *dest_dir* to CHD format.
+        """Thin shim → Toolchain.convert_to_chd().
 
-        Returns ``(converted, failed)`` counts so callers can track progress
-        accurately without fragile before/after CHD-count comparisons.
+        Passes the caller's resolved chdman path to the Toolchain so the
+        shim never writes back to the shared attribute from a worker thread.
         """
-        # Resolve and cache chdman path the first time — shutil.which() scans $PATH
-        # on every call and is invoked once per game during large batch conversions.
-        if not self._chdman_path:
-            found = shutil.which("chdman")
-            if found:
-                self._chdman_path = found
-        chdman = self._chdman_path or "chdman"
-        converted = failed = 0
-
-        # Collect all convertible source files, skipping those already converted
-        conversion_targets: list[Path] = []
-        for ext in _CHD_CMD_MAP:
-            for f in dest_dir.rglob(f'*{ext}'):
-                if not f.with_suffix('.chd').exists():
-                    conversion_targets.append(f)
-
-        for file_path in conversion_targets:
-            if self.cancel_flag.is_set():
-                return converted, failed
-
-            ext_lower = file_path.suffix.lower()
-            subcommands = _CHD_CMD_MAP.get(ext_lower, ['createcd'])
-            chd_output  = file_path.with_suffix('.chd')
-            succeeded   = False
-
-            for subcmd in subcommands:
-                if self.cancel_flag.is_set():
-                    return converted, failed
-                try:
-                    proc = subprocess.Popen(
-                        [chdman, subcmd,
-                         "-i", str(file_path),
-                         "-o", str(chd_output),
-                         "--num-processors", self._chd_cores],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-                    )
-                    self._register_process(proc)
-
-                    # Drain stderr in a background thread so the pipe buffer
-                    # never fills and blocks chdman. Poll for completion so we
-                    # can honour cancel_flag and enforce a per-file timeout.
-                    stderr_chunks: list[bytes] = []
-                    def _read_stderr(p=proc, buf=stderr_chunks) -> None:
-                        try:
-                            for chunk in iter(lambda: p.stderr.read(4096), b""):
-                                buf.append(chunk)
-                        except OSError:
-                            pass
-
-                    stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
-                    stderr_thread.start()
-
-                    deadline = time.monotonic() + _CHD_TIMEOUT
-                    while proc.poll() is None:
-                        if self.cancel_flag.is_set():
-                            proc.kill()
-                            proc.wait()
-                            stderr_thread.join(timeout=2)
-                            self._unregister_process(proc)
-                            return converted, failed
-                        if time.monotonic() > deadline:
-                            proc.kill()
-                            proc.wait()
-                            stderr_thread.join(timeout=2)
-                            self._unregister_process(proc)
-                            raise subprocess.TimeoutExpired(proc.args, _CHD_TIMEOUT)
-                        time.sleep(0.5)
-
-                    stderr_thread.join(timeout=5)
-                    stderr_bytes = b"".join(stderr_chunks)
-                    self._unregister_process(proc)
-
-                    if proc.returncode == 0:
-                        succeeded = True
-                        break
-                    else:
-                        # Clean up any partial output before retrying
-                        if chd_output.exists():
-                            try:
-                                chd_output.unlink()
-                            except OSError:
-                                pass
-                        if not silent:
-                            err_snippet = (stderr_bytes.decode('utf-8', errors='replace')
-                                           .strip()[:120])
-                            self.post_message(SystemLog(
-                                f"chdman {subcmd} failed for {file_path.name}: {err_snippet}",
-                                True
-                            ))
-                except subprocess.TimeoutExpired:
-                    if not silent:
-                        self.post_message(SystemLog(
-                            f"chdman timed out converting {file_path.name} — killed.", True
-                        ))
-                    if chd_output.exists():
-                        try:
-                            chd_output.unlink()
-                        except OSError:
-                            pass
-                    break
-                except Exception as e:
-                    self.post_message(SystemLog(
-                        f"chdman error ({file_path.name}): {e}", True
-                    ))
-                    break
-
-            if not succeeded:
-                failed += 1
-                if not silent:
-                    self.post_message(SystemLog(
-                        f"CHD conversion failed: {file_path.name} — "
-                        "not a supported disc image format.", True
-                    ))
-                continue
-
-            converted += 1
-
-            # ── Post-conversion cleanup ──────────────────────────────────────
-            if ext_lower == '.cue':
-                try:
-                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as cue_file:
-                        bins = CUE_BIN_REGEX.findall(cue_file.read())
-                    all_bins_removed = True
-                    with self.chd_lock:
-                        for bin_name in bins:
-                            bin_path = file_path.parent / bin_name
-                            if bin_path.exists():
-                                try:
-                                    bin_path.unlink()
-                                except OSError:
-                                    all_bins_removed = False
-                    if all_bins_removed:
-                        try:
-                            file_path.unlink()
-                        except OSError:
-                            pass
-                except Exception:
-                    pass
-            elif ext_lower == '.gdi':
-                # Remove the .gdi descriptor and all raw tracks it references
-                try:
-                    gdi_dir = file_path.parent
-                    for track_file in gdi_dir.glob("*.raw"):
-                        try:
-                            track_file.unlink()
-                        except OSError:
-                            pass
-                    for track_file in gdi_dir.glob("*.bin"):
-                        try:
-                            track_file.unlink()
-                        except OSError:
-                            pass
-                    file_path.unlink()
-                except OSError:
-                    pass
-            else:
-                # .iso or other single-file source
-                try:
-                    file_path.unlink()
-                except OSError:
-                    pass
-
-        return converted, failed
+        # Resolve locally and update toolchain only from the main thread (on_mount).
+        # Worker threads call this shim; writing toolchain.chdman_path here would
+        # race with other workers.  The Toolchain's own convert_to_chd already
+        # does a local shutil.which() if its chdman_path is empty.
+        return self.toolchain.convert_to_chd(dest_dir, silent=silent)
 
     def on_download_progress(self, message: DownloadProgress) -> None:
         grid = self.query_one("#progress-grid")
@@ -3680,11 +4295,14 @@ class MyrientTUI(App):
 
     def on_download_complete(self, message: DownloadComplete) -> None:
         if message.success:
-            # Protect counter incremented from concurrent completion callbacks
+            # Protect both counters — on_download_complete runs on the Textual
+            # main thread but start_download_engine (the @work thread) reads
+            # _batch_succeeded/_batch_failed for BatchComplete after the executor
+            # finishes.  Using _progress_lock keeps the write visible.
             with self._progress_lock:
-                self.global_completed += 1
-                completed_snap = self.global_completed
-            self._batch_succeeded += 1
+                self.global_completed   += 1
+                self._batch_succeeded   += 1
+                completed_snap           = self.global_completed
             try:
                 self.query_one("#global-progress", ProgressBar).advance(1)
                 self.query_one("#lbl-global-progress", Label).update(
@@ -3733,7 +4351,8 @@ class MyrientTUI(App):
         else:
             # Download failed — mark label as failed, hide bar, then remove
             # the container after a short delay so the user can see the failure.
-            self._batch_failed += 1
+            with self._progress_lock:
+                self._batch_failed += 1
             self._active_progress_containers.discard(message.item["id"])
             item_id = message.item["id"]
             try:
@@ -3823,12 +4442,10 @@ class MyrientTUI(App):
         When the dry-run switch (sw-dat-dry-run) is enabled, planned renames are
         logged but no files are moved and no status markers are written.
         """
-        # Check if the user has requested a dry run via the UI switch
-        dry_run = False
-        try:
-            dry_run = self.query_one("#sw-dat-dry-run", Switch).value
-        except Exception:
-            pass
+        self.cancel_flag.clear()
+        # Read the dry-run setting from the persisted config (thread-safe) rather
+        # than querying the Switch widget, which is only safe on the main thread.
+        dry_run = self.state.settings.get("dat_dry_run", False)
 
         if dry_run:
             self.post_message(SystemLog(
@@ -3942,7 +4559,7 @@ class MyrientTUI(App):
             dat_filename = Path(unquote(dat_href)).name
             dat_path     = dat_dir / dat_filename
 
-            # Re-fetch if the cached DAT is older than _DAT_CACHE_TTL.
+            # Re-fetch if the cached DAT is older than dat_ttl (read from settings above).
             # Redump DATs are updated continuously as new verified dumps are
             # submitted; a week-old file will miss recently-verified entries.
             _dat_is_stale = False
@@ -4255,11 +4872,10 @@ class MyrientTUI(App):
         a game directory (convert that one game), or None / the library root
         to convert everything.
         """
-        if not self._chdman_path:
-            found = shutil.which("chdman")
-            if found:
-                self._chdman_path = found
-        chdman = self._chdman_path
+        self.cancel_flag.clear()
+        # Resolve locally — worker threads must not write back to toolchain.chdman_path
+        # since concurrent @work threads could race on that shared attribute.
+        chdman = self.toolchain.chdman_path or Toolchain.find_chdman()
         if not chdman:
             self.post_message(SystemLog(
                 "[bold red]chdman not found.[/bold red] "
@@ -4357,11 +4973,9 @@ class MyrientTUI(App):
         then falls back to extracthd (→ .img).  Source .chd is removed only on
         confirmed success.
         """
-        if not self._chdman_path:
-            found = shutil.which("chdman")
-            if found:
-                self._chdman_path = found
-        chdman = self._chdman_path
+        self.cancel_flag.clear()
+        # Resolve locally — same race-safety rationale as run_lib_convert.
+        chdman = self.toolchain.chdman_path or Toolchain.find_chdman()
         if not chdman:
             self.post_message(SystemLog(
                 "[bold red]chdman not found.[/bold red] "
@@ -4491,8 +5105,11 @@ class MyrientTUI(App):
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
             elif _OS == "darwin":
+                # Escape backslashes and double quotes to prevent AppleScript injection
+                safe_body  = body.replace("\\", "\\\\").replace('"', '\\"')
+                safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
                 script = (
-                    f'display notification "{body}" with title "{title}"'
+                    f'display notification "{safe_body}" with title "{safe_title}"'
                 )
                 subprocess.Popen(
                     ["osascript", "-e", script],
@@ -4644,12 +5261,14 @@ class MyrientTUI(App):
     def _save_current_preset(self, name: str) -> None:
         if not name.strip():
             return
-        presets = self.state.settings.setdefault("filter_presets", {})
-        presets[name] = {
+        preset_data = {
             "include": sorted(self._filter_include_sel),
             "exclude": sorted(self._filter_exclude_sel),
         }
-        self.state.save()
+        with self.state._lock:
+            presets = self.state.data["settings"].setdefault("filter_presets", {})
+            presets[name] = preset_data
+            self.state._write_locked()
         self._refresh_preset_dropdown()
         self.notify(f"Preset '{name}' saved")
 
@@ -4674,12 +5293,14 @@ class MyrientTUI(App):
         self.notify(f"Preset '{name}' loaded")
 
     def _delete_preset(self, name: str) -> None:
-        presets = self.state.settings.get("filter_presets", {})
-        if name in presets:
+        with self.state._lock:
+            presets = self.state.data["settings"].get("filter_presets", {})
+            if name not in presets:
+                return
             del presets[name]
-            self.state.save()
-            self._refresh_preset_dropdown()
-            self.notify(f"Preset '{name}' deleted")
+            self.state._write_locked()
+        self._refresh_preset_dropdown()
+        self.notify(f"Preset '{name}' deleted")
 
     # ── Orphaned file detection ───────────────────────────────────────────────
 
@@ -4786,7 +5407,6 @@ class MyrientTUI(App):
             self.post_message(SystemLog("DAT Audit Dry Run: Library path not found.", True))
             return
 
-        from concurrent.futures import ThreadPoolExecutor as _TPE
         console_dirs = sorted(
             d for d in library.iterdir()
             if d.is_dir() and not d.name.startswith('.')
@@ -4809,6 +5429,7 @@ class MyrientTUI(App):
             dat_path = max(dat_files, key=lambda p: p.stat().st_mtime)
             try:
                 dat_by_sha1: dict[str, dict[str, str]] = {}
+                ambiguous_sha1s: set[str] = set()
                 context = ET.iterparse(dat_path, events=('start', 'end'))
                 _, xml_root = next(context)
                 current_game = "Unknown"
@@ -4819,23 +5440,61 @@ class MyrientTUI(App):
                         sha1_val = elem.get('sha1')
                         rom_name = elem.get('name')
                         if sha1_val and rom_name:
-                            dat_by_sha1[sha1_val.lower()] = {
-                                "name": rom_name, "game": current_game
-                            }
+                            sha1_lower = sha1_val.lower()
+                            if sha1_lower in ambiguous_sha1s:
+                                pass
+                            elif sha1_lower in dat_by_sha1:
+                                ambiguous_sha1s.add(sha1_lower)
+                                del dat_by_sha1[sha1_lower]
+                            else:
+                                dat_by_sha1[sha1_lower] = {
+                                    "name": rom_name, "game": current_game
+                                }
                         elem.clear()
                     elif event == 'end' and elem.tag == 'game':
                         xml_root.clear()
             except Exception:
                 continue
 
+            # Load SHA-1 cache for this console (same logic as run_bulk_dat_audit)
+            sha1_cache_path = DAT_CACHE_DIR / console_name / ".sha1_cache.json"
+            sha1_cache: dict[str, dict[str, Any]] = {}
+            try:
+                if sha1_cache_path.exists():
+                    with open(sha1_cache_path, 'r', encoding='utf-8') as cf:
+                        loaded = json.load(cf)
+                    for k, v in loaded.items():
+                        p = Path(k)
+                        if p.is_absolute():
+                            try:
+                                rel = p.relative_to(console_dir).as_posix()
+                            except ValueError:
+                                continue
+                            sha1_cache[rel] = v
+                        else:
+                            sha1_cache[k] = v
+            except (json.JSONDecodeError, OSError):
+                sha1_cache = {}
+
             for ext in _DAT_AUDITABLE_EXTS:
                 for file_path in console_dir.rglob(f'*{ext}'):
                     try:
-                        sha1_obj = hashlib.sha1(usedforsecurity=False)
-                        with open(file_path, 'rb') as fh:
-                            while chunk := fh.read(_HASH_CHUNK_BYTES):
-                                sha1_obj.update(chunk)
-                        file_hash = sha1_obj.hexdigest().lower()
+                        stat = file_path.stat()
+                        key = file_path.relative_to(console_dir).as_posix()
+                        cached = sha1_cache.get(key)
+                        if (cached
+                                and cached.get("mtime") == stat.st_mtime
+                                and cached.get("size") == stat.st_size):
+                            file_hash = cached["sha1"]
+                        else:
+                            sha1_obj = hashlib.sha1(usedforsecurity=False)
+                            with open(file_path, 'rb') as fh:
+                                while chunk := fh.read(_HASH_CHUNK_BYTES):
+                                    sha1_obj.update(chunk)
+                            file_hash = sha1_obj.hexdigest().lower()
+
+                        if file_hash in ambiguous_sha1s:
+                            continue  # shared track — skip rename suggestion
                         if file_hash in dat_by_sha1:
                             expected_name = dat_by_sha1[file_hash]['name']
                             expected_game = dat_by_sha1[file_hash]['game']
@@ -5005,7 +5664,16 @@ class MyrientTUI(App):
 
     @work(exclusive=True, thread=True)
     def requeue_failed_games(self) -> None:
-        """Finds all corrupted and incomplete game dirs and adds them to the active download queue."""
+        """Finds all corrupted and incomplete game dirs and adds them to the active download queue.
+
+        .. note:: URL reconstruction
+            The Myrient download URL is rebuilt from ``console_name / game_dir.name + '.zip'``.
+            This works correctly as long as the directory name on disk matches the Myrient
+            filename exactly (which is true for all downloads made by this app).  If a game
+            directory was renamed manually after download, the reconstructed URL will 404.
+            A future improvement would store the original ``game_url`` in the lib-status JSON
+            so this step is not needed.
+        """
         library = Path(self.state.settings['library_root'])
         if not library.exists():
             self.post_message(SystemLog("Re-queue: Library path not found.", True))
@@ -5067,6 +5735,10 @@ class MyrientTUI(App):
         Clears any existing validated/corrupted status so the download worker
         does not fast-skip games that were previously marked validated.
         Already-queued entries are skipped to avoid duplicates.
+
+        URL reconstruction carries the same caveat as ``requeue_failed_games``:
+        URLs are built from the on-disk directory name; manually renamed directories
+        will produce URLs that 404.
         """
         if not console_path.exists():
             self.post_message(SystemLog(
@@ -5126,6 +5798,12 @@ class MyrientTUI(App):
     def _parse_size_bytes(size_str: str) -> int:
         """Parse a human-readable size string (e.g. '524.8 MB', '1.2GiB') into bytes.
         Uses the pre-compiled SIZE_REGEX and _SIZE_MULTIPLIERS constant.
+
+        Unit mapping: only the first character of the matched unit is used as the
+        dict key ('KB'→'K', 'MiB'→'M', 'GB'→'G', etc.).  SI and IEC units both
+        map to the same binary multipliers (1 KB = 1 KiB = 1024 bytes) — this is
+        intentional: Myrient displays sizes with mixed conventions and the
+        difference is negligible for progress display purposes.
         """
         if not size_str or size_str == "N/A":
             return 0
@@ -5157,8 +5835,8 @@ class MyrientTUI(App):
                     f"# Session ended {datetime.datetime.now().isoformat()}\n"
                 )
                 self._session_log_file.close()
-            except Exception:
-                pass
+            except OSError as e:
+                logging.error("Failed to close session log: %s", e)
 
 
 if __name__ == "__main__":
