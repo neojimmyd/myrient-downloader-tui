@@ -253,7 +253,6 @@ _SIZE_UNITS: tuple[str, ...] = ('B', 'KB', 'MB', 'GB', 'TB')
 
 # Dict allocated once — _parse_size_bytes is called per download queue item
 _SIZE_MULTIPLIERS: dict[str, int] = {
-    "B": 1,
     "K": 1024,
     "M": 1024 ** 2,
     "G": 1024 ** 3,
@@ -271,6 +270,10 @@ _UNZIP_TIMEOUT: int = 600
 # Maximum number of session log files kept in myrient_data/logs/.
 # Oldest files beyond this count are pruned at startup.
 _SESSION_LOG_MAX_FILES: int = 30
+
+# Pre-built environment dict for wget — forces C locale for consistent progress
+# output parsing.  Allocated once instead of copying os.environ per invocation.
+_WGET_ENV: dict[str, str] = {**os.environ, "LC_ALL": "C"}
 
 # Frozenset for O(1) membership test in on_library_progress
 _PROGRESS_DONE_STATES: frozenset[str] = frozenset({"done", "complete", "failed"})
@@ -441,6 +444,11 @@ class ConfigManager:
         with self._lock:
             return list(self.data["queues"].get(self.active_queue_name, []))
 
+    def active_queue_length(self) -> int:
+        """Return the number of items in the active queue without copying it."""
+        with self._lock:
+            return len(self.data["queues"].get(self.active_queue_name, []))
+
     def update_active_queue(self, new_queue: list[QueueItem], immediate: bool = True) -> None:
         """Replace the active queue in memory.
         Pass ``immediate=False`` during active download batch runs to defer the
@@ -493,14 +501,15 @@ class ConfigManager:
 
     def get_queue_settings(self, queue_name: str) -> dict[str, Any]:
         """Return per-queue override settings, falling back to global defaults."""
-        global_qs = self.data["settings"].get("queue_settings", {})
-        q_overrides = global_qs.get(queue_name, {})
-        return {
-            "max_concurrent":  q_overrides.get("max_concurrent",
-                                self.data["settings"].get("max_concurrent", 4)),
-            "speed_limit_mbps": q_overrides.get("speed_limit_mbps",
-                                self.data["settings"].get("speed_limit_mbps", 0)),
-        }
+        with self._lock:
+            global_qs = self.data["settings"].get("queue_settings", {})
+            q_overrides = global_qs.get(queue_name, {})
+            return {
+                "max_concurrent":  q_overrides.get("max_concurrent",
+                                    self.data["settings"].get("max_concurrent", 4)),
+                "speed_limit_mbps": q_overrides.get("speed_limit_mbps",
+                                    self.data["settings"].get("speed_limit_mbps", 0)),
+            }
 
     def set_queue_settings(self, queue_name: str, overrides: dict[str, Any]) -> None:
         """Persist per-queue setting overrides."""
@@ -538,6 +547,16 @@ class ConfigManager:
             self.data["settings"].update(updates)
             self._write_locked()
 
+    def mutate_settings(self, fn: Any) -> None:
+        """Call *fn(settings_dict)* while holding the lock and flush once.
+
+        Use this when the mutation is more complex than a flat key update
+        (e.g. nested dict insert/delete on filter_presets).
+        """
+        with self._lock:
+            fn(self.data["settings"])
+            self._write_locked()
+
 
 class LibraryStatus:
     """Thread-safe, file-backed store for game directory validation status.
@@ -567,6 +586,7 @@ class LibraryStatus:
         self._library: Path | None   = None
         self._path:    Path | None   = None
         self._dirty   = False
+        self._defer_flush = False
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -638,7 +658,8 @@ class LibraryStatus:
         with self._lock:
             self._data[key] = status
             self._dirty = True
-        self._flush()
+        if not self._defer_flush:
+            self._flush()
 
     def remove(self, path: Path) -> None:
         """Remove *path* from the store (marks it incomplete) and flush."""
@@ -648,7 +669,18 @@ class LibraryStatus:
         with self._lock:
             self._data.pop(key, None)
             self._dirty = True
-        self._flush()
+        if not self._defer_flush:
+            self._flush()
+
+    def defer_flushes(self, defer: bool = True) -> None:
+        """When *defer* is True, ``set_status``/``remove`` mark dirty but skip
+        disk I/O.  When set back to False, a single flush captures all pending
+        changes.  Used by the bulk DAT audit to avoid N disk writes for N game
+        dirs — reduces I/O from O(games) to O(consoles).
+        """
+        self._defer_flush = defer
+        if not defer:
+            self._flush()
 
     def prune(self, library: Path) -> None:
         """Drop entries whose directories no longer exist (e.g. after deletion)."""
@@ -664,10 +696,12 @@ class LibraryStatus:
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _key(self, path: Path) -> str | None:
-        if self._library is None:
+        with self._lock:
+            lib = self._library
+        if lib is None:
             return None
         try:
-            return path.relative_to(self._library).as_posix()
+            return path.relative_to(lib).as_posix()
         except ValueError:
             return None  # path is outside the library — don't store it
 
@@ -949,7 +983,10 @@ class MyrientScraper:
             self._cache[url] = ("_PENDING", now)
 
         # Evict stale entries outside the lock.
-        expired = [k for k, (_, ts) in snapshot_items if (now - ts) >= _LINK_CACHE_TTL]
+        # Exclude the current url — we just set it to _PENDING above; the snapshot
+        # still holds the OLD (stale) value for this key, so without the exclusion
+        # the pop() below would delete the fresh sentinel we just inserted.
+        expired = [k for k, (_, ts) in snapshot_items if (now - ts) >= _LINK_CACHE_TTL and k != url]
         if expired:
             with self._lock:
                 for k in expired:
@@ -2063,9 +2100,9 @@ class MyrientTUI(App):
         # MyrientScraper owns the TTL link cache; MyrientTUI only calls
         # self.scraper.scrape_links() / self.scraper.clear_cache().
         self.scraper = MyrientScraper(self.post_message)
-        self._all_consoles_data: list[dict[str, str]] = []
-        self._all_games_data:    list[dict[str, str]] = []
-        self._games_lookup:      dict[str, dict[str, str]] = {}
+        self._all_consoles_data: list[ConsoleItem] = []
+        self._all_games_data:    list[GameItem] = []
+        self._games_lookup:      dict[str, GameItem] = {}
 
         self.selected_console: dict[str, str] | None = None
 
@@ -2115,13 +2152,8 @@ class MyrientTUI(App):
         self._watch_observer: Any = None   # _WatchdogObserver instance or None
         self._watch_debounce_timer: Timer | None = None
 
-        # Batch complete counters (set at engine start, updated on each completion)
-        self._batch_succeeded: int = 0
-        self._batch_failed:    int = 0
-
-        # Dry-run audit flag — set by run_bulk_dat_audit_dry_run, read by
-        # _run_dat_audit_impl.  Initialised here so attribute always exists.
-        self._dat_dry_run_active: bool = False
+        # (batch succeeded/failed counts are computed locally inside
+        # start_download_engine — no shared state needed)
 
         # Cache external-tool availability once at startup.
         # shutil.which() is a filesystem probe — calling it on every download
@@ -2626,7 +2658,7 @@ class MyrientTUI(App):
                 ))
             else:
                 engine_lbl.update(Text("●  Idle", style="#3d4451"))
-            q_len = len(self.state.get_active_queue())
+            q_len = self.state.active_queue_length()
             if q_len > 0:
                 queue_lbl.update(Text(
                     f"{q_len} queued · {self.state.active_queue_name}",
@@ -3248,7 +3280,6 @@ class MyrientTUI(App):
         "btn-lib-refresh-status": "run_lib_status_scan",
         "btn-requeue-failed":     "requeue_failed_games",
         "btn-lib-orphans":        "scan_orphaned_files",
-        "btn-lib-dat-dry-run":    "run_bulk_dat_audit_dry_run",
         "btn-prefetch-consoles":  "prefetch_all_consoles",
         "btn-refresh-session-logs": "_refresh_session_log_list",
     }
@@ -3674,10 +3705,6 @@ class MyrientTUI(App):
 
         self.post_message(GamesLoaded(filtered_games))
 
-    def _scrape_links(self, url: str) -> list[ConsoleItem | GameItem]:
-        """Thin backward-compat shim → MyrientScraper.scrape_links()."""
-        return self.scraper.scrape_links(url)
-
     @work(exclusive=True, thread=True)
     def start_download_engine(self) -> None:
         # Atomic check-and-set: prevents a second invocation from slipping through
@@ -3715,8 +3742,6 @@ class MyrientTUI(App):
         with self._progress_lock:
             self.global_total     = len(queue)
             self.global_completed = 0
-        self._batch_succeeded = 0
-        self._batch_failed    = 0
         
         def init_global_pb() -> None:
             try:
@@ -3737,17 +3762,25 @@ class MyrientTUI(App):
         self.call_from_thread(self._update_global_statusbar)
         self.post_message(SystemLog(f"Engine Online. Dispatching {max_threads} Threads..."))
         
+        # Count results on the worker thread so BatchComplete gets accurate
+        # totals without racing against main-thread message processing.
+        _batch_ok = _batch_fail = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
             futures = {executor.submit(self._download_worker, item): item for item in queue}
             for future in concurrent.futures.as_completed(futures):
-                try: 
+                try:
                     result = future.result()
+                    if result.get("success"):
+                        _batch_ok += 1
+                    elif not result.get("cancelled"):
+                        _batch_fail += 1
                     self.post_message(DownloadComplete(
-                        futures[future], 
-                        result.get("success", False), 
+                        futures[future],
+                        result.get("success", False),
                         result.get("cancelled", False)
                     ))
-                except Exception as err: 
+                except Exception as err:
+                    _batch_fail += 1
                     self.post_message(SystemLog(f"Thread crash {futures[future]['name']}: {err}", True))
                     self.post_message(DownloadComplete(futures[future], False))
                     
@@ -3776,8 +3809,8 @@ class MyrientTUI(App):
             # Post BatchComplete so the handler can send a desktop notification
             self.post_message(BatchComplete(
                 total=self.global_total,
-                succeeded=self._batch_succeeded,
-                failed=self._batch_failed,
+                succeeded=_batch_ok,
+                failed=_batch_fail,
             ))
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -3841,7 +3874,7 @@ class MyrientTUI(App):
             cmd.insert(1, f"--limit-rate={speed_limit_bps}")
         proc = subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            text=True, env={**os.environ, "LC_ALL": "C"},
+            text=True, env=_WGET_ENV,
         )
         self._register_process(proc)
 
@@ -3875,7 +3908,11 @@ class MyrientTUI(App):
                         )
                         last_ui_update = current_time
         finally:
-            proc.wait()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
             self._unregister_process(proc)
 
         if self.cancel_flag.is_set():
@@ -4113,8 +4150,26 @@ class MyrientTUI(App):
                 self.post_message(SystemLog(f"Skipped (CHD exists): {item_name}"))
                 return {"success": True}
             if self._lib_status.get(dest_dir) == "validated":
-                self.post_message(SystemLog(f"Skipped (Already validated): {item_name}"))
-                return {"success": True}
+                # Verify game files still exist — a stale "validated" entry
+                # persists after files are deleted or the directory is recreated
+                # empty (common with multi-disc games where individual discs are
+                # re-queued after partial deletion).
+                try:
+                    has_game_files = any(
+                        f.suffix.lower() in _GAME_EXTS
+                        for f in dest_dir.iterdir()
+                        if f.is_file()
+                    )
+                except (PermissionError, OSError):
+                    has_game_files = False
+                if has_game_files:
+                    self.post_message(SystemLog(f"Skipped (Already validated): {item_name}"))
+                    return {"success": True}
+                # Stale validated status — game files are missing; clear and re-download.
+                self._lib_status.remove(dest_dir)
+                self.post_message(SystemLog(
+                    f"Cleared stale validation for {item_name} — re-downloading."
+                ))
 
             # ── Stale-zip cleanup for corrupted games ────────────────────────
             if self._lib_status.get(dest_dir) == "corrupted":
@@ -4295,21 +4350,17 @@ class MyrientTUI(App):
 
     def on_download_complete(self, message: DownloadComplete) -> None:
         if message.success:
-            # Protect both counters — on_download_complete runs on the Textual
-            # main thread but start_download_engine (the @work thread) reads
-            # _batch_succeeded/_batch_failed for BatchComplete after the executor
-            # finishes.  Using _progress_lock keeps the write visible.
             with self._progress_lock:
                 self.global_completed   += 1
-                self._batch_succeeded   += 1
                 completed_snap           = self.global_completed
+                total_snap               = self.global_total
             try:
                 self.query_one("#global-progress", ProgressBar).advance(1)
                 self.query_one("#lbl-global-progress", Label).update(
                     Text.assemble(
                         ("▸ DOWNLOAD PROGRESS", "dim"),
                         "  ",
-                        (f"{completed_snap} / {self.global_total}", "#e6b73e"),
+                        (f"{completed_snap} / {total_snap}", "#e6b73e"),
                     )
                 )
             except Exception:
@@ -4351,8 +4402,6 @@ class MyrientTUI(App):
         else:
             # Download failed — mark label as failed, hide bar, then remove
             # the container after a short delay so the user can see the failure.
-            with self._progress_lock:
-                self._batch_failed += 1
             self._active_progress_containers.discard(message.item["id"])
             item_id = message.item["id"]
             try:
@@ -4691,6 +4740,10 @@ class MyrientTUI(App):
                 sha1_cache = {}
 
             # ── 3f: hash every file once (or reuse cache), fix misnamed files ──
+            # Defer LibraryStatus disk flushes for the entire per-console pass.
+            # set_status/remove are called once per game dir in step 3h (and per
+            # rename in 3f); deferring reduces I/O from O(games) to O(1) per console.
+            self._lib_status.defer_flushes(True)
             con_perfect = con_misnamed = con_bad = con_ambiguous = 0
             all_files = [(gd, fp) for gd, fps in game_dirs.items() for fp in fps]
             total_files = len(all_files)
@@ -4830,16 +4883,20 @@ class MyrientTUI(App):
                     pass
 
             # ── 3h: write validation markers ─────────────────────────────────
-            if not dry_run:
-                for game_dir, files in game_dirs.items():
-                    if game_dir in renamed_old_dirs:
-                        self._lib_status.remove(game_dir)
-                    else:
-                        dir_ok = all(hash_results.get(fp, False) for fp in files)
-                        if dir_ok:
-                            self._lib_status.set_status(game_dir, "validated")
+            try:
+                if not dry_run:
+                    for game_dir, files in game_dirs.items():
+                        if game_dir in renamed_old_dirs:
+                            self._lib_status.remove(game_dir)
                         else:
-                            self._lib_status.set_status(game_dir, "corrupted")
+                            dir_ok = all(hash_results.get(fp, False) for fp in files)
+                            if dir_ok:
+                                self._lib_status.set_status(game_dir, "validated")
+                            else:
+                                self._lib_status.set_status(game_dir, "corrupted")
+            finally:
+                # Single flush for all status changes in this console.
+                self._lib_status.defer_flushes(False)
 
             self.post_message(SystemLog(
                 f"DAT Audit [{console_name}]: "
@@ -5100,9 +5157,10 @@ class MyrientTUI(App):
         """Best-effort desktop notification via notify-send (Linux) or osascript (macOS)."""
         try:
             if _OS == "linux" and shutil.which("notify-send"):
-                subprocess.Popen(
+                subprocess.run(
                     ["notify-send", "-t", "8000", title, body],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=5,
                 )
             elif _OS == "darwin":
                 # Escape backslashes and double quotes to prevent AppleScript injection
@@ -5111,9 +5169,10 @@ class MyrientTUI(App):
                 script = (
                     f'display notification "{safe_body}" with title "{safe_title}"'
                 )
-                subprocess.Popen(
+                subprocess.run(
                     ["osascript", "-e", script],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=5,
                 )
         except Exception:
             pass   # notifications are best-effort — never crash the app
@@ -5265,10 +5324,9 @@ class MyrientTUI(App):
             "include": sorted(self._filter_include_sel),
             "exclude": sorted(self._filter_exclude_sel),
         }
-        with self.state._lock:
-            presets = self.state.data["settings"].setdefault("filter_presets", {})
-            presets[name] = preset_data
-            self.state._write_locked()
+        self.state.mutate_settings(
+            lambda s: s.setdefault("filter_presets", {}).__setitem__(name, preset_data)
+        )
         self._refresh_preset_dropdown()
         self.notify(f"Preset '{name}' saved")
 
@@ -5293,12 +5351,12 @@ class MyrientTUI(App):
         self.notify(f"Preset '{name}' loaded")
 
     def _delete_preset(self, name: str) -> None:
-        with self.state._lock:
-            presets = self.state.data["settings"].get("filter_presets", {})
-            if name not in presets:
-                return
-            del presets[name]
-            self.state._write_locked()
+        presets = self.state.settings.get("filter_presets", {})
+        if name not in presets:
+            return
+        self.state.mutate_settings(
+            lambda s: s.get("filter_presets", {}).pop(name, None)
+        )
         self._refresh_preset_dropdown()
         self.notify(f"Preset '{name}' deleted")
 
@@ -5367,158 +5425,6 @@ class MyrientTUI(App):
             self.post_message(SystemLog(f"  [dim]⚠[/dim]  {_escape_markup(str(rel))}"))
         if len(orphans) > 50:
             self.post_message(SystemLog(f"  … and {len(orphans) - 50} more."))
-
-    # ── DAT audit dry-run ─────────────────────────────────────────────────────
-
-    @work(exclusive=True, thread=True)
-    def run_bulk_dat_audit_dry_run(self) -> None:
-        """Preview what the DAT audit would rename/move without touching any files.
-
-        Runs the full hashing and DAT-lookup pass but skips all shutil.move calls.
-        Reports the planned renames to the log as [DRY-RUN] lines.
-        """
-        self.cancel_flag.clear()
-        # Re-use run_bulk_dat_audit with a dry_run flag stored on self.
-        # We set a flag here and read it inside run_bulk_dat_audit.
-        self.post_message(SystemLog(
-            "[bold cyan]DAT Audit Dry Run[/bold cyan] — no files will be moved."
-        ))
-        self._dat_dry_run_active = True
-        try:
-            # Call internal method directly since we can't call the worker from here
-            self._run_dat_audit_impl(dry_run=True)
-        finally:
-            self._dat_dry_run_active = False
-
-    def _run_dat_audit_impl(self, dry_run: bool = False) -> None:
-        """Shared core for run_bulk_dat_audit and dry-run variant.
-
-        When dry_run=True, planned renames are logged but shutil.move is NOT called
-        and no validation markers are written.
-        """
-        # This is a lightweight dispatch: the full audit logic lives in
-        # run_bulk_dat_audit.  For the dry-run path we post a clear header and
-        # re-use a summary-only scan rather than duplicating thousands of lines.
-        # A full implementation would factor the audit core into a shared method;
-        # for this feature-addition pass we log a summary that shows each file
-        # that WOULD be renamed along with expected new paths.
-        library = Path(self.state.settings['library_root'])
-        if not library.exists():
-            self.post_message(SystemLog("DAT Audit Dry Run: Library path not found.", True))
-            return
-
-        console_dirs = sorted(
-            d for d in library.iterdir()
-            if d.is_dir() and not d.name.startswith('.')
-        )
-        if not console_dirs:
-            self.post_message(SystemLog("DAT Audit Dry Run: No console folders found."))
-            return
-
-        planned_moves: list[tuple[Path, Path]] = []
-        for console_dir in console_dirs:
-            if self.cancel_flag.is_set():
-                break
-            console_name = console_dir.name
-            dat_dir  = DAT_CACHE_DIR / console_name
-            if not dat_dir.exists():
-                continue
-            dat_files = list(dat_dir.glob("*.dat"))
-            if not dat_files:
-                continue
-            dat_path = max(dat_files, key=lambda p: p.stat().st_mtime)
-            try:
-                dat_by_sha1: dict[str, dict[str, str]] = {}
-                ambiguous_sha1s: set[str] = set()
-                context = ET.iterparse(dat_path, events=('start', 'end'))
-                _, xml_root = next(context)
-                current_game = "Unknown"
-                for event, elem in context:
-                    if event == 'start' and elem.tag == 'game':
-                        current_game = elem.get('name', 'Unknown')
-                    elif event == 'end' and elem.tag == 'rom':
-                        sha1_val = elem.get('sha1')
-                        rom_name = elem.get('name')
-                        if sha1_val and rom_name:
-                            sha1_lower = sha1_val.lower()
-                            if sha1_lower in ambiguous_sha1s:
-                                pass
-                            elif sha1_lower in dat_by_sha1:
-                                ambiguous_sha1s.add(sha1_lower)
-                                del dat_by_sha1[sha1_lower]
-                            else:
-                                dat_by_sha1[sha1_lower] = {
-                                    "name": rom_name, "game": current_game
-                                }
-                        elem.clear()
-                    elif event == 'end' and elem.tag == 'game':
-                        xml_root.clear()
-            except Exception:
-                continue
-
-            # Load SHA-1 cache for this console (same logic as run_bulk_dat_audit)
-            sha1_cache_path = DAT_CACHE_DIR / console_name / ".sha1_cache.json"
-            sha1_cache: dict[str, dict[str, Any]] = {}
-            try:
-                if sha1_cache_path.exists():
-                    with open(sha1_cache_path, 'r', encoding='utf-8') as cf:
-                        loaded = json.load(cf)
-                    for k, v in loaded.items():
-                        p = Path(k)
-                        if p.is_absolute():
-                            try:
-                                rel = p.relative_to(console_dir).as_posix()
-                            except ValueError:
-                                continue
-                            sha1_cache[rel] = v
-                        else:
-                            sha1_cache[k] = v
-            except (json.JSONDecodeError, OSError):
-                sha1_cache = {}
-
-            for ext in _DAT_AUDITABLE_EXTS:
-                for file_path in console_dir.rglob(f'*{ext}'):
-                    try:
-                        stat = file_path.stat()
-                        key = file_path.relative_to(console_dir).as_posix()
-                        cached = sha1_cache.get(key)
-                        if (cached
-                                and cached.get("mtime") == stat.st_mtime
-                                and cached.get("size") == stat.st_size):
-                            file_hash = cached["sha1"]
-                        else:
-                            sha1_obj = hashlib.sha1(usedforsecurity=False)
-                            with open(file_path, 'rb') as fh:
-                                while chunk := fh.read(_HASH_CHUNK_BYTES):
-                                    sha1_obj.update(chunk)
-                            file_hash = sha1_obj.hexdigest().lower()
-
-                        if file_hash in ambiguous_sha1s:
-                            continue  # shared track — skip rename suggestion
-                        if file_hash in dat_by_sha1:
-                            expected_name = dat_by_sha1[file_hash]['name']
-                            expected_game = dat_by_sha1[file_hash]['game']
-                            if file_path.name != expected_name:
-                                clean_game = DISC_REGEX.sub('', expected_game).strip()
-                                if clean_game != expected_game:
-                                    correct_dir = console_dir / clean_game / expected_game
-                                else:
-                                    correct_dir = console_dir / expected_game
-                                correct_path = correct_dir / expected_name
-                                planned_moves.append((file_path, correct_path))
-                                self.post_message(SystemLog(
-                                    f"[cyan][DRY-RUN][/cyan] Would rename: "
-                                    f"[dim]{_escape_markup(str(file_path.relative_to(library)))}[/dim]"
-                                    f" → [bold]{_escape_markup(str(correct_path.relative_to(library)))}[/bold]"
-                                ))
-                    except Exception:
-                        continue
-
-        self.post_message(SystemLog(
-            f"[bold cyan]DAT Audit Dry Run complete[/bold cyan] — "
-            f"[bold]{len(planned_moves)}[/bold] file(s) would be renamed. "
-            "[dim]No files were changed.[/dim]"
-        ))
 
     # ── Library disk usage helper ─────────────────────────────────────────────
 
@@ -5697,6 +5603,11 @@ class MyrientTUI(App):
         for console_name, game_dir, status in targets:
             if str(game_dir) in existing_paths:
                 continue
+            # Clear status so the download worker doesn't fast-skip on a stale
+            # "validated" entry (can happen when _classify_game_dir correctly
+            # returns "incomplete" for an empty dir but lib_status JSON still
+            # carries the old "validated" value from a previous download).
+            self._lib_status.remove(game_dir)
             # Reconstruct the Myrient URL from the library directory structure.
             game_zip = game_dir.name + ".zip"
             game_url = BASE_URL + quote(console_name, safe="") + "/" + quote(game_zip, safe="")
