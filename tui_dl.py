@@ -41,8 +41,8 @@ from textual.message import Message
 from textual.screen import ModalScreen
 from textual.timer import Timer
 from textual.widgets import (
-    Button, DataTable, Footer, Header, Input,
-    Label, ListItem, ListView, ProgressBar, RichLog, Select,
+    Button, Collapsible, DataTable, Footer, Header, Input,
+    Label, ListItem, ListView, ProgressBar, RichLog, Rule, Select,
     Switch, TabbedContent, TabPane, Tree
 )
 
@@ -699,9 +699,12 @@ class LibraryProgress(Message):
 
 class LibraryTreeReady(Message):
     """Carries the fully-built library structure to the main thread for Tree rendering."""
-    def __init__(self, structure: dict[str, tuple[Path, list[tuple[Path, str]]]], library_path: Path):
+    def __init__(self, structure: dict[str, tuple[Path, list[tuple[Path, str]]]], library_path: Path,
+                 disk_usage: dict[str, int] | None = None):
         self.structure = structure
         self.library_path = library_path
+        # Pre-computed disk usage per console (computed on the worker thread).
+        self.disk_usage: dict[str, int] = disk_usage or {}
         super().__init__()
 
 class BatchComplete(Message):
@@ -967,11 +970,10 @@ class MyrientTUI(App):
     #queue-table { height: 1fr; border: solid #1c2333; background: #0d1117; }
     .queue-toolbar  { height: auto; margin-bottom: 1; layout: vertical; }
     .queue-controls { height: auto; layout: horizontal; margin-top: 1; align: left middle; }
-    .queue-settings-row {
+    /* Queue settings collapsible replaces old .queue-settings-row */
+    #queue-settings-collapsible {
         height: auto;
         margin-top: 1;
-        border-top: dashed #1c2333;
-        padding-top: 1;
     }
 
     /* Progress panel */
@@ -1049,24 +1051,11 @@ class MyrientTUI(App):
     #lib-status-bar ProgressBar { width: 35%; display: none; }
     #lib-progress-bar { display: none; }
 
-    /* ── ◎ SETTINGS pane ──────────────────────────────────────────── */
-    #settings-layout { height: 1fr; layout: horizontal; }
-    #settings-left {
-        width: 50%;
-        height: 1fr;
-        background: #080c12;
-        border-right: solid #1c2333;
-        padding: 1 2;
-        overflow-y: auto;
-        layout: vertical;
-    }
-    #settings-right {
-        width: 1fr;
-        height: 1fr;
-        padding: 1 2;
-        overflow-y: auto;
-        layout: vertical;
-    }
+    /* ── ◎ SETTINGS pane (TabbedContent layout) ─────────────────── */
+    #settings-tabs { height: 1fr; }
+    #settings-tabs > ContentSwitcher { height: 1fr; }
+    TabPane { padding: 0; }
+    TabPane > VerticalScroll { height: 1fr; padding: 1 2; }
     .setting-label { margin-top: 1; color: #9aa0aa; }
     .filter-table  {
         height: 8;
@@ -1079,10 +1068,33 @@ class MyrientTUI(App):
     .preset-row { height: auto; margin-bottom: 1; layout: horizontal; }
     Switch { background: transparent; }
 
+    /* ── Collapsible widget styling ───────────────────────────────── */
+    Collapsible { background: transparent; padding: 0; margin: 0 0 1 0; }
+    CollapsibleTitle {
+        background: #080c12;
+        color: #9aa0aa;
+        border: solid #1c2333;
+        padding: 0 1;
+        height: 3;
+    }
+    CollapsibleTitle:hover { background: #0f1520; color: #e6edf3; }
+    CollapsibleTitle:focus { border: solid #30415e; }
+
+    /* ── TabbedContent tab bar styling ────────────────────────────── */
+    Tabs { background: #080c12; border-bottom: solid #1c2333; }
+    Tab { background: transparent; color: #3d4451; padding: 0 2; height: 3; }
+    Tab:hover { color: #9aa0aa; }
+    Tab.-active { color: #e6b73e; border-bottom: thick #e6b73e; }
+    Tab:focus { text-style: bold; }
+
+    /* ── Rule (horizontal divider) ────────────────────────────────── */
+    Rule { color: #1c2333; margin: 1 0; }
+
     /* ── ≡ LOGS pane ──────────────────────────────────────────────── */
     #logs-layout { height: 1fr; layout: vertical; }
     #log-toolbar {
-        height: 3;
+        height: auto;
+        min-height: 3;
         layout: horizontal;
         margin-bottom: 1;
         align: left middle;
@@ -1108,9 +1120,7 @@ class MyrientTUI(App):
         color: #9aa0aa;
     }
     #sessions-divider {
-        height: 1;
         color: #1c2333;
-        border-top: solid #1c2333;
         margin: 0;
     }
     #sessions-layout { height: 30%; min-height: 8; layout: horizontal; }
@@ -1728,216 +1738,11 @@ class MyrientTUI(App):
 
             # ── Content area: one pane per section ───────────────────────
             with Vertical(id="content-area"):
-
-                # ── ◈ Browse ─────────────────────────────────────────────
-                with Vertical(id="pane-browse", classes="content-pane"):
-                    with Horizontal(id="browse-layout"):
-                        with Vertical(id="browse-left"):
-                            yield Label("Consoles", classes="section-header")
-                            yield Input(
-                                placeholder="  filter consoles…",
-                                id="search-consoles",
-                                classes="search-bar",
-                            )
-                            yield ListView(id="console-list")
-
-                        with Vertical(id="browse-right"):
-                            yield Label("", id="breadcrumb")
-                            yield GameSearchInput(
-                                placeholder="  search games…",
-                                id="search-games",
-                                classes="search-bar",
-                            )
-                            yield DataTable(id="game-list", cursor_type="row", zebra_stripes=False)
-                            with Horizontal(classes="browse-actions"):
-                                yield Button("▸ Queue Selected", id="btn-add-queue", variant="success")
-                                yield Button("⊠ Select All",    id="btn-select-all")
-                                yield Button("↺ Refresh",       id="btn-refresh-games")
-                                yield Label("", id="game-selection-count")
-                            yield Label(
-                                "[dim]↑↓[/dim] navigate  [dim]Space/Tab[/dim] select  "
-                                "[dim]Enter/q[/dim] queue  [dim]?[/dim] help",
-                                classes="hint-bar",
-                            )
-
-                # ── ▶ Downloads ───────────────────────────────────────────
-                with Vertical(id="pane-downloads", classes="content-pane"):
-                    with Horizontal(id="downloads-layout"):
-                        with Vertical(id="queue-panel"):
-                            yield Label("Queue", classes="section-header")
-                            with Vertical(classes="queue-toolbar"):
-                                yield Select([], id="queue-select", prompt="active profile…")
-                                yield Input(placeholder="new profile name…", id="input-new-queue")
-                                with Horizontal(classes="btn-row"):
-                                    yield Button("Create", id="btn-create-queue", variant="success")
-                                    yield Button("Delete", id="btn-delete-queue", variant="error")
-                            yield DataTable(id="queue-table")
-                            with Horizontal(classes="queue-controls"):
-                                yield Button("▲", id="btn-queue-up",   classes="reorder-btn")
-                                yield Button("▼", id="btn-queue-down", classes="reorder-btn")
-                                yield Button("Remove",  id="btn-remove-items", variant="warning")
-                                yield Button("▶ Start", id="btn-start-dl",    variant="primary")
-                                yield Button("■ Stop",  id="btn-pause-dl",    variant="error")
-                            with Vertical(classes="queue-settings-row"):
-                                yield Label("[dim]Per-queue speed limit (MB/s, 0=unlimited)[/dim]")
-                                yield Input(placeholder="0", id="input-queue-speed-limit")
-                                yield Button("Apply to Queue", id="btn-apply-queue-settings")
-                            yield Label(
-                                "[dim]Ctrl+J[/dim] jump to console  [dim]?[/dim] help",
-                                classes="hint-bar",
-                            )
-
-                        with Vertical(id="progress-panel"):
-                            yield Label("▸ DOWNLOAD PROGRESS", id="lbl-global-progress")
-                            yield ProgressBar(id="global-progress", show_eta=True)
-                            with VerticalScroll(id="progress-area"):
-                                with Container(id="progress-grid"):
-                                    pass
-
-                # ── ⊞ Library ─────────────────────────────────────────────
-                with Vertical(id="pane-library", classes="content-pane"):
-                    with Vertical(id="lib-tab-wrapper"):
-                        with Horizontal(id="library-main"):
-                            with Vertical(id="lib-tree-panel"):
-                                yield Label("Library", classes="section-header")
-                                yield Label("", id="lib-summary-bar")
-                                yield Tree("Library", id="lib-tree")
-                                with Horizontal(classes="btn-row"):
-                                    yield Button("✕ Delete", id="btn-lib-delete", variant="error")
-                            with VerticalScroll(id="lib-ops-panel"):
-                                yield Label("Operations", classes="section-header")
-                                yield Button("Scan & Organize",       id="btn-lib-organize",      classes="ops-btn")
-                                yield Button("Verify vs. Redump DAT", id="btn-lib-dat-audit",      classes="ops-btn")
-                                yield Button("Convert to CHD",        id="btn-lib-convert",        classes="ops-btn")
-                                yield Button("CHD → Original",        id="btn-lib-chd-to-orig",    classes="ops-btn")
-                                yield Button("PS2 Master Disc Patch", id="btn-ps2-md-patch",       classes="ops-btn")
-                                yield Button("↺ Refresh Status",      id="btn-lib-refresh-status", classes="ops-btn")
-                                yield Button("Re-queue Failures",     id="btn-requeue-failed",     classes="ops-btn")
-                                yield Button("Re-queue Console",      id="btn-requeue-console",    classes="ops-btn")
-                                yield Button("Find Orphaned Files",   id="btn-lib-orphans",        classes="ops-btn")
-                                yield Label("[dim]DAT Audit[/dim]", classes="setting-label")
-                                with Horizontal(classes="btn-row"):
-                                    yield Label("Dry Run", classes="setting-label")
-                                    yield Switch(value=False, id="sw-dat-dry-run")
-                                yield Label(
-                                    "[bold green]✓[/] Validated  "
-                                    "[bold red]✗[/] Corrupted  "
-                                    "[yellow]~[/] Incomplete",
-                                    classes="legend-label",
-                                )
-                        with Container(id="lib-status-bar"):
-                            yield Label("Idle", id="lib-status-label")
-                            yield ProgressBar(id="lib-progress-bar", show_eta=True)
-
-                # ── ◎ Settings ────────────────────────────────────────────
-                with Vertical(id="pane-settings", classes="content-pane"):
-                    with Horizontal(id="settings-layout"):
-                        with VerticalScroll(id="settings-left"):
-                            yield Label("Paths & Engine", classes="section-header")
-                            yield Label("Library root path", classes="setting-label")
-                            yield Input(
-                                value=self.state.settings["library_root"],
-                                id="set-lib-path",
-                            )
-                            yield Label(
-                                "Max concurrent downloads  [dim](1–10)[/dim]",
-                                classes="setting-label",
-                            )
-                            yield Input(
-                                value=str(self.state.settings["max_concurrent"]),
-                                id="set-threads",
-                            )
-                            yield Label(
-                                "Global speed limit per download  [dim](MB/s, 0=unlimited)[/dim]",
-                                classes="setting-label",
-                            )
-                            yield Input(
-                                value=str(self.state.settings.get("speed_limit_mbps", 0)),
-                                id="set-speed-limit",
-                            )
-                            yield Label(
-                                "DAT cache TTL  [dim](hours, 0=always refresh)[/dim]",
-                                classes="setting-label",
-                            )
-                            yield Input(
-                                value=str(self.state.settings.get("dat_cache_ttl_hours", 168)),
-                                id="set-dat-ttl",
-                            )
-                            yield Label("Auto-convert to CHD after download", classes="setting-label")
-                            yield Switch(
-                                value=self.state.settings.get("auto_convert_chd", False),
-                                id="set-auto-chd",
-                            )
-                            yield Label(
-                                "Watch library for changes  [dim](requires watchdog)[/dim]",
-                                classes="setting-label",
-                            )
-                            yield Switch(
-                                value=self.state.settings.get("watch_library", False),
-                                id="set-watch-library",
-                            )
-                            yield Label(
-                                "Desktop notification on batch complete",
-                                classes="setting-label",
-                            )
-                            yield Switch(
-                                value=self.state.settings.get("notify_on_batch_complete", True),
-                                id="set-notify-batch",
-                            )
-                            yield Button("▸ Save Settings", id="btn-save-settings", variant="success")
-                            yield Label("Tools", classes="section-header")
-                            yield Label(
-                                "[dim]Install or locate conversion / patching tools[/dim]",
-                                classes="setting-label",
-                            )
-                            yield Button("Setup chdman",         id="btn-setup-chdman",    classes="ops-btn")
-                            yield Button("Setup PS2 Patcher",    id="btn-setup-ps2mdp",    classes="ops-btn")
-                            yield Button("Prefetch All Consoles",id="btn-prefetch-consoles",classes="ops-btn")
-
-                        with VerticalScroll(id="settings-right"):
-                            yield Label("Regional Include Filter", classes="section-header")
-                            yield Label(
-                                "[dim]Only show games matching these regions  (empty = show all)[/dim]",
-                                classes="setting-label",
-                            )
-                            yield DataTable(id="set-include", classes="filter-table")
-                            yield Label("Type Exclude Filter", classes="section-header")
-                            yield Label(
-                                "[dim]Hide games matching these tags[/dim]",
-                                classes="setting-label",
-                            )
-                            yield DataTable(id="set-exclude", classes="filter-table")
-                            yield Button(
-                                "✕ Clear Filters",
-                                id="btn-clear-filters",
-                                variant="warning",
-                                classes="ops-btn",
-                            )
-                            yield Label("Filter Presets", classes="section-header")
-                            yield Label(
-                                "[dim]Save/load current filter combination as a named preset[/dim]",
-                                classes="setting-label",
-                            )
-                            yield Input(placeholder="preset name…", id="input-preset-name")
-                            with Horizontal(classes="preset-row"):
-                                yield Button("Save Preset",  id="btn-save-preset", variant="success")
-                                yield Button("Load Preset",  id="btn-load-preset", variant="primary")
-                                yield Button("Del Preset",   id="btn-del-preset",  variant="error")
-                            yield Select([], id="preset-select", prompt="choose preset…")
-
-                # ── ≡ Logs ────────────────────────────────────────────────
-                with Vertical(id="pane-logs", classes="content-pane"):
-                    with Vertical(id="logs-layout"):
-                        with Horizontal(id="log-toolbar"):
-                            yield Button("All",   id="log-filter-all", classes="log-filter-btn")
-                            yield Button("Errors",id="log-filter-err", classes="log-filter-btn")
-                            yield Input(placeholder="  search logs…", id="log-search")
-                            yield Button("↺ Sessions", id="btn-refresh-session-logs")
-                        yield RichLog(id="sys-log", markup=True, wrap=True, max_lines=2000)
-                        yield Label("── Session Files ─────────────────────────────────────────", id="sessions-divider")
-                        with Horizontal(id="sessions-layout"):
-                            yield ListView(id="session-log-list")
-                            yield RichLog(id="session-log-view", markup=False, wrap=True, max_lines=5000)
+                yield BrowsePane(id="pane-browse", classes="content-pane")
+                yield DownloadsPane(id="pane-downloads", classes="content-pane")
+                yield LibraryPane(id="pane-library", classes="content-pane")
+                yield SettingsPane(id="pane-settings", classes="content-pane")
+                yield LogsPane(id="pane-logs", classes="content-pane")
 
         # ── Global status bar (always visible, above Footer) ─────────────
         with Horizontal(id="global-statusbar"):
@@ -2315,9 +2120,9 @@ class MyrientTUI(App):
                 n_ok  = counts["validated"]
                 n_bad = counts["corrupted"]
                 n_inc = counts["incomplete"]
-                # Compute disk usage inline — cheap on modern SSDs, avoids a
-                # second full tree walk.  The label stays readable up to TB scale.
-                disk_bytes = MyrientTUI._console_disk_usage(console_path)
+                # Use pre-computed disk usage from the worker thread — avoids
+                # blocking the main thread with heavy I/O on large libraries.
+                disk_bytes = message.disk_usage.get(console_name, 0)
                 console_node = tree.root.add(
                     _console_label(console_name, n_ok, n_bad, n_inc, disk_bytes),
                     data=console_path,
@@ -3950,6 +3755,7 @@ class MyrientTUI(App):
 
     @work(exclusive=True, thread=True)
     def run_lib_organize(self) -> None:
+        self.cancel_flag.clear()
         self.post_message(SystemLog("Library Scan: Building target list..."))
         library = Path(self.state.settings['library_root'])
 
@@ -4950,6 +4756,7 @@ class MyrientTUI(App):
         Runs the full hashing and DAT-lookup pass but skips all shutil.move calls.
         Reports the planned renames to the log as [DRY-RUN] lines.
         """
+        self.cancel_flag.clear()
         # Re-use run_bulk_dat_audit with a dry_run flag stored on self.
         # We set a flag here and read it inside run_bulk_dat_audit.
         self.post_message(SystemLog(
@@ -5100,9 +4907,16 @@ class MyrientTUI(App):
         except PermissionError:
             return None
 
-        # Empty directory = download started but no files arrived yet
+        # Empty directory: if it contains subdirectories it is likely a
+        # multi-disc grouping folder — return None so the walker descends.
+        # Only treat it as "incomplete" when it has no subdirs at all (i.e.
+        # a download started but no files arrived yet).
         if not dir_files:
-            return "incomplete"
+            try:
+                has_subdirs = any(e.is_dir() for e in d.iterdir() if not e.name.startswith('.'))
+            except PermissionError:
+                has_subdirs = False
+            return None if has_subdirs else "incomplete"
 
         # _GAME_EXTS is a module-level frozenset — O(1) membership test
         has_game = has_zip = False
@@ -5181,7 +4995,13 @@ class MyrientTUI(App):
                 structure[console_name] = (library / console_name, [])
             structure[console_name][1].append((game_dir, status))
 
-        self.post_message(LibraryTreeReady(structure, library))
+        # Pre-compute disk usage per console on this worker thread so the main
+        # thread's on_library_tree_ready handler never blocks on heavy I/O.
+        disk_usage: dict[str, int] = {}
+        for console_name, (console_path, _) in structure.items():
+            disk_usage[console_name] = self._console_disk_usage(console_path)
+
+        self.post_message(LibraryTreeReady(structure, library, disk_usage))
 
     @work(exclusive=True, thread=True)
     def requeue_failed_games(self) -> None:
