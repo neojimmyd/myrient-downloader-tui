@@ -275,6 +275,18 @@ _SESSION_LOG_MAX_FILES: int = 30
 # output parsing.  Allocated once instead of copying os.environ per invocation.
 _WGET_ENV: dict[str, str] = {**os.environ, "LC_ALL": "C"}
 
+# Pre-built kwargs for subprocess.Popen that lower process priority so that
+# CPU-heavy children (chdman) don't starve the rest of the system.
+if _OS == "windows":
+    _LOW_PRIO_POPEN: dict[str, Any] = {"creationflags": 0x00004000}  # BELOW_NORMAL
+else:
+    def _nice_preexec() -> None:
+        try:
+            os.nice(10)
+        except OSError:
+            pass
+    _LOW_PRIO_POPEN: dict[str, Any] = {"preexec_fn": _nice_preexec}
+
 # Frozenset for O(1) membership test in on_library_progress
 _PROGRESS_DONE_STATES: frozenset[str] = frozenset({"done", "complete", "failed"})
 
@@ -364,7 +376,7 @@ class ConfigManager:
 
     def _load(self) -> dict[str, Any]:
         base: dict[str, Any] = {
-            "settings": DEFAULT_SETTINGS.copy(),
+            "settings": json.loads(json.dumps(DEFAULT_SETTINGS)),
             "active_queue": "default",
             "queues": {"default": []}
         }
@@ -380,7 +392,7 @@ class ConfigManager:
             try:
                 with open(self.config_path, 'r', encoding="utf-8") as file:
                     disk_data = json.load(file)
-                base["settings"] = {**DEFAULT_SETTINGS, **disk_data.get("settings", {})}
+                base["settings"] = {**json.loads(json.dumps(DEFAULT_SETTINGS)), **disk_data.get("settings", {})}
                 base["queues"] = disk_data.get("queues", {"default": []})
                 base["active_queue"] = disk_data.get("active_queue", "default")
                 if base["active_queue"] not in base["queues"]:
@@ -1071,11 +1083,13 @@ class Toolchain:
         self.chd_lock          = chd_lock
         self.chdman_path: str  = ""
         self.ps2mdp_path: str  = ""
-        # CPU core count — kept for informational logging only.
-        # chdman createcd/createdvd do NOT accept --numprocessors or --threads;
-        # only createhd/createraw do.  We no longer pass it on the command line.
+        # Limit chdman to half the available cores so it doesn't saturate
+        # every core with LZMA compression and freeze the system.
         _cpu = os.cpu_count()
-        self.chd_cores: int    = max(1, _cpu - 1) if _cpu else 1
+        self.chd_cores: int    = max(1, _cpu // 2) if _cpu else 1
+        # Serialise concurrent chdman invocations (e.g. auto-CHD during
+        # parallel downloads) so only one runs at a time.
+        self._chd_sem          = threading.Semaphore(1)
 
     # ── Binary discovery ──────────────────────────────────────────────────────
 
@@ -1326,12 +1340,15 @@ class Toolchain:
             for subcmd in subcommands:
                 if self.cancel_flag.is_set():
                     return converted, failed
+                self._chd_sem.acquire()
                 try:
                     proc = subprocess.Popen(
                         [chdman, subcmd,
                          "-i", str(file_path),
-                         "-o", str(chd_output)],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                         "-o", str(chd_output),
+                         "--numprocessors", str(self.chd_cores)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                        **_LOW_PRIO_POPEN,
                     )
                     self._reg_proc(proc)
 
@@ -1397,6 +1414,8 @@ class Toolchain:
                 except Exception as e:
                     self._post(SystemLog(f"chdman error ({file_path.name}): {e}", True))
                     break
+                finally:
+                    self._chd_sem.release()
 
             if not succeeded:
                 failed += 1
@@ -2269,6 +2288,12 @@ class MyrientTUI(App):
         contains DVD_Sectors.Bin.
         Originals are never deleted.
         """
+        if self.engine_running:
+            self.post_message(SystemLog(
+                "[bold yellow]Cannot start while downloads are active.[/bold yellow] "
+                "Pause the download engine first.", True
+            ))
+            return
         self.cancel_flag.clear()
         # Resolve locally — same race-safety rationale as run_lib_convert.
         ps2mdp = self.toolchain.ps2mdp_path or Toolchain.find_ps2mdp()
@@ -3556,15 +3581,36 @@ class MyrientTUI(App):
             def check_delete(confirm: bool) -> None:
                 if confirm and target_path:
                     try:
+                        library = Path(self.state.settings['library_root'])
                         # Remove status entries for the deleted path (and all children
                         # if it's a console dir) before wiping from disk, so the JSON
                         # store doesn't accumulate stale entries.
                         self._lib_status.remove(target_path)
-                        self._lib_status.prune(Path(self.state.settings['library_root']))
+                        self._lib_status.prune(library)
                         if target_path.is_dir():
                             shutil.rmtree(target_path)
                         else:
                             target_path.unlink()
+
+                        # Clean up empty parent grouping folder (multi-disc case):
+                        # when the last disc subfolder is deleted, the parent folder
+                        # becomes an empty orphan that would be classified as
+                        # "incomplete".  Remove it if it's now empty and is NOT a
+                        # console-level or library-level directory.
+                        parent = target_path.parent
+                        if (parent.exists()
+                                and parent != library
+                                and parent.parent != library):
+                            try:
+                                if not any(parent.iterdir()):
+                                    self._lib_status.remove(parent)
+                                    parent.rmdir()
+                                    self.post_message(SystemLog(
+                                        f"Cleaned up empty grouping folder: {parent.name}"
+                                    ))
+                            except OSError:
+                                pass
+
                         self.run_lib_status_scan()
                     except Exception as err:
                         self.notify(f"Error during deletion: {err}", severity="error")
@@ -4423,11 +4469,21 @@ class MyrientTUI(App):
 
     @work(exclusive=True, thread=True)
     def run_lib_organize(self) -> None:
+        if self.engine_running:
+            self.post_message(SystemLog(
+                "[bold yellow]Cannot start while downloads are active.[/bold yellow] "
+                "Pause the download engine first.", True
+            ))
+            return
         self.cancel_flag.clear()
         self.post_message(SystemLog("Library Scan: Building target list..."))
         library = Path(self.state.settings['library_root'])
 
         targets = []
+        # Collect empty orphaned directories for cleanup (e.g. multi-disc
+        # parent folders left behind after all disc subfolders were deleted).
+        empty_dirs: list[Path] = []
+
         if library.exists():
             try:
                 console_dirs = [d for d in library.iterdir()
@@ -4437,27 +4493,37 @@ class MyrientTUI(App):
 
             for console_dir in console_dirs:
                 try:
-                    game_entries = console_dir.iterdir()   # direct iteration — no list allocation
+                    game_entries = list(console_dir.iterdir())
                 except PermissionError:
                     continue
                 for game_dir in game_entries:
-                    if game_dir.is_dir() and not game_dir.name.startswith('.'):
-                        base_name = DISC_REGEX.sub('', game_dir.name).strip()
-                        if base_name != game_dir.name:
-                            targets.append((game_dir, console_dir / base_name))
-        
-        total_ops = len(targets)
+                    if not game_dir.is_dir() or game_dir.name.startswith('.'):
+                        continue
+                    base_name = DISC_REGEX.sub('', game_dir.name).strip()
+                    if base_name != game_dir.name:
+                        targets.append((game_dir, console_dir / base_name))
+                    else:
+                        # Check if this is an empty orphaned folder
+                        try:
+                            if not any(game_dir.iterdir()):
+                                empty_dirs.append(game_dir)
+                        except PermissionError:
+                            pass
+
+        total_ops = len(targets) + len(empty_dirs)
         if total_ops == 0:
             self.post_message(SystemLog("Library Scan: No valid targets found. (Library is already organized)"))
             self.post_message(LibraryProgress("Organize", "Done", 100, 100))
             return
-            
-        moved = 0
-        for i, (game_dir, parent_dir) in enumerate(targets, 1):
+
+        changed = 0
+        step = 0
+        for game_dir, parent_dir in targets:
+            step += 1
             if self.cancel_flag.is_set():
                 self.post_message(SystemLog("[yellow]Organize cancelled.[/]"))
                 break
-            self.post_message(LibraryProgress(f"Organizing ({i}/{total_ops})", game_dir.name, i, total_ops))
+            self.post_message(LibraryProgress(f"Organizing ({step}/{total_ops})", game_dir.name, step, total_ops))
             parent_dir.mkdir(parents=True, exist_ok=True)
             new_location = parent_dir / game_dir.name
             try:
@@ -4468,15 +4534,31 @@ class MyrientTUI(App):
                 self._lib_status.remove(game_dir)
                 if old_status in ("validated", "corrupted"):
                     self._lib_status.set_status(new_location, old_status)
-                moved += 1
+                changed += 1
             except Exception as e:
                 self.post_message(SystemLog(f"Move failed [{game_dir.name}]: {e}", True))
 
+        # Remove empty orphaned directories
+        for empty_dir in empty_dirs:
+            step += 1
+            if self.cancel_flag.is_set():
+                break
+            self.post_message(LibraryProgress(f"Cleanup ({step}/{total_ops})", empty_dir.name, step, total_ops))
+            try:
+                # Re-check emptiness in case something changed since the scan
+                if empty_dir.exists() and not any(empty_dir.iterdir()):
+                    self._lib_status.remove(empty_dir)
+                    empty_dir.rmdir()
+                    self.post_message(SystemLog(f"Removed empty folder: {empty_dir.name}"))
+                    changed += 1
+            except OSError:
+                pass
+
         self.post_message(LibraryProgress("Organize", "Complete", total_ops, total_ops))
-        if moved:
+        if changed:
             # Only rescan if the directory tree actually changed
             self.run_lib_status_scan()
-        self.post_message(SystemLog(f"Clean-up Complete. {moved} folder(s) moved."))
+        self.post_message(SystemLog(f"Clean-up Complete. {changed} folder(s) organized/removed."))
 
     @work(exclusive=True, thread=True)
     def run_bulk_dat_audit(self) -> None:
@@ -4491,6 +4573,12 @@ class MyrientTUI(App):
         When the dry-run switch (sw-dat-dry-run) is enabled, planned renames are
         logged but no files are moved and no status markers are written.
         """
+        if self.engine_running:
+            self.post_message(SystemLog(
+                "[bold yellow]Cannot start while downloads are active.[/bold yellow] "
+                "Pause the download engine first.", True
+            ))
+            return
         self.cancel_flag.clear()
         # Read the dry-run setting from the persisted config (thread-safe) rather
         # than querying the Switch widget, which is only safe on the main thread.
@@ -4929,6 +5017,12 @@ class MyrientTUI(App):
         a game directory (convert that one game), or None / the library root
         to convert everything.
         """
+        if self.engine_running:
+            self.post_message(SystemLog(
+                "[bold yellow]Cannot start while downloads are active.[/bold yellow] "
+                "Pause the download engine first.", True
+            ))
+            return
         self.cancel_flag.clear()
         # Resolve locally — worker threads must not write back to toolchain.chdman_path
         # since concurrent @work threads could race on that shared attribute.
@@ -5030,6 +5124,12 @@ class MyrientTUI(App):
         then falls back to extracthd (→ .img).  Source .chd is removed only on
         confirmed success.
         """
+        if self.engine_running:
+            self.post_message(SystemLog(
+                "[bold yellow]Cannot start while downloads are active.[/bold yellow] "
+                "Pause the download engine first.", True
+            ))
+            return
         self.cancel_flag.clear()
         # Resolve locally — same race-safety rationale as run_lib_convert.
         chdman = self.toolchain.chdman_path or Toolchain.find_chdman()
@@ -5087,7 +5187,8 @@ class MyrientTUI(App):
                         [chdman, subcommand,
                          "-i", str(chd_path),
                          "-o", str(output_file)],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                        **_LOW_PRIO_POPEN,
                     )
                     self._register_process(proc)
                     try:
@@ -5144,7 +5245,12 @@ class MyrientTUI(App):
     # ── Batch completion notification ─────────────────────────────────────────
 
     def on_batch_complete(self, message: BatchComplete) -> None:
-        """Send desktop notification when a batch finishes if the setting is enabled."""
+        """Refresh the library tree and send a desktop notification when a batch finishes."""
+        # Refresh the library tree so newly downloaded games (including
+        # multi-disc titles) reflect their current status immediately.
+        if message.succeeded:
+            self.run_lib_status_scan()
+
         if not self.state.settings.get("notify_on_batch_complete", True):
             return
         title = "Myrient: Downloads Finished"
@@ -5403,11 +5509,20 @@ class MyrientTUI(App):
                         # Files directly inside console dir (not in a game subdir) = orphaned
                         orphans.append(entry)
                     elif entry.is_dir() and not entry.name.startswith('.'):
-                        # Game dir not in any known queue, not classified by lib_status → check
                         status = self._classify_game_dir(entry, self._lib_status)
                         if status is None and entry not in queued_dirs:
-                            # Not a recognised game dir and not queued
-                            orphans.append(entry)
+                            # Check if this is a multi-disc grouping folder with
+                            # game-containing subdirectories before flagging as orphaned.
+                            try:
+                                has_game_subdir = any(
+                                    self._classify_game_dir(sub, self._lib_status) is not None
+                                    for sub in entry.iterdir()
+                                    if sub.is_dir() and not sub.name.startswith('.')
+                                )
+                            except PermissionError:
+                                has_game_subdir = False
+                            if not has_game_subdir:
+                                orphans.append(entry)
             except PermissionError:
                 continue
 
@@ -5464,8 +5579,11 @@ class MyrientTUI(App):
         (not a recognised game dir — caller should skip it).
         Status is read from *lib_status* — no marker files are checked.
 
-        An empty directory is treated as ``'incomplete'`` because it was most
-        likely created by a download that was interrupted before any files landed.
+        A completely empty directory (no files *and* no subdirs) returns
+        ``None`` — it is either an orphaned multi-disc grouping folder or a
+        download that was interrupted before any data landed.  In both cases
+        the directory is not a recognisable game and should be invisible in
+        the library tree.  ``run_lib_organize`` cleans these up on request.
         """
         try:
             dir_files = [f for f in d.iterdir() if f.is_file() and not f.name.startswith('.')]
@@ -5474,14 +5592,10 @@ class MyrientTUI(App):
 
         # Empty directory: if it contains subdirectories it is likely a
         # multi-disc grouping folder — return None so the walker descends.
-        # Only treat it as "incomplete" when it has no subdirs at all (i.e.
-        # a download started but no files arrived yet).
+        # If it has NO subdirs either, it is an orphaned/interrupted dir —
+        # also return None so it doesn't pollute the tree as "incomplete".
         if not dir_files:
-            try:
-                has_subdirs = any(e.is_dir() for e in d.iterdir() if not e.name.startswith('.'))
-            except PermissionError:
-                has_subdirs = False
-            return None if has_subdirs else "incomplete"
+            return None
 
         # _GAME_EXTS is a module-level frozenset — O(1) membership test
         has_game = has_zip = False
@@ -5568,17 +5682,84 @@ class MyrientTUI(App):
 
         self.post_message(LibraryTreeReady(structure, library, disk_usage))
 
+    def _find_disc_variants(self, console_name: str, base_name: str) -> list[GameItem]:
+        """Scrape the console page on Myrient and return disc-specific entries
+        whose base name (with the disc suffix stripped) matches *base_name*.
+
+        Used by the requeue methods to expand multi-disc parent folders into
+        individual per-disc queue items.
+        """
+        console_url = BASE_URL + quote(console_name, safe="") + "/"
+        all_games = self.scraper.scrape_links(console_url)
+        variants: list[GameItem] = []
+        for g in all_games:
+            name: str = g["name"]  # e.g. "Resident Evil 2 (USA) (Disc 1).zip"
+            if not name.lower().endswith(".zip"):
+                continue
+            folder_name = name[:-4]  # strip .zip
+            disc_base = DISC_REGEX.sub("", folder_name).strip()
+            if disc_base == base_name and DISC_REGEX.search(folder_name):
+                variants.append(g)  # type: ignore[arg-type]
+        return variants
+
+    def _queue_disc_variants(
+        self,
+        console_name: str,
+        game_dir: Path,
+        status: str,
+        library: Path,
+        current_queue: list[QueueItem],
+        existing_paths: set[str],
+        include_status_label: bool = False,
+    ) -> int:
+        """Expand a multi-disc parent *game_dir* into individual disc queue items.
+
+        Returns the number of items added.  Mutates *current_queue* and
+        *existing_paths* in place.
+        """
+        variants = self._find_disc_variants(console_name, game_dir.name)
+        if not variants:
+            return 0
+
+        added = 0
+        console_url = BASE_URL + quote(console_name, safe="") + "/"
+        for g in variants:
+            disc_folder = g["name"][:-4]  # strip .zip
+            disc_dest = library / console_name / game_dir.name / disc_folder
+            if str(disc_dest) in existing_paths:
+                continue
+            self._lib_status.remove(disc_dest)
+            disc_url = urljoin(console_url, g["url_part"])
+            label = f"{console_name} / {g['name']}"
+            if include_status_label:
+                plain = "corrupted" if status == "corrupted" else "incomplete"
+                label += f" ({plain})"
+            current_queue.append({
+                "id":        f"dl_{uuid.uuid4().hex[:8]}",
+                "name":      label,
+                "game_url":  disc_url,
+                "dest_path": str(disc_dest),
+                "size_str":  g.get("size_str", "N/A"),
+            })
+            existing_paths.add(str(disc_dest))
+            added += 1
+
+        # Clean up the empty parent folder now that disc items are queued
+        try:
+            if game_dir.exists() and not any(game_dir.iterdir()):
+                game_dir.rmdir()
+        except OSError:
+            pass
+
+        return added
+
     @work(exclusive=True, thread=True)
     def requeue_failed_games(self) -> None:
         """Finds all corrupted and incomplete game dirs and adds them to the active download queue.
 
-        .. note:: URL reconstruction
-            The Myrient download URL is rebuilt from ``console_name / game_dir.name + '.zip'``.
-            This works correctly as long as the directory name on disk matches the Myrient
-            filename exactly (which is true for all downloads made by this app).  If a game
-            directory was renamed manually after download, the reconstructed URL will 404.
-            A future improvement would store the original ``game_url`` in the lib-status JSON
-            so this step is not needed.
+        Multi-disc parent folders (e.g. ``Resident Evil 2 (USA)/`` with no disc
+        subfolders) are detected automatically: the console page is scraped to
+        find matching disc entries and each disc is queued individually.
         """
         library = Path(self.state.settings['library_root'])
         if not library.exists():
@@ -5608,6 +5789,25 @@ class MyrientTUI(App):
             # returns "incomplete" for an empty dir but lib_status JSON still
             # carries the old "validated" value from a previous download).
             self._lib_status.remove(game_dir)
+
+            # ── Multi-disc parent detection ────────────────────────────────
+            # If the dir name has no disc suffix, it may be a grouping folder
+            # whose disc subfolders were deleted.  Scrape the console page to
+            # find individual disc zips and queue each one.
+            if DISC_REGEX.search(game_dir.name) is None:
+                disc_added = self._queue_disc_variants(
+                    console_name, game_dir, status, library,
+                    current_queue, existing_paths, include_status_label=True,
+                )
+                if disc_added:
+                    added += disc_added
+                    if status == "corrupted":
+                        n_corrupted += disc_added
+                    else:
+                        n_incomplete += disc_added
+                    continue
+                # No disc variants found — queue as a normal single-file game
+
             # Reconstruct the Myrient URL from the library directory structure.
             game_zip = game_dir.name + ".zip"
             game_url = BASE_URL + quote(console_name, safe="") + "/" + quote(game_zip, safe="")
@@ -5675,6 +5875,8 @@ class MyrientTUI(App):
         existing_paths = {i["dest_path"] for i in current_queue}
         added = skipped = 0
 
+        library = Path(self.state.settings['library_root'])
+
         for _, game_dir, status in targets:
             if str(game_dir) in existing_paths:
                 skipped += 1
@@ -5682,6 +5884,17 @@ class MyrientTUI(App):
             # Clear status so the download worker doesn't fast-skip validated games.
             # The game will be re-validated after a successful re-download.
             self._lib_status.remove(game_dir)
+
+            # ── Multi-disc parent detection (same logic as requeue_failed_games)
+            if DISC_REGEX.search(game_dir.name) is None:
+                disc_added = self._queue_disc_variants(
+                    console_name, game_dir, status, library,
+                    current_queue, existing_paths,
+                )
+                if disc_added:
+                    added += disc_added
+                    continue
+
             game_zip = game_dir.name + ".zip"
             game_url = BASE_URL + quote(console_name, safe="") + "/" + quote(game_zip, safe="")
             current_queue.append({
