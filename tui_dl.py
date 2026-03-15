@@ -289,7 +289,8 @@ else:
         # Best-effort idle I/O scheduling (class 3 = idle)
         try:
             os.system("ionice -c 3 -p " + str(os.getpid()))
-        except Exception:
+        except Exception as e:
+            logging.debug("ionice setup failed: %s", e)
             pass
     _LOW_PRIO_POPEN: dict[str, Any] = {"preexec_fn": _nice_preexec}
 
@@ -1456,11 +1457,18 @@ class Toolchain:
                     self._reg_proc(proc)
 
                     stderr_chunks: list[bytes] = []
+                    _chd_progress_pct: list[float] = [0.0]
+                    _chd_pct_re = re.compile(rb'(\d+(?:\.\d+)?)%')
+
                     def _read_stderr(p: subprocess.Popen = proc,
-                                     buf: list[bytes] = stderr_chunks) -> None:
+                                     buf: list[bytes] = stderr_chunks,
+                                     pct: list[float] = _chd_progress_pct) -> None:
                         try:
                             for chunk in iter(lambda: p.stderr.read(4096), b""):
                                 buf.append(chunk)
+                                m = _chd_pct_re.search(chunk)
+                                if m:
+                                    pct[0] = float(m.group(1))
                         except OSError:
                             pass
 
@@ -1481,6 +1489,14 @@ class Toolchain:
                             stderr_thread.join(timeout=2)
                             self._unreg_proc(proc)
                             raise subprocess.TimeoutExpired(proc.args, _CHD_TIMEOUT)
+                        # Report CHD conversion progress
+                        if not silent and _chd_progress_pct[0] > 0:
+                            self._post(LibraryProgress(
+                                "CHD convert",
+                                f"{file_path.name} ({_chd_progress_pct[0]:.0f}%)",
+                                int(_chd_progress_pct[0]),
+                                100,
+                            ))
                         time.sleep(0.5)
 
                     stderr_thread.join(timeout=5)
@@ -1552,7 +1568,8 @@ class Toolchain:
                                     self._post(SystemLog(
                                         f"CHD cleanup: could not delete {bin_path.name}: {ose}", True
                                     ))
-                except Exception:
+                except Exception as e:
+                    logging.debug("CHD cue sheet cleanup failed: %s", e)
                     pass
             elif ext_lower == ".gdi":
                 gdi_dir = file_path.parent
@@ -1602,6 +1619,7 @@ class BrowsePane(Vertical):
             with Vertical(id="browse-right"):
                 yield Label("", id="breadcrumb")
                 yield GameSearchInput(placeholder="  search games…", id="search-games", classes="search-bar")
+                yield Input(placeholder="  global search (all consoles)…", id="search-global", classes="search-bar")
                 yield DataTable(id="game-list", cursor_type="row", zebra_stripes=False)
                 with Horizontal(classes="browse-actions"):
                     yield Button("▸ Queue Selected", id="btn-add-queue", variant="success")
@@ -1635,6 +1653,10 @@ class DownloadsPane(Vertical):
                     yield Button("Remove", id="btn-remove-items", variant="warning")
                     yield Button("▶ Start", id="btn-start-dl", variant="primary")
                     yield Button("■ Stop", id="btn-pause-dl", variant="error")
+                with Horizontal(classes="btn-row"):
+                    yield Label("[dim]Schedule:[/dim]", classes="setting-label")
+                    yield Input(placeholder="HH:MM (empty=now)", id="input-schedule-time", classes="schedule-input")
+                    yield Button("⏱ Schedule", id="btn-schedule-dl")
                 with Horizontal(classes="btn-row"):
                     yield Button("Export", id="btn-export-queue", variant="default")
                     yield Button("Import", id="btn-import-queue", variant="default")
@@ -1671,6 +1693,8 @@ class LibraryPane(Vertical):
                     yield Label("", id="lib-summary-bar")
                     yield Tree("Library", id="lib-tree")
                     with Horizontal(classes="btn-row"):
+                        yield Button("▸ Expand", id="btn-lib-expand-all")
+                        yield Button("▾ Collapse", id="btn-lib-collapse-all")
                         yield Button("✕ Delete", id="btn-lib-delete", variant="error")
                 with VerticalScroll(id="lib-ops-panel"):
                     yield Label("Operations", classes="section-header")
@@ -1690,7 +1714,11 @@ class LibraryPane(Vertical):
                         yield Button("Re-queue Failures", id="btn-requeue-failed", classes="ops-btn")
                         yield Button("Re-queue Corrupted", id="btn-requeue-corrupted", classes="ops-btn")
                         yield Button("Re-queue Console", id="btn-requeue-console", classes="ops-btn")
+                    with Collapsible(title="Analysis", collapsed=True, id="ops-analysis"):
+                        yield Button("Missing Games Report", id="btn-lib-missing", classes="ops-btn")
+                        yield Button("Detect Duplicates", id="btn-lib-duplicates", classes="ops-btn")
                     yield Rule(line_style="heavy")
+                    yield Label("", id="lib-disk-bar")
                     yield Label(
                         "[bold green]✓[/] Validated  "
                         "[bold red]✗[/] Corrupted  "
@@ -1734,6 +1762,13 @@ class SettingsPane(Vertical):
                     yield Label("Type Exclude Filter", classes="section-header")
                     yield Label("[dim]Hide games matching these tags[/dim]", classes="setting-label")
                     yield DataTable(id="set-exclude", classes="filter-table")
+                    yield Rule()
+                    yield Label("Custom Regex Filters", classes="section-header")
+                    yield Label("[dim]Include regex (show only matching, empty = all)[/dim]", classes="setting-label")
+                    yield Input(placeholder="e.g. (USA|World).*Disc 1", id="set-custom-include")
+                    yield Label("[dim]Exclude regex (hide matching)[/dim]", classes="setting-label")
+                    yield Input(placeholder="e.g. Demo|Sample|Promo", id="set-custom-exclude")
+                    yield Rule()
                     yield Button("✕ Clear Filters", id="btn-clear-filters", variant="warning", classes="ops-btn")
                     yield Rule()
                     yield Label("Filter Presets", classes="section-header")
@@ -1752,6 +1787,11 @@ class SettingsPane(Vertical):
                     yield Rule()
                     yield Label("[dim]Pre-cache all console game lists for faster browsing[/dim]", classes="setting-label")
                     yield Button("Prefetch All Consoles", id="btn-prefetch-consoles", classes="ops-btn")
+                    yield Rule()
+                    yield Label("Batch Queue Import", classes="section-header")
+                    yield Label("[dim]Import game URLs or names from a text file (one per line)[/dim]", classes="setting-label")
+                    yield Input(placeholder="path to .txt file…", id="input-batch-import-path")
+                    yield Button("Import from File", id="btn-batch-import", classes="ops-btn")
 
 
 class LogsPane(Vertical):
@@ -1998,18 +2038,19 @@ class MyrientTUI(App):
     #lib-tab-wrapper { height: 1fr; layout: vertical; }
     #library-main    { height: 1fr; layout: horizontal; }
     #lib-tree-panel {
-        width: 60%;
+        width: 1fr;
         min-width: 38;
         height: 1fr;
         background: #080c12;
         border-right: solid #1c2333;
-        padding: 1 2;
+        padding: 1 1;
         layout: vertical;
     }
     #lib-ops-panel {
-        width: 1fr;
+        width: 34;
+        max-width: 38;
         height: 1fr;
-        padding: 1 2;
+        padding: 1 1;
         overflow-y: auto;
         layout: vertical;
     }
@@ -2204,6 +2245,60 @@ class MyrientTUI(App):
     .help-row     { height: 1; color: #9aa0aa; }
     .help-key     { color: #58a6ff; }
     #help-close   { margin-top: 2; }
+
+    /* ═══════════════════════════════════════════════════════════════════════
+       LIGHT THEME OVERRIDES
+       Activated when user toggles theme with Ctrl+D
+       Screen.-light-mode is the Textual CSS class added in light mode.
+       ═══════════════════════════════════════════════════════════════════════ */
+    Screen.-light-mode { background: #ffffff; color: #1f2328; }
+    Screen.-light-mode Header { background: #f6f8fa; color: #656d76; border-bottom: solid #d0d7de; }
+    Screen.-light-mode Footer { background: #f6f8fa; color: #656d76; border-top: solid #d0d7de; }
+    Screen.-light-mode #nav-sidebar { background: #f6f8fa; border-right: solid #d0d7de; }
+    Screen.-light-mode #nav-logo { color: #9a6700; border-bottom: solid #d0d7de; }
+    Screen.-light-mode .nav-btn { color: #656d76; }
+    Screen.-light-mode .nav-btn:hover { background: #ffffff; color: #1f2328; }
+    Screen.-light-mode .nav-btn:focus { background: #ffffff; color: #1f2328; border: solid #d0d7de; }
+    Screen.-light-mode .nav-btn.--nav-active { background: #ffffff; color: #9a6700; border-left: thick #9a6700; }
+    Screen.-light-mode #nav-status { border-top: solid #d0d7de; color: #656d76; }
+    Screen.-light-mode #content-area { background: #ffffff; }
+    Screen.-light-mode #global-statusbar { background: #f6f8fa; border-top: solid #d0d7de; }
+    Screen.-light-mode #gs-engine { color: #656d76; }
+    Screen.-light-mode #gs-speed { color: #1a7f37; }
+    Screen.-light-mode #gs-queue { color: #656d76; }
+    Screen.-light-mode .section-header { color: #656d76; border-bottom: solid #d0d7de; }
+    Screen.-light-mode .search-bar { background: #f6f8fa; color: #1f2328; border: solid #d0d7de; }
+    Screen.-light-mode .search-bar:focus { border: solid #0969da; }
+    Screen.-light-mode #breadcrumb { color: #656d76; background: #f6f8fa; border-bottom: solid #d0d7de; }
+    Screen.-light-mode DataTable { background: #ffffff; color: #1f2328; }
+    Screen.-light-mode DataTable > .datatable--header { background: #f6f8fa; color: #656d76; }
+    Screen.-light-mode DataTable > .datatable--cursor { background: #ddf4ff; color: #1f2328; }
+    Screen.-light-mode .console-list-container { background: #f6f8fa; border-right: solid #d0d7de; }
+    Screen.-light-mode ListView { background: #f6f8fa; }
+    Screen.-light-mode ListView > ListItem { color: #656d76; }
+    Screen.-light-mode ListView > ListItem.-highlight { background: #ddf4ff; }
+    Screen.-light-mode Tree { background: #ffffff; color: #1f2328; }
+    Screen.-light-mode Tree > .tree--cursor { background: #ddf4ff; color: #1f2328; }
+    Screen.-light-mode RichLog { background: #ffffff; color: #1f2328; }
+    Screen.-light-mode Input { background: #f6f8fa; color: #1f2328; border: solid #d0d7de; }
+    Screen.-light-mode Input:focus { border: solid #0969da; }
+    Screen.-light-mode Button { background: #f6f8fa; color: #1f2328; border: solid #d0d7de; }
+    Screen.-light-mode Button:hover { background: #eaeef2; }
+    Screen.-light-mode ProgressBar Bar { background: #eaeef2; }
+    Screen.-light-mode ProgressBar Bar > .bar--bar { color: #0969da; }
+    Screen.-light-mode Collapsible { background: #ffffff; }
+    Screen.-light-mode CollapsibleTitle { color: #656d76; }
+    Screen.-light-mode Select { background: #f6f8fa; color: #1f2328; }
+    Screen.-light-mode Switch { background: #eaeef2; }
+    Screen.-light-mode TabbedContent ContentSwitcher { background: #ffffff; }
+    Screen.-light-mode TabbedContent Tab { color: #656d76; }
+    Screen.-light-mode TabbedContent Tab.-active { color: #0969da; }
+    Screen.-light-mode Rule { color: #d0d7de; }
+    Screen.-light-mode #queue-table { background: #ffffff; }
+    Screen.-light-mode #help-modal-content { background: #ffffff; }
+    Screen.-light-mode #help-title { color: #9a6700; }
+    Screen.-light-mode .help-row { color: #1f2328; }
+    Screen.-light-mode .help-key { color: #0969da; }
     """
 
     BINDINGS = [
@@ -2300,6 +2395,17 @@ class MyrientTUI(App):
         self._log_search_text: str = ""
         self._log_search_timer: Timer | None = None
 
+        # Queue multi-select state
+        self._queue_selected: set[str] = set()
+
+        # Download scheduling
+        self._scheduled_time: str = ""  # HH:MM format, empty = immediate
+        self._schedule_timer: Timer | None = None
+
+        # Global search state
+        self._global_search_results: dict[str, str] = {}  # key → console_name
+        self._global_search_timer: Timer | None = None
+
     @property
     def engine_running(self) -> bool:
         """Backward-compatible check — True when the download engine is active."""
@@ -2314,7 +2420,8 @@ class MyrientTUI(App):
         self._update_selection_count()
         try:
             self.query_one("#game-list", DataTable).clear()
-        except Exception:
+        except Exception as e:
+            logging.debug("Clear game list failed: %s", e)
             pass
         self.fetch_consoles()
 
@@ -2348,7 +2455,8 @@ class MyrientTUI(App):
             search_input = self.query_one("#search-consoles", Input)
             search_input.value = console_name_raw
             self._render_consoles(console_name_raw)
-        except Exception:
+        except Exception as e:
+            logging.debug("Jump to console failed: %s", e)
             pass
 
     def _register_process(self, proc: subprocess.Popen) -> None:
@@ -2373,9 +2481,11 @@ class MyrientTUI(App):
                 proc.kill()
                 try:
                     proc.wait(timeout=1)   # reap zombie — POSIX requires wait() after kill()
-                except Exception:
+                except Exception as e:
+                    logging.debug("Zombie reap failed after kill: %s", e)
                     pass
-            except Exception:
+            except Exception as e:
+                logging.debug("Subprocess cleanup failed: %s", e)
                 pass
 
     @work(exclusive=True, thread=True)
@@ -2676,7 +2786,8 @@ class MyrientTUI(App):
             mc = q_settings.get("max_concurrent")
             self.query_one("#input-queue-max-concurrent", Input).value = \
                 str(mc) if mc is not None else ""
-        except Exception:
+        except Exception as e:
+            logging.debug("Populate per-queue settings failed: %s", e)
             pass
 
         # ── Start watchdog observer if enabled ────────────────────────────
@@ -2706,7 +2817,8 @@ class MyrientTUI(App):
         self._nav_switch("pane-browse")
         try:
             self.query_one("#log-filter-all", Button).add_class("--log-active")
-        except Exception:
+        except Exception as e:
+            logging.debug("Init log filter button failed: %s", e)
             pass
         # Show breadcrumb placeholder
         self._update_breadcrumb()
@@ -2719,13 +2831,11 @@ class MyrientTUI(App):
 
     def _nav_switch(self, pane_id: str) -> None:
         """Show the requested content pane and update sidebar nav highlights."""
-        # C8: Auto-save settings when navigating away from the settings pane
-        if getattr(self, "_current_pane", None) == "pane-settings" and pane_id != "pane-settings":
-            self._auto_save_settings()
         for pid in self._NAV_PANE_IDS:
             try:
                 self.query_one(f"#{pid}").display = (pid == pane_id)
-            except Exception:
+            except Exception as e:
+                logging.debug("Nav pane toggle %s failed: %s", pid, e)
                 pass
         for pid, bid in self._NAV_BTN_MAP.items():
             try:
@@ -2734,7 +2844,8 @@ class MyrientTUI(App):
                     btn.add_class("--nav-active")
                 else:
                     btn.remove_class("--nav-active")
-            except Exception:
+            except Exception as e:
+                logging.debug("Nav button toggle %s failed: %s", bid, e)
                 pass
         self._current_pane = pane_id
 
@@ -2751,7 +2862,8 @@ class MyrientTUI(App):
             grid = self.query_one("#progress-grid", Container)
             cols = 2 if self.size.width >= 120 else 1
             grid.styles.grid_size_columns = cols
-        except Exception:
+        except Exception as e:
+            logging.debug("Resize progress grid failed: %s", e)
             pass
 
     def action_show_help(self) -> None:
@@ -2772,7 +2884,8 @@ class MyrientTUI(App):
             if game_count > 0:
                 t.append(f"  ({game_count:,})", style="dim #3d4451")
             lbl.update(t)
-        except Exception:
+        except Exception as e:
+            logging.debug("Update breadcrumb failed: %s", e)
             pass
 
     def _select_all_visible(self) -> None:
@@ -2786,11 +2899,13 @@ class MyrientTUI(App):
             current_query = ""
             try:
                 current_query = self.query_one("#search-games", Input).value
-            except Exception:
+            except Exception as e:
+                logging.debug("Get search-games input failed: %s", e)
                 pass
             self._render_games(current_query)
             self._update_selection_count()
-        except Exception:
+        except Exception as e:
+            logging.debug("Select all visible failed: %s", e)
             pass
 
     def _update_global_statusbar(self) -> None:
@@ -2825,7 +2940,8 @@ class MyrientTUI(App):
             try:
                 qs = self.query_one("#queue-select", Select)
                 qs.disabled = state in (EngineState.RUNNING, EngineState.PAUSING)
-            except Exception:
+            except Exception as e:
+                logging.debug("Queue select disable toggle failed: %s", e)
                 pass
             # C1: Nav-sidebar status summary
             nav_status = self.query_one("#nav-status", Label)
@@ -2842,7 +2958,8 @@ class MyrientTUI(App):
                 nav_status.update(Text.assemble(*[(t + "  ", s) for t, s in parts]))
             else:
                 nav_status.update(Text(""))
-        except Exception:
+        except Exception as e:
+            logging.debug("Update global statusbar failed: %s", e)
             pass
 
     def _auto_save_settings(self) -> None:
@@ -2875,7 +2992,8 @@ class MyrientTUI(App):
                 "filter_include":           sorted(self._filter_include_sel),
                 "filter_exclude":           sorted(self._filter_exclude_sel),
             })
-        except Exception:
+        except Exception as e:
+            logging.debug("Auto-save settings failed: %s", e)
             pass  # best-effort — don't interrupt navigation
 
     def _set_log_filter(self, filter_id: str) -> None:
@@ -2889,7 +3007,8 @@ class MyrientTUI(App):
                     btn.add_class("--log-active")
                 else:
                     btn.remove_class("--log-active")
-            except Exception:
+            except Exception as e:
+                logging.debug("Log filter button toggle failed: %s", e)
                 pass
         self._rerender_log()
 
@@ -2906,7 +3025,8 @@ class MyrientTUI(App):
                 if self._log_search_text and self._log_search_text not in line.plain.lower():
                     continue
                 log_widget.write(line)
-        except Exception:
+        except Exception as e:
+            logging.debug("Rerender log failed: %s", e)
             pass
 
     def _log(self, msg: str, is_error: bool = False) -> None:
@@ -2989,16 +3109,16 @@ class MyrientTUI(App):
         def _game_label(name: str, status: str, has_chd: bool = False) -> Text:
             t = Text(no_wrap=True, overflow="ellipsis")
             if status == "validated":
-                t.append("✓  ", style=_TREE_GREEN)
-                t.append(name,   style=_TREE_GREEN)
+                t.append("✓ ", style=_TREE_GREEN)
+                t.append(name, style=_TREE_GREEN)
             elif status == "corrupted":
-                t.append("✗  ", style=_TREE_RED)
-                t.append(name,   style=_TREE_RED)
+                t.append("✗ ", style=_TREE_RED)
+                t.append(name, style=_TREE_RED)
             else:
-                t.append("~  ", style=_TREE_YELLOW)
-                t.append(name,   style=_TREE_YELLOW)
+                t.append("~ ", style=_TREE_YELLOW)
+                t.append(name, style=_TREE_YELLOW)
             if has_chd:
-                t.append("  │ ", style="dim #3d4451")
+                t.append(" │ ", style="dim #3d4451")
                 t.append("CHD", style="dim #58a6ff")
             return t
 
@@ -3007,13 +3127,13 @@ class MyrientTUI(App):
             t = Text(no_wrap=True)
             t.append(name, style=f"bold {_TREE_AMBER}")
             if n_ok:
-                t.append(f"  {n_ok}✓", style=_TREE_GREEN)
+                t.append(f" {n_ok}✓", style=_TREE_GREEN)
             if n_bad:
-                t.append(f"  {n_bad}✗", style=_TREE_RED)
+                t.append(f" {n_bad}✗", style=_TREE_RED)
             if n_inc:
-                t.append(f"  {n_inc}~", style=_TREE_YELLOW)
+                t.append(f" {n_inc}~", style=_TREE_YELLOW)
             if disk_bytes > 0:
-                t.append(f"  [{MyrientTUI._format_size(disk_bytes)}]", style=_TREE_DIM)
+                t.append(f" [{MyrientTUI._format_size(disk_bytes)}]", style=_TREE_DIM)
             return t
 
         try:
@@ -3064,16 +3184,16 @@ class MyrientTUI(App):
                     # Aggregate status for leading icon + game name
                     statuses = {s for _, s, _, _ in discs}
                     if statuses == {"validated"}:
-                        t.append("✓  ", style=_TREE_GREEN)
+                        t.append("✓ ", style=_TREE_GREEN)
                         t.append(base_name, style=_TREE_GREEN)
                     elif "corrupted" in statuses:
-                        t.append("✗  ", style=_TREE_RED)
+                        t.append("✗ ", style=_TREE_RED)
                         t.append(base_name, style=_TREE_RED)
                     else:
-                        t.append("~  ", style=_TREE_YELLOW)
+                        t.append("~ ", style=_TREE_YELLOW)
                         t.append(base_name, style=_TREE_YELLOW)
                     # Dim pipe separator to visually divide name from disc labels
-                    t.append("  │ ", style="dim #3d4451")
+                    t.append(" │ ", style="dim #3d4451")
                     # CHD indicator if any disc is in CHD format
                     any_chd = any(c for _, _, _, c in discs)
                     if any_chd:
@@ -3114,6 +3234,7 @@ class MyrientTUI(App):
                 total_bad = all_statuses.count("corrupted")
                 total_inc = all_statuses.count("incomplete")
                 n_cons    = len(message.structure)
+                total_bytes = sum(message.disk_usage.values())
                 t = Text()
                 t.append(f"{n_cons} console(s)", style="#3d4451")
                 t.append("   ", style="")
@@ -3122,9 +3243,17 @@ class MyrientTUI(App):
                 t.append(f"{total_bad}✗", style="#f85149")
                 t.append("  ", style="")
                 t.append(f"{total_inc}~", style="#d29922")
+                if total_bytes > 0:
+                    t.append("   ", style="")
+                    t.append(f"[{self._format_size(total_bytes)}]", style="dim #606878")
                 self.query_one("#lib-summary-bar", Label).update(t)
-            except Exception:
+            except Exception as e:
+                logging.debug("Update lib summary bar failed: %s", e)
                 pass
+
+            # Update disk space dashboard widget
+            if message.disk_usage:
+                self._render_disk_dashboard(message.disk_usage)
         except Exception as e:
             self._log(f"Tree build error: {e}", is_error=True)
 
@@ -3158,7 +3287,8 @@ class MyrientTUI(App):
                     (item_display, "#9aa0aa"),
                 )
                 status_label.update(status_text)
-        except Exception:
+        except Exception as e:
+            logging.debug("Update library progress UI failed: %s", e)
             pass
 
     # --- Fuzzy Search Engine & Highlighter ---
@@ -3218,7 +3348,8 @@ class MyrientTUI(App):
             t = self.query_one("#game-list", DataTable)
             if t.row_count:
                 t.move_cursor(row=max((t.cursor_row or 0) - 1, 0))
-        except Exception:
+        except Exception as e:
+            logging.debug("Game list nav up failed: %s", e)
             pass
 
     def on_game_search_input_nav_down(self, _: GameSearchInput.NavDown) -> None:
@@ -3226,7 +3357,8 @@ class MyrientTUI(App):
             t = self.query_one("#game-list", DataTable)
             if t.row_count:
                 t.move_cursor(row=min((t.cursor_row or 0) + 1, t.row_count - 1))
-        except Exception:
+        except Exception as e:
+            logging.debug("Game list nav down failed: %s", e)
             pass
 
     def on_game_search_input_toggle_at_cursor(self, _: GameSearchInput.ToggleAtCursor) -> None:
@@ -3260,20 +3392,12 @@ class MyrientTUI(App):
                 event.stop()
 
         elif fid == "queue-table":
-            if event.key == "delete":
-                # Simulate btn-remove-items click
-                try:
-                    table = self.query_one("#queue-table", DataTable)
-                    rows = list(table.ordered_rows)
-                    if table.cursor_row is not None and table.cursor_row < len(rows):
-                        item_id = rows[table.cursor_row].key.value
-                        cur_q = self.state.get_active_queue()
-                        new_q = [i for i in cur_q if i["id"] != item_id]
-                        if len(new_q) < len(cur_q):
-                            self.state.update_active_queue(new_q)
-                            self._remove_queue_row(item_id)
-                except Exception:
-                    pass
+            if event.key == "space":
+                self._queue_toggle_selection()
+                event.prevent_default()
+                event.stop()
+            elif event.key == "delete":
+                self._remove_selected_queue_items()
                 event.prevent_default()
                 event.stop()
             elif event.key == "shift+up":
@@ -3305,7 +3429,8 @@ class MyrientTUI(App):
                 self._selected_games.add(url_part)
             self._refresh_game_row(game_table, url_part)
             self._update_selection_count()
-        except Exception:
+        except Exception as e:
+            logging.debug("Toggle game at cursor failed: %s", e)
             pass
 
     def _refresh_game_row(self, game_table: DataTable, url_part: str) -> None:
@@ -3320,7 +3445,8 @@ class MyrientTUI(App):
         try:
             game_table.update_cell(url_part, "sel",  sel_cell,  update_width=False)
             game_table.update_cell(url_part, "name", name_cell, update_width=False)
-        except Exception:
+        except Exception as e:
+            logging.debug("Refresh game row failed: %s", e)
             pass
 
     def _update_selection_count(self) -> None:
@@ -3332,7 +3458,8 @@ class MyrientTUI(App):
             else:
                 noun = "game" if count == 1 else "games"
                 lbl.update(Text.assemble((f"{count} {noun} selected", "bold green")))
-        except Exception:
+        except Exception as e:
+            logging.debug("Update selection count failed: %s", e)
             pass
 
     def _toggle_filter_at_cursor(self, table_id: str) -> None:
@@ -3354,7 +3481,8 @@ class MyrientTUI(App):
             else:
                 sel_set.add(tag)
             self._refresh_filter_row(tbl, tag, sel_set)
-        except Exception:
+        except Exception as e:
+            logging.debug("Toggle filter at cursor failed: %s", e)
             pass
 
     def _refresh_filter_row(self, tbl: DataTable, tag: str, sel_set: set) -> None:
@@ -3365,7 +3493,8 @@ class MyrientTUI(App):
         try:
             tbl.update_cell(tag, "sel",  sel_cell,  update_width=False)
             tbl.update_cell(tag, "name", name_cell, update_width=False)
-        except Exception:
+        except Exception as e:
+            logging.debug("Refresh filter row failed: %s", e)
             pass
 
     def on_switch_changed(self, event: Switch.Changed) -> None:
@@ -3389,6 +3518,14 @@ class MyrientTUI(App):
             self._games_search_timer = self.set_timer(
                 _SEARCH_DEBOUNCE, lambda: self._render_games(event.value)
             )
+        elif event.input.id == "search-global":
+            if self._global_search_timer is not None:
+                self._global_search_timer.stop()
+            val = event.value.strip()
+            if len(val) >= 3:
+                self._global_search_timer = self.set_timer(
+                    1.0, lambda: self.run_global_search(val)
+                )
         elif event.input.id == "log-search":
             self._log_search_text = event.value.lower().strip()
             if self._log_search_timer is not None:
@@ -3499,7 +3636,8 @@ class MyrientTUI(App):
                     entry.get("size", ""),
                     entry.get("timestamp", ""),
                 )
-        except Exception:
+        except Exception as e:
+            logging.debug("Refresh history table failed: %s", e)
             pass
 
     def _load_settings_toggles(self) -> None:
@@ -3517,29 +3655,34 @@ class MyrientTUI(App):
         for wid, val in _input_vals.items():
             try:
                 self.query_one(f"#{wid}", Input).value = val
-            except Exception:
+            except Exception as e:
+                logging.debug("Load settings input %s failed: %s", wid, e)
                 pass
 
         # ── Switch toggles ─────────────────────────────────────────────────
         try:
             self.query_one("#set-auto-chd", Switch).value = \
                 self.state.settings.get("auto_convert_chd", False)
-        except Exception:
+        except Exception as e:
+            logging.debug("Load set-auto-chd toggle failed: %s", e)
             pass
         try:
             self.query_one("#set-watch-library", Switch).value = \
                 self.state.settings.get("watch_library", False)
-        except Exception:
+        except Exception as e:
+            logging.debug("Load set-watch-library toggle failed: %s", e)
             pass
         try:
             self.query_one("#set-notify-batch", Switch).value = \
                 self.state.settings.get("notify_on_batch_complete", True)
-        except Exception:
+        except Exception as e:
+            logging.debug("Load set-notify-batch toggle failed: %s", e)
             pass
         try:
             self.query_one("#sw-dat-dry-run", Switch).value = \
                 self.state.settings.get("dat_dry_run", False)
-        except Exception:
+        except Exception as e:
+            logging.debug("Load sw-dat-dry-run toggle failed: %s", e)
             pass
 
         # Restore filter selections from saved settings into the Python sets and DataTable rows
@@ -3552,7 +3695,8 @@ class MyrientTUI(App):
             exc_tbl = self.query_one("#set-exclude", DataTable)
             for row in exc_tbl.ordered_rows:
                 self._refresh_filter_row(exc_tbl, row.key.value, self._filter_exclude_sel)
-        except Exception:
+        except Exception as e:
+            logging.debug("Restore filter selections failed: %s", e)
             pass
 
     def on_select_changed(self, event: Select.Changed) -> None:
@@ -3568,7 +3712,8 @@ class MyrientTUI(App):
                 mc = q_settings.get("max_concurrent")
                 self.query_one("#input-queue-max-concurrent", Input).value = \
                     str(mc) if mc is not None else ""
-            except Exception:
+            except Exception as e:
+                logging.debug("Reflect queue settings on select failed: %s", e)
                 pass
 
     _NAV_PANE_IDS: tuple[str, ...] = (
@@ -3588,16 +3733,20 @@ class MyrientTUI(App):
     # @work-decorated methods are looked up fresh each invocation (they return new
     # Worker objects and must not be cached as bound methods).
     _BUTTON_DISPATCH: dict[str, str] = {
-        "btn-add-queue":          "_add_selected_to_queue",
-        "btn-lib-organize":       "run_lib_organize",
-        "btn-lib-dat-audit":      "run_bulk_dat_audit",
-        "btn-setup-chdman":       "setup_chdman_auto",
-        "btn-setup-ps2mdp":       "setup_ps2mdp_auto",
-        "btn-lib-refresh-status": "run_lib_status_scan",
-        "btn-requeue-failed":     "requeue_failed_games",
-        "btn-lib-orphans":        "scan_orphaned_files",
-        "btn-prefetch-consoles":  "prefetch_all_consoles",
+        "btn-add-queue":            "_add_selected_to_queue",
+        "btn-lib-organize":         "run_lib_organize",
+        "btn-setup-chdman":         "setup_chdman_auto",
+        "btn-setup-ps2mdp":         "setup_ps2mdp_auto",
+        "btn-lib-refresh-status":   "run_lib_status_scan",
+        "btn-requeue-failed":       "requeue_failed_games",
+        "btn-lib-orphans":          "scan_orphaned_files",
+        "btn-prefetch-consoles":    "prefetch_all_consoles",
         "btn-refresh-session-logs": "_refresh_session_log_list",
+        "btn-lib-expand-all":       "_lib_expand_all",
+        "btn-lib-collapse-all":     "_lib_collapse_all",
+        "btn-lib-duplicates":       "scan_duplicates",
+        "btn-lib-missing":          "scan_missing_games",
+        "btn-schedule-dl":          "_schedule_download",
     }
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -3624,6 +3773,17 @@ class MyrientTUI(App):
 
         if button_id in self._BUTTON_DISPATCH:
             getattr(self, self._BUTTON_DISPATCH[button_id])()
+            return
+
+        if button_id == "btn-batch-import":
+            try:
+                path = self.query_one("#input-batch-import-path", Input).value.strip()
+                if path:
+                    self.run_batch_import(path)
+                else:
+                    self.notify("Enter a file path first", severity="warning")
+            except Exception:
+                pass
             return
 
         if button_id == "btn-refresh-games" and self.selected_console:
@@ -3660,7 +3820,8 @@ class MyrientTUI(App):
                     self._save_current_preset(name)
                 else:
                     self.notify("Enter a preset name first.", severity="warning")
-            except Exception:
+            except Exception as e:
+                logging.debug("Save preset failed: %s", e)
                 pass
 
         elif button_id == "btn-load-preset":
@@ -3670,7 +3831,8 @@ class MyrientTUI(App):
                     self._load_preset(str(sel.value))
                 else:
                     self.notify("Select a preset from the dropdown first.", severity="warning")
-            except Exception:
+            except Exception as e:
+                logging.debug("Load preset failed: %s", e)
                 pass
 
         elif button_id == "btn-del-preset":
@@ -3680,7 +3842,8 @@ class MyrientTUI(App):
                     self._delete_preset(str(sel.value))
                 else:
                     self.notify("Select a preset to delete.", severity="warning")
-            except Exception:
+            except Exception as e:
+                logging.debug("Delete preset failed: %s", e)
                 pass
 
         elif button_id == "btn-create-queue":
@@ -3707,21 +3870,7 @@ class MyrientTUI(App):
                 self.notify("Cannot delete the only remaining queue.", severity="warning")
                 
         elif button_id == "btn-remove-items":
-            table = self.query_one("#queue-table", DataTable)
-            if table.cursor_row is not None:
-                try:
-                    # Identify by stable row key (item id), not visual cursor_row index.
-                    # cursor_row stops mapping 1:1 to queue positions after surgical removes.
-                    rows = list(table.ordered_rows)
-                    if rows and table.cursor_row < len(rows):
-                        item_id = rows[table.cursor_row].key.value
-                        current_queue = self.state.get_active_queue()
-                        new_queue = [i for i in current_queue if i["id"] != item_id]
-                        if len(new_queue) < len(current_queue):
-                            self.state.update_active_queue(new_queue)
-                            self._remove_queue_row(item_id)
-                except Exception as e:
-                    logging.error("btn-remove-items: unexpected error: %s", e)
+            self._remove_selected_queue_items()
                     
         elif button_id == "btn-start-dl":
             if self.state.get_active_queue():
@@ -3750,7 +3899,8 @@ class MyrientTUI(App):
                     tbl = self.query_one(f"#{tbl_id}", DataTable)
                     for row in tbl.ordered_rows:
                         self._refresh_filter_row(tbl, row.key.value, sel_set)
-            except Exception:
+            except Exception as e:
+                logging.debug("Clear filter table visuals failed: %s", e)
                 pass
             self.state.update_settings({"filter_include": [], "filter_exclude": []})
             self.notify("Filters cleared")
@@ -3779,6 +3929,16 @@ class MyrientTUI(App):
 
                 # Apply all changes in one lock window — prevents other threads
                 # from reading a partially-updated settings dict.
+                # Read custom regex filters
+                try:
+                    custom_inc = self.query_one("#set-custom-include", Input).value.strip()
+                except Exception:
+                    custom_inc = self.state.settings.get("custom_include_regex", "")
+                try:
+                    custom_exc = self.query_one("#set-custom-exclude", Input).value.strip()
+                except Exception:
+                    custom_exc = self.state.settings.get("custom_exclude_regex", "")
+
                 self.state.update_settings({
                     "library_root":             str(new_path),
                     "max_concurrent":           max(1, min(10, thread_count)),
@@ -3789,6 +3949,8 @@ class MyrientTUI(App):
                     "notify_on_batch_complete": self.query_one("#set-notify-batch", Switch).value,
                     "filter_include":           sorted(self._filter_include_sel),
                     "filter_exclude":           sorted(self._filter_exclude_sel),
+                    "custom_include_regex":     custom_inc,
+                    "custom_exclude_regex":     custom_exc,
                 })
 
                 new_path.mkdir(parents=True, exist_ok=True)
@@ -3807,7 +3969,8 @@ class MyrientTUI(App):
                     if self._watch_observer is not None:
                         try:
                             self._watch_observer.stop()
-                        except Exception:
+                        except Exception as e:
+                            logging.debug("Stop watchdog observer failed: %s", e)
                             pass
                         self._watch_observer = None
 
@@ -3890,8 +4053,9 @@ class MyrientTUI(App):
                 return
             self.requeue_console_games(console_path.name, console_path)
 
-        elif button_id in ("btn-lib-convert", "btn-lib-chd-to-orig", "btn-ps2-md-patch"):
-            # All three operations are scoped to the tree cursor when one is selected,
+        elif button_id in ("btn-lib-convert", "btn-lib-chd-to-orig", "btn-ps2-md-patch",
+                           "btn-lib-dat-audit"):
+            # All scoped operations use the tree cursor when one is selected,
             # or fall back to the full library when nothing is highlighted.
             tree = self.query_one("#lib-tree", Tree)
             node = tree.cursor_node
@@ -3899,12 +4063,6 @@ class MyrientTUI(App):
 
             if node and isinstance(getattr(node, "data", None), Path):
                 node_path: Path = node.data
-                # Check from outermost to innermost so short-circuit works correctly:
-                #   root node  → library root → full scan
-                #   console    → direct child of library → scope = console dir
-                #   game/disc  → any deeper node → scope = that dir
-                # (Previous code checked depth-2 first, which caused game nodes to
-                #  resolve to the library root instead of the game dir itself.)
                 if node_path == library:
                     scope = library
                 elif node_path.parent == library:
@@ -3918,6 +4076,8 @@ class MyrientTUI(App):
                 self.run_lib_convert(scope)
             elif button_id == "btn-lib-chd-to-orig":
                 self.run_chd_to_original(scope)
+            elif button_id == "btn-lib-dat-audit":
+                self.run_bulk_dat_audit(scope)
             elif button_id == "btn-ps2-md-patch":
                 self._ps2mdp_target = scope
                 self.run_ps2_master_disc_patch()
@@ -3969,6 +4129,43 @@ class MyrientTUI(App):
             self.push_screen(ConfirmDeleteScreen(target_path.name), check_delete)
             
     def _add_selected_to_queue(self) -> None:
+        # Global search mode: results keyed as "Console/url_part"
+        if self._global_search_results and self._selected_games:
+            library_root = Path(self.state.settings["library_root"])
+            current_queue = self.state.get_active_queue()
+            existing_paths = {i["dest_path"] for i in current_queue}
+            added_count = 0
+            for key in self._selected_games:
+                data = self._games_lookup.get(key)
+                gs_console = self._global_search_results.get(key)
+                if not data or not gs_console:
+                    continue
+                sub_folder = data['name'].replace('.zip', '').strip()
+                clean_base = DISC_REGEX.sub('', sub_folder).strip()
+                if clean_base != sub_folder:
+                    dest_path = library_root / gs_console / clean_base / sub_folder
+                else:
+                    dest_path = library_root / gs_console / sub_folder
+                if str(dest_path) in existing_paths:
+                    continue
+                game_url = BASE_URL + quote(gs_console, safe="") + "/" + quote(data["url_part"], safe="")
+                current_queue.append({
+                    "id": f"dl_{uuid.uuid4().hex[:8]}",
+                    "name": f"{gs_console} / {data['name']}",
+                    "game_url": game_url,
+                    "dest_path": str(dest_path),
+                    "size_str": data["size_str"],
+                })
+                existing_paths.add(str(dest_path))
+                added_count += 1
+            self._selected_games.clear()
+            self._update_selection_count()
+            self.state.update_active_queue(current_queue)
+            self._refresh_queue_table()
+            self.notify(f"Queued {added_count} item(s)")
+            self._update_global_statusbar()
+            return
+
         if not self.selected_console or not self._selected_games:
             return
 
@@ -4016,7 +4213,6 @@ class MyrientTUI(App):
         self.state.update_active_queue(current_queue)
         self._refresh_queue_table()
         self.notify(f"Queued {added_count} item(s)")
-        self._nav_switch("pane-downloads")
         self._update_global_statusbar()
 
     # --- UI Message Receivers ---
@@ -4033,12 +4229,22 @@ class MyrientTUI(App):
         # and use ↑↓/Space/Enter without clicking anything.
         try:
             self.query_one("#search-games", Input).focus()
-        except Exception:
+        except Exception as e:
+            logging.debug("Focus search-games input failed: %s", e)
             pass
 
     # --- Async Background Workers ---
     @work(exclusive=True, thread=True)
     def fetch_consoles(self) -> None:
+        def _show_loading() -> None:
+            try:
+                lv = self.query_one("#console-list", ListView)
+                lv.clear()
+                lv.append(ListItem(Label(Text("Loading consoles…", style="dim italic"))))
+            except Exception as e:
+                logging.debug("Show console loading indicator failed: %s", e)
+                pass
+        self.call_from_thread(_show_loading)
         self.post_message(SystemLog("Scraping console list..."))
         items = self.scraper.scrape_links(BASE_URL)
         consoles = [i for i in items if i["url_part"].endswith('/')]
@@ -4071,7 +4277,8 @@ class MyrientTUI(App):
             for f in concurrent.futures.as_completed(futures):
                 try:
                     f.result()
-                except Exception:
+                except Exception as e:
+                    logging.debug("Pre-cache console fetch failed: %s", e)
                     pass
 
         self.post_message(LibraryProgress("Pre-caching", "Done", total, total))
@@ -4092,7 +4299,8 @@ class MyrientTUI(App):
                 t.append(console_data["name"], style="#9aa0aa")
                 t.append("  ⟳ Loading…", style="italic #d29922")
                 lbl.update(t)
-            except Exception:
+            except Exception as e:
+                logging.debug("Show game loading breadcrumb failed: %s", e)
                 pass
         self.call_from_thread(_show_loading)
         self.post_message(SystemLog(f"Listing games for {console_data['name']}..."))
@@ -4101,8 +4309,24 @@ class MyrientTUI(App):
         inc_filters = self.state.settings["filter_include"]
         exc_filters = self.state.settings["filter_exclude"]
 
-        inc_rx = re.compile('|'.join(re.escape(t) for t in inc_filters), re.IGNORECASE) if inc_filters else None
-        exc_rx = re.compile('|'.join(re.escape(t) for t in exc_filters), re.IGNORECASE) if exc_filters else None
+        # Build combined include regex: tag-based presets + custom regex
+        inc_parts: list[str] = [re.escape(t) for t in inc_filters]
+        custom_inc = self.state.settings.get("custom_include_regex", "").strip()
+        if custom_inc:
+            inc_parts.append(custom_inc)
+        try:
+            inc_rx = re.compile('|'.join(inc_parts), re.IGNORECASE) if inc_parts else None
+        except re.error:
+            inc_rx = re.compile('|'.join(re.escape(t) for t in inc_filters), re.IGNORECASE) if inc_filters else None
+
+        exc_parts: list[str] = [re.escape(t) for t in exc_filters]
+        custom_exc = self.state.settings.get("custom_exclude_regex", "").strip()
+        if custom_exc:
+            exc_parts.append(custom_exc)
+        try:
+            exc_rx = re.compile('|'.join(exc_parts), re.IGNORECASE) if exc_parts else None
+        except re.error:
+            exc_rx = re.compile('|'.join(re.escape(t) for t in exc_filters), re.IGNORECASE) if exc_filters else None
 
         filtered_games: list[GameItem] = []
         for game in items:
@@ -4138,7 +4362,8 @@ class MyrientTUI(App):
                 for child in list(grid.children):
                     if hasattr(child, 'id') and child.id and child.id.startswith("cont_pb_"):
                         child.remove()
-            except Exception:
+            except Exception as e:
+                logging.debug("Clear paused progress containers failed: %s", e)
                 pass
         self.call_from_thread(_clear_paused_containers)
 
@@ -4192,9 +4417,10 @@ class MyrientTUI(App):
                         (f"0 / {self.global_total}", "#e6b73e"),
                     )
                 )
-            except Exception:
+            except Exception as e:
+                logging.debug("Init global progress bar failed: %s", e)
                 pass
-                
+
         self.call_from_thread(init_global_pb)
         self.call_from_thread(self._update_global_statusbar)
         # A8: Global bandwidth cap — shared across all download threads
@@ -4240,7 +4466,8 @@ class MyrientTUI(App):
                 )
                 # Clear speed indicator
                 self.query_one("#gs-speed", Label).update(Text(""))
-            except Exception:
+            except Exception as e:
+                logging.debug("Finish download UI update failed: %s", e)
                 pass
             self._update_global_statusbar()
 
@@ -4716,10 +4943,11 @@ class MyrientTUI(App):
             self._run_chd_auto(item, item_name, dest_dir, size_bytes)
 
             # B1: Record in download history
+            console_name = item["name"].split(" / ")[0].strip() if " / " in item["name"] else ""
             self.state.record_download(
                 item_name,
-                item.get("console_name", ""),
-                item.get("size_str", ""),
+                console_name,
+                item["size_str"],
             )
             return {"success": True}
 
@@ -4764,7 +4992,8 @@ class MyrientTUI(App):
                 self.query_one("#gs-speed", Label).update(
                     Text(speed_str, style="#3fb950")
                 )
-            except Exception:
+            except Exception as e:
+                logging.debug("Update speed indicator failed: %s", e)
                 pass
         elif message.action in ("Extracting ZIP", "Converting CHD"):
             # C7: Phase label in statusbar when not downloading
@@ -4772,7 +5001,8 @@ class MyrientTUI(App):
                 self.query_one("#gs-speed", Label).update(
                     Text(f"⟳ {message.action}…", style="italic #d29922")
                 )
-            except Exception:
+            except Exception as e:
+                logging.debug("Update action phase label failed: %s", e)
                 pass
         if message.eta_secs >= 0:
             if message.eta_secs < 60:
@@ -4789,7 +5019,8 @@ class MyrientTUI(App):
                     progress=message.completed, total=message.total
                 )
                 self.query_one(f"#{lbl_id}", Label).update(status_line)
-            except Exception:
+            except Exception as e:
+                logging.debug("Update download progress widget failed: %s", e)
                 pass
         else:
             self._active_progress_containers.add(task_id)
@@ -4816,7 +5047,8 @@ class MyrientTUI(App):
                         (f"{completed_snap} / {total_snap}", "#e6b73e"),
                     )
                 )
-            except Exception:
+            except Exception as e:
+                logging.debug("Update global progress on completion failed: %s", e)
                 pass
 
             # Deferred save: mark dirty instead of flushing to disk on every
@@ -4835,7 +5067,8 @@ class MyrientTUI(App):
             self._active_progress_containers.discard(message.item["id"])
             try:
                 self.query_one(f"#cont_pb_{message.item['id']}").remove()
-            except Exception:
+            except Exception as e:
+                logging.debug("Remove completed progress container failed: %s", e)
                 pass
 
         elif message.cancelled:
@@ -4962,9 +5195,10 @@ class MyrientTUI(App):
         self.post_message(SystemLog(f"Clean-up Complete. {changed} folder(s) organized/removed."))
 
     @work(exclusive=True, thread=True)
-    def run_bulk_dat_audit(self) -> None:
+    def run_bulk_dat_audit(self, scope: Path | None = None) -> None:
         """
-        Full-library DAT audit. For every console folder:
+        DAT audit scoped to *scope* (library root, console dir, or game dir).
+        For every console folder in scope:
           1. Fetches (or reuses a cached) Redump .dat file from Myrient.
           2. SHA-1 hashes every .bin/.iso/.cue/.img file.
           3. Looks each hash up in the DAT and marks the parent game dir
@@ -4975,8 +5209,6 @@ class MyrientTUI(App):
         logged but no files are moved and no status markers are written.
         """
         self._lib_cancel.clear()
-        # Read the dry-run setting from the persisted config (thread-safe) rather
-        # than querying the Switch widget, which is only safe on the main thread.
         dry_run = self.state.settings.get("dat_dry_run", False)
 
         if dry_run:
@@ -4985,7 +5217,6 @@ class MyrientTUI(App):
                 "(no files will be moved or marked)"
             ))
 
-        # Use configurable TTL from settings
         dat_ttl = self.state.settings.get("dat_cache_ttl_hours", 168) * 3600.0
         library = Path(self.state.settings['library_root'])
 
@@ -4993,17 +5224,34 @@ class MyrientTUI(App):
             self.post_message(SystemLog("DAT Audit: Library path not found.", True))
             return
 
-        # ── Phase 1: discover console dirs ──────────────────────────────────
-        console_dirs = sorted(
-            d for d in library.iterdir()
-            if d.is_dir() and not d.name.startswith('.')
-        )
+        if scope is None:
+            scope = library
+
+        # ── Phase 1: discover console dirs (scoped) ─────────────────────────
+        if scope == library:
+            console_dirs = sorted(
+                d for d in library.iterdir()
+                if d.is_dir() and not d.name.startswith('.')
+            )
+            scope_label = "full library"
+        elif scope.parent == library:
+            # Single console
+            console_dirs = [scope] if scope.is_dir() else []
+            scope_label = f"console [{scope.name}]"
+        else:
+            # Game dir — resolve to its console parent
+            console_parent = scope.parent
+            while console_parent.parent != library and console_parent != library:
+                console_parent = console_parent.parent
+            console_dirs = [console_parent] if console_parent.is_dir() else []
+            scope_label = f"game [{scope.name}]"
+
         if not console_dirs:
             self.post_message(SystemLog("DAT Audit: No console folders found in library."))
             return
 
         self.post_message(SystemLog(
-            f"DAT Audit: Starting bulk audit of {len(console_dirs)} console(s)..."
+            f"DAT Audit [{scope_label}]: Starting audit of {len(console_dirs)} console(s)..."
         ))
 
         # ── Phase 2: fetch the DAT index page once ──────────────────────────
@@ -5880,6 +6128,105 @@ class MyrientTUI(App):
         except Exception:
             pass
 
+    # ── Library tree expand/collapse helpers ────────────────────────────────
+
+    def _lib_expand_all(self) -> None:
+        try:
+            tree = self.query_one("#lib-tree", Tree)
+            tree.root.expand_all()
+        except Exception:
+            pass
+
+    def _lib_collapse_all(self) -> None:
+        try:
+            tree = self.query_one("#lib-tree", Tree)
+            tree.root.collapse_all()
+            tree.root.expand()  # keep root visible
+        except Exception:
+            pass
+
+    # ── Disk space dashboard ─────────────────────────────────────────────────
+
+    def _render_disk_dashboard(self, disk_usage: dict[str, int]) -> None:
+        """Update the library summary with a disk space breakdown."""
+        try:
+            library = Path(self.state.settings["library_root"])
+            total_lib = sum(disk_usage.values())
+            try:
+                free = shutil.disk_usage(library).free
+            except OSError:
+                free = 0
+            t = Text()
+            t.append("Disk: ", style="dim #606878")
+            t.append(self._format_size(total_lib), style="#9aa0aa")
+            t.append(" used", style="dim #606878")
+            if free > 0:
+                t.append("  |  ", style="dim #1c2333")
+                t.append(self._format_size(free), style="#3fb950")
+                t.append(" free", style="dim #606878")
+            try:
+                self.query_one("#lib-disk-bar", Label).update(t)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # ── Queue multi-select ───────────────────────────────────────────────────
+
+    def _queue_toggle_selection(self) -> None:
+        """Toggle selection on the current queue row for bulk operations."""
+        try:
+            table = self.query_one("#queue-table", DataTable)
+            cursor = table.cursor_row
+            if cursor is None:
+                return
+            rows = table.ordered_rows
+            if cursor >= len(rows):
+                return
+            item_id = rows[cursor].key.value
+            if item_id in self._queue_selected:
+                self._queue_selected.discard(item_id)
+            else:
+                self._queue_selected.add(item_id)
+            self._refresh_queue_row_visual(table, item_id)
+        except Exception:
+            pass
+
+    def _refresh_queue_row_visual(self, table: DataTable, item_id: str) -> None:
+        """Update a queue row's visual to reflect multi-select state."""
+        try:
+            current_queue = self.state.get_active_queue()
+            item = next((i for i in current_queue if i["id"] == item_id), None)
+            if not item:
+                return
+            selected = item_id in self._queue_selected
+            name_cell = Text(item["name"], style="bold cyan" if selected else "")
+            table.update_cell(item_id, "Game", name_cell, update_width=False)
+        except Exception:
+            pass
+
+    def _remove_selected_queue_items(self) -> None:
+        """Remove all multi-selected queue items (or the cursor item if none selected)."""
+        try:
+            table = self.query_one("#queue-table", DataTable)
+            if self._queue_selected:
+                ids_to_remove = set(self._queue_selected)
+                self._queue_selected.clear()
+            else:
+                # Fall back to cursor item
+                rows = list(table.ordered_rows)
+                if table.cursor_row is not None and table.cursor_row < len(rows):
+                    ids_to_remove = {rows[table.cursor_row].key.value}
+                else:
+                    return
+            current_queue = self.state.get_active_queue()
+            new_queue = [i for i in current_queue if i["id"] not in ids_to_remove]
+            if len(new_queue) < len(current_queue):
+                self.state.update_active_queue(new_queue)
+                self._refresh_queue_table()
+        except Exception as e:
+            logging.error("Queue multi-remove error: %s", e)
+
     # ── Preset filter profile management ─────────────────────────────────────
 
     def _refresh_preset_dropdown(self) -> None:
@@ -6157,6 +6504,18 @@ class MyrientTUI(App):
 
         self.post_message(LibraryTreeReady(structure, library, disk_usage))
 
+    def _lookup_game_size(self, console_name: str, game_zip: str) -> str:
+        """Look up a game's size from the scrape cache. Returns 'N/A' on miss."""
+        try:
+            url = BASE_URL + quote(console_name, safe="") + "/"
+            games = self.scraper.scrape_links(url)
+            for g in games:
+                if g["name"] == game_zip:
+                    return g.get("size_str", "N/A")
+        except Exception:
+            pass
+        return "N/A"
+
     def _find_disc_variants(self, console_name: str, base_name: str) -> list[GameItem]:
         """Scrape the console page on Myrient and return disc-specific entries
         whose base name (with the disc suffix stripped) matches *base_name*.
@@ -6294,6 +6653,7 @@ class MyrientTUI(App):
             # Reconstruct the Myrient URL from the library directory structure.
             game_zip = game_dir.name + ".zip"
             game_url = BASE_URL + quote(console_name, safe="") + "/" + quote(game_zip, safe="")
+            size_str = self._lookup_game_size(console_name, game_zip)
             # Store plain-text name — Rich markup must NOT be embedded in persisted JSON
             # because brackets in console/game names would inject unintended markup at render time.
             plain_status = "corrupted" if status == "corrupted" else "incomplete"
@@ -6302,7 +6662,7 @@ class MyrientTUI(App):
                 "name":      f"{console_name} / {game_zip} ({plain_status})",
                 "game_url":  game_url,
                 "dest_path": str(game_dir),
-                "size_str":  "N/A",
+                "size_str":  size_str,
             })
             existing_paths.add(str(game_dir))
             added += 1
@@ -6380,12 +6740,13 @@ class MyrientTUI(App):
 
             game_zip = game_dir.name + ".zip"
             game_url = BASE_URL + quote(console_name, safe="") + "/" + quote(game_zip, safe="")
+            size_str = self._lookup_game_size(console_name, game_zip)
             current_queue.append({
                 "id":        f"dl_{uuid.uuid4().hex[:8]}",
                 "name":      f"{console_name} / {game_zip}",
                 "game_url":  game_url,
                 "dest_path": str(game_dir),
-                "size_str":  "N/A",
+                "size_str":  size_str,
             })
             existing_paths.add(str(game_dir))
             added += 1
@@ -6399,6 +6760,355 @@ class MyrientTUI(App):
             f"Re-queue Console [{_escape_markup(console_name)}]: "
             f"queued [bold]{added}[/bold] game(s)"
             + (f", skipped {skipped} already in queue." if skipped else ".")
+        ))
+
+    # ── Global cross-console search (2A) ──────────────────────────────────────
+
+    @work(exclusive=True, thread=True)
+    def run_global_search(self, query: str) -> None:
+        """Search all consoles for games matching *query*. Uses prefetch cache."""
+        if not query or len(query) < 2:
+            return
+        self._lib_cancel.clear()
+        self.post_message(SystemLog(f"Global search: \"{_escape_markup(query)}\"…"))
+
+        items = self.scraper.scrape_links(BASE_URL)
+        consoles = [i for i in items if i["url_part"].endswith('/')]
+        if not consoles:
+            self.post_message(SystemLog("Global search: no consoles found.", True))
+            return
+
+        results: list[tuple[str, GameItem]] = []
+        semaphore = threading.Semaphore(_SCRAPE_CONCURRENCY)
+        lock = threading.Lock()
+
+        def _search_one(console: ConsoleItem, idx: int) -> None:
+            with semaphore:
+                if self._lib_cancel.is_set():
+                    return
+                url = urljoin(BASE_URL, console["url_part"])
+                self.post_message(LibraryProgress(
+                    "Searching", console["name"].strip('/'), idx, len(consoles)
+                ))
+                games = self.scraper.scrape_links(url)
+                for g in games:
+                    if not g["url_part"].lower().endswith('.zip'):
+                        continue
+                    if self._fuzzy_spans(query, g["name"]) is not None:
+                        with lock:
+                            results.append((console["name"].strip('/'), g))  # type: ignore[arg-type]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_SCRAPE_CONCURRENCY) as ex:
+            futures = [ex.submit(_search_one, c, i) for i, c in enumerate(consoles, 1)]
+            for f in concurrent.futures.as_completed(futures):
+                try:
+                    f.result()
+                except Exception:
+                    pass
+
+        # Populate game table with results
+        def _show_results() -> None:
+            try:
+                gt = self.query_one("#game-list", DataTable)
+                gt.clear()
+                self._all_games_data = []
+                self._games_lookup = {}
+                self._global_search_results = {}
+                for console_name, game in results:
+                    key = f"{console_name}/{game['url_part']}"
+                    game_item: GameItem = game  # type: ignore[assignment]
+                    self._all_games_data.append(game_item)
+                    self._games_lookup[key] = game_item
+                    self._global_search_results[key] = console_name
+                    name_text = Text(no_wrap=True)
+                    name_text.append(f"[{console_name}] ", style="dim #58a6ff")
+                    spans = self._fuzzy_spans(query, game["name"])
+                    if spans:
+                        name_text.append_text(self._build_highlight_text(game["name"], spans))
+                    else:
+                        name_text.append(game["name"], style="#9aa0aa")
+                    gt.add_row(Text(" "), name_text, game["size_str"], key=key)
+                if not results:
+                    gt.add_row("", Text("No matches found.", style="dim"), "", key="EMPTY")
+                lbl = self.query_one("#breadcrumb", Label)
+                t = Text()
+                t.append("Global Search", style="#58a6ff")
+                t.append(f"  ({len(results)} results)", style="dim #606878")
+                lbl.update(t)
+            except Exception as e:
+                logging.debug("Global search UI update failed: %s", e)
+        self.call_from_thread(_show_results)
+
+        self.post_message(SystemLog(
+            f"Global search: found [bold]{len(results)}[/bold] match(es) across {len(consoles)} consoles."
+        ))
+
+    # ── Missing games report (2B) ─────────────────────────────────────────────
+
+    @work(exclusive=True, thread=True)
+    def scan_missing_games(self) -> None:
+        """Compare library against cached DAT files to find missing games."""
+        self._lib_cancel.clear()
+        library = Path(self.state.settings["library_root"])
+        if not library.exists():
+            self.post_message(SystemLog("Missing games: Library path not found.", True))
+            return
+
+        dat_dir = _DATA_DIR / "dats"
+        if not dat_dir.exists():
+            self.post_message(SystemLog(
+                "Missing games: No DAT files cached. Run DAT Audit first to download them.", True
+            ))
+            return
+
+        console_dirs = sorted(
+            d for d in library.iterdir()
+            if d.is_dir() and not d.name.startswith('.')
+        )
+        if not console_dirs:
+            self.post_message(SystemLog("Missing games: No console folders found."))
+            return
+
+        total_missing = 0
+        report_lines: list[str] = []
+
+        for idx, console_dir in enumerate(console_dirs, 1):
+            if self._lib_cancel.is_set():
+                return
+            self.post_message(LibraryProgress(
+                "Missing scan", console_dir.name, idx, len(console_dirs)
+            ))
+
+            dat_subdir = dat_dir / console_dir.name
+            if not dat_subdir.exists():
+                continue
+            dat_files = list(dat_subdir.glob("*.dat"))
+            if not dat_files:
+                continue
+
+            try:
+                tree_et = ET.parse(dat_files[0])
+                root_el = tree_et.getroot()
+            except Exception:
+                continue
+
+            dat_games: set[str] = set()
+            for game_el in root_el.iter("game"):
+                name = game_el.get("name", "")
+                if name:
+                    dat_games.add(name)
+
+            lib_games: set[str] = set()
+            for gd in console_dir.iterdir():
+                if gd.is_dir() and not gd.name.startswith('.'):
+                    lib_games.add(gd.name)
+
+            missing = dat_games - lib_games
+            if missing:
+                total_missing += len(missing)
+                report_lines.append(
+                    f"[bold]{_escape_markup(console_dir.name)}[/bold]: "
+                    f"{len(missing)} missing"
+                )
+                for name in sorted(missing)[:10]:
+                    report_lines.append(f"  · {_escape_markup(name)}")
+                if len(missing) > 10:
+                    report_lines.append(f"  … and {len(missing) - 10} more")
+
+        for line in report_lines:
+            self.post_message(SystemLog(line))
+
+        self.post_message(SystemLog(
+            f"Missing games report: [bold]{total_missing}[/bold] game(s) missing "
+            f"across {len(console_dirs)} console(s)."
+        ))
+        self.post_message(LibraryProgress("Missing scan", "Done", len(console_dirs), len(console_dirs)))
+
+    # ── Duplicate detection (2C) ──────────────────────────────────────────────
+
+    @work(exclusive=True, thread=True)
+    def scan_duplicates(self) -> None:
+        """Scan library for files with identical SHA-1 hashes."""
+        self._lib_cancel.clear()
+        library = Path(self.state.settings["library_root"])
+        if not library.exists():
+            self.post_message(SystemLog("Duplicates: Library path not found.", True))
+            return
+
+        hash_map: dict[str, list[Path]] = {}
+        extensions = {'.bin', '.iso', '.img', '.chd', '.cue'}
+        files: list[Path] = []
+
+        for f in library.rglob("*"):
+            if f.suffix.lower() in extensions and f.is_file():
+                files.append(f)
+
+        if not files:
+            self.post_message(SystemLog("Duplicates: No ROM files found in library."))
+            return
+
+        for idx, f in enumerate(files, 1):
+            if self._lib_cancel.is_set():
+                return
+            if idx % 50 == 0 or idx == len(files):
+                self.post_message(LibraryProgress("Hashing", f.name, idx, len(files)))
+            try:
+                h = hashlib.sha1()
+                with open(f, "rb") as fh:
+                    while chunk := fh.read(65536):
+                        if self._lib_cancel.is_set():
+                            return
+                        h.update(chunk)
+                digest = h.hexdigest()
+                hash_map.setdefault(digest, []).append(f)
+            except OSError:
+                continue
+
+        dupes = {h: paths for h, paths in hash_map.items() if len(paths) > 1}
+        if not dupes:
+            self.post_message(SystemLog("Duplicates: No duplicate files found. Library is clean!"))
+            return
+
+        total_dup_files = sum(len(p) - 1 for p in dupes.values())
+        self.post_message(SystemLog(
+            f"Duplicates: found [bold]{total_dup_files}[/bold] duplicate file(s) "
+            f"in {len(dupes)} group(s):"
+        ))
+        for sha, paths in sorted(dupes.items()):
+            self.post_message(SystemLog(f"  SHA1 {sha[:12]}…:"))
+            for p in paths:
+                self.post_message(SystemLog(f"    · {p.relative_to(library)}"))
+
+        self.post_message(LibraryProgress("Duplicates", "Done", len(files), len(files)))
+
+    # ── Batch queue import (2E) ───────────────────────────────────────────────
+
+    @work(exclusive=True, thread=True)
+    def run_batch_import(self, file_path: str) -> None:
+        """Import game URLs or names from a text file into the download queue."""
+        path = Path(file_path.strip())
+        if not path.exists():
+            self.post_message(SystemLog(f"Batch import: file not found: {path}", True))
+            return
+
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").strip().splitlines()
+        except OSError as e:
+            self.post_message(SystemLog(f"Batch import: read error: {e}", True))
+            return
+
+        lines = [l.strip() for l in lines if l.strip() and not l.strip().startswith('#')]
+        if not lines:
+            self.post_message(SystemLog("Batch import: file is empty or all comments."))
+            return
+
+        library_root = Path(self.state.settings["library_root"])
+        current_queue = self.state.get_active_queue()
+        existing_paths = {i["dest_path"] for i in current_queue}
+        added = 0
+
+        for line in lines:
+            if self._lib_cancel.is_set():
+                return
+            if line.startswith(("http://", "https://")) and "myrient" in line.lower():
+                try:
+                    parsed = urllib.parse.urlparse(line)
+                    parts = [unquote(p) for p in parsed.path.strip('/').split('/') if p]
+                    if len(parts) >= 3:
+                        console_name = parts[-2]
+                        game_zip = parts[-1]
+                        game_name = game_zip.replace('.zip', '').strip()
+                        clean_base = DISC_REGEX.sub('', game_name).strip()
+                        if clean_base != game_name:
+                            dest_path = library_root / console_name / clean_base / game_name
+                        else:
+                            dest_path = library_root / console_name / game_name
+                        if str(dest_path) not in existing_paths:
+                            current_queue.append({
+                                "id": f"dl_{uuid.uuid4().hex[:8]}",
+                                "name": f"{console_name} / {game_zip}",
+                                "game_url": line,
+                                "dest_path": str(dest_path),
+                                "size_str": "N/A",
+                            })
+                            existing_paths.add(str(dest_path))
+                            added += 1
+                except Exception:
+                    continue
+            elif " / " in line:
+                parts = line.split(" / ", 1)
+                console_name = parts[0].strip()
+                game_zip = parts[1].strip()
+                if not game_zip.endswith('.zip'):
+                    game_zip += '.zip'
+                game_name = game_zip.replace('.zip', '').strip()
+                clean_base = DISC_REGEX.sub('', game_name).strip()
+                if clean_base != game_name:
+                    dest_path = library_root / console_name / clean_base / game_name
+                else:
+                    dest_path = library_root / console_name / game_name
+                game_url = BASE_URL + quote(console_name, safe="") + "/" + quote(game_zip, safe="")
+                if str(dest_path) not in existing_paths:
+                    current_queue.append({
+                        "id": f"dl_{uuid.uuid4().hex[:8]}",
+                        "name": f"{console_name} / {game_zip}",
+                        "game_url": game_url,
+                        "dest_path": str(dest_path),
+                        "size_str": "N/A",
+                    })
+                    existing_paths.add(str(dest_path))
+                    added += 1
+
+        if added:
+            self.state.update_active_queue(current_queue, immediate=True)
+            self.call_from_thread(self._refresh_queue_table)
+
+        self.post_message(SystemLog(
+            f"Batch import: queued [bold]{added}[/bold] item(s) from {len(lines)} line(s)."
+        ))
+
+    # ── Download scheduling (2F) ─────────────────────────────────────────────
+
+    def _schedule_download(self) -> None:
+        """Schedule downloads to start at the configured time."""
+        try:
+            time_input = self.query_one("#input-schedule-time", Input).value.strip()
+        except Exception:
+            time_input = ""
+
+        if not time_input:
+            self.notify("Enter a time in HH:MM format", severity="warning")
+            return
+
+        try:
+            hour, minute = map(int, time_input.split(":"))
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError
+        except (ValueError, AttributeError):
+            self.notify("Invalid time format. Use HH:MM (24h)", severity="warning")
+            return
+
+        now = datetime.datetime.now()
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += datetime.timedelta(days=1)
+
+        delay = (target - now).total_seconds()
+        self._scheduled_time = time_input
+
+        if self._schedule_timer is not None:
+            self._schedule_timer.stop()
+
+        def _start_at_time() -> None:
+            self._scheduled_time = ""
+            self._schedule_timer = None
+            self.start_download_engine()
+            self.notify("Scheduled download started!")
+
+        self._schedule_timer = self.set_timer(delay, _start_at_time)
+        self.notify(f"Downloads scheduled for {time_input} ({delay/3600:.1f}h from now)")
+        self.post_message(SystemLog(
+            f"Download engine scheduled for {time_input} ({delay/3600:.1f} hours from now)."
         ))
 
     @staticmethod
