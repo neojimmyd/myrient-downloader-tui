@@ -3262,7 +3262,6 @@ class MyrientTUI(App):
             "btn-lib-refresh-status": {"root"},
             "btn-ps2-md-patch":       {"console", "game"},
             "btn-requeue-failed":     {"root"},
-            "btn-requeue-corrupted":  {"root"},
             "btn-requeue-console":    {"console"},
         }
         for btn_id, levels in _vis.items():
@@ -3308,23 +3307,57 @@ class MyrientTUI(App):
         elif node_path.parent == library:
             t.append(node_path.name, style="bold #e6b73e")
         else:
-            status = self._lib_status.get(node_path)
-            if status == "validated":
-                t.append("✓ ", style="bold green")
-            elif status == "corrupted":
-                t.append("✗ ", style="bold red")
-            else:
-                t.append("~ ", style="yellow")
-            t.append(node_path.name, style="#c9d1d9")
-            # Show file details for game dirs
+            # Check if this is a multi-disc grouping folder
+            disc_subdirs: list[Path] = []
             try:
-                files = [f for f in node_path.iterdir() if f.is_file() and not f.name.startswith('.')]
-                if files:
-                    total_size = sum(f.stat().st_size for f in files)
-                    t.append(f"  {len(files)} file(s)", style="dim")
-                    t.append(f"  {MyrientTUI._format_size(total_size)}", style="dim #9aa0aa")
+                disc_subdirs = [
+                    d for d in node_path.iterdir()
+                    if d.is_dir() and DISC_REGEX.search(d.name)
+                ]
             except (PermissionError, OSError):
                 pass
+
+            if disc_subdirs:
+                # Multi-disc grouping folder — aggregate status from disc subdirs
+                statuses = {self._lib_status.get(d) for d in disc_subdirs}
+                if statuses == {"validated"}:
+                    t.append("✓ ", style="bold green")
+                elif "corrupted" in statuses:
+                    t.append("✗ ", style="bold red")
+                else:
+                    t.append("~ ", style="yellow")
+                t.append(node_path.name, style="#c9d1d9")
+                t.append(f"  {len(disc_subdirs)} disc(s)", style="dim")
+                try:
+                    total_files = 0
+                    total_size = 0
+                    for d in disc_subdirs:
+                        for f in d.iterdir():
+                            if f.is_file() and not f.name.startswith('.'):
+                                total_files += 1
+                                total_size += f.stat().st_size
+                    if total_files:
+                        t.append(f"  {total_files} file(s)", style="dim")
+                        t.append(f"  {MyrientTUI._format_size(total_size)}", style="dim #9aa0aa")
+                except (PermissionError, OSError):
+                    pass
+            else:
+                status = self._lib_status.get(node_path)
+                if status == "validated":
+                    t.append("✓ ", style="bold green")
+                elif status == "corrupted":
+                    t.append("✗ ", style="bold red")
+                else:
+                    t.append("~ ", style="yellow")
+                t.append(node_path.name, style="#c9d1d9")
+                try:
+                    files = [f for f in node_path.iterdir() if f.is_file() and not f.name.startswith('.')]
+                    if files:
+                        total_size = sum(f.stat().st_size for f in files)
+                        t.append(f"  {len(files)} file(s)", style="dim")
+                        t.append(f"  {MyrientTUI._format_size(total_size)}", style="dim #9aa0aa")
+                except (PermissionError, OSError):
+                    pass
         status_label.update(t)
 
     def on_library_progress(self, message: LibraryProgress) -> None:
@@ -4233,9 +4266,6 @@ class MyrientTUI(App):
                 self.notify(f"Imported {added} item(s) from {import_path}")
             except Exception as e:
                 self.notify(f"Import failed: {e}", severity="error")
-
-        elif button_id == "btn-requeue-corrupted":
-            self.requeue_failed_games(corrupted_only=True)
 
         elif button_id == "btn-clear-history":
             self.state.clear_history()
@@ -6331,8 +6361,8 @@ class MyrientTUI(App):
         return added
 
     @work(exclusive=True, thread=True)
-    def requeue_failed_games(self, corrupted_only: bool = False) -> None:
-        """Finds corrupted (and optionally incomplete) game dirs and adds them to the queue.
+    def requeue_failed_games(self) -> None:
+        """Finds corrupted and incomplete game dirs and adds them to the queue.
 
         Multi-disc parent folders (e.g. ``Resident Evil 2 (USA)/`` with no disc
         subfolders) are detected automatically: the console page is scraped to
@@ -6343,23 +6373,14 @@ class MyrientTUI(App):
             self.post_message(SystemLog("Re-queue: Library path not found.", True))
             return
 
-        # Walk library and keep only non-validated entries; generator means no full list built
-        if corrupted_only:
-            targets = [
-                (cn, gd, s)
-                for cn, gd, s in self._walk_library_game_dirs(library, self._lib_status)
-                if s == "corrupted"
-            ]
-        else:
-            targets = [
-                (cn, gd, s)
-                for cn, gd, s in self._walk_library_game_dirs(library, self._lib_status)
-                if s != "validated"
-            ]
+        targets = [
+            (cn, gd, s)
+            for cn, gd, s in self._walk_library_game_dirs(library, self._lib_status)
+            if s != "validated"
+        ]
 
         if not targets:
-            label = "corrupted" if corrupted_only else "incomplete or corrupted"
-            self.post_message(SystemLog(f"Re-queue: No {label} games found. Library looks clean!"))
+            self.post_message(SystemLog("Re-queue: No incomplete or corrupted games found. Library looks clean!"))
             return
 
         current_queue  = self.state.get_active_queue()

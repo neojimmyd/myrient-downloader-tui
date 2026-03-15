@@ -27,7 +27,6 @@ class LibraryPane(Vertical):
                 yield Button("Refresh", id="btn-lib-refresh-status", classes="lib-tb-btn")
                 yield Button("PS2 Patch", id="btn-ps2-md-patch", classes="lib-tb-btn")
                 yield Button("Requeue ✗", id="btn-requeue-failed", classes="lib-tb-btn")
-                yield Button("Requeue ~", id="btn-requeue-corrupted", classes="lib-tb-btn")
                 yield Button("Requeue Console", id="btn-requeue-console", classes="lib-tb-btn")
                 yield Label("Dry Run", id="lbl-dat-dry-run", classes="lib-tb-label --lib-hidden")
                 yield Switch(value=False, id="sw-dat-dry-run", classes="--lib-hidden")
