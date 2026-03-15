@@ -1,0 +1,528 @@
+/* ═══════════════════════════════════════════════════════════════════════
+   MYRIENT  —  Redesigned Terminal UI
+   Left-sidebar nav · semantic color vocabulary · responsive panels
+   Color roles: amber=nav-active  blue=actions  green=success  red=error
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* ── Base ─────────────────────────────────────────────────────── */
+Screen { background: #0d1117; color: #e6edf3; }
+
+/* ── Header / Footer ──────────────────────────────────────────── */
+Header {
+    background: #080c12;
+    color: #9aa0aa;
+    border-bottom: solid #1c2333;
+    height: 1;
+}
+Footer {
+    background: #080c12;
+    color: #3d4451;
+    border-top: solid #1c2333;
+}
+
+/* ── App body: sidebar + content ──────────────────────────────── */
+#app-body { height: 1fr; layout: horizontal; }
+
+/* ── Left navigation sidebar ──────────────────────────────────── */
+#nav-sidebar {
+    width: 20;
+    min-width: 18;
+    height: 1fr;
+    background: #080c12;
+    border-right: solid #1c2333;
+    layout: vertical;
+    padding: 0;
+}
+#nav-logo {
+    height: 3;
+    padding: 1 2;
+    color: #e6b73e;
+    text-style: bold;
+    border-bottom: solid #1c2333;
+    content-align: left middle;
+}
+.nav-btn {
+    width: 100%;
+    height: 3;
+    background: transparent;
+    border: none;
+    color: #3d4451;
+    text-align: left;
+    padding: 0 2;
+    margin: 0;
+    min-width: 1;
+    text-style: none;
+}
+.nav-btn:hover  { background: #0d1117; color: #9aa0aa; border: none; }
+.nav-btn:focus  { background: #0d1117; color: #9aa0aa; border: solid #1c2333; }
+.nav-btn.--nav-active {
+    background: #0d1117;
+    color: #e6b73e;
+    text-style: bold;
+    border-left: thick #e6b73e;
+}
+#nav-status {
+    height: auto;
+    padding: 1 2;
+    border-top: solid #1c2333;
+    color: #3d4451;
+    margin-top: 1;
+}
+
+/* ── Content area ─────────────────────────────────────────────── */
+#content-area { height: 1fr; width: 1fr; background: #0d1117; }
+.content-pane { height: 1fr; display: none; }
+
+/* ── Global status bar (engine · speed · queue) ───────────────── */
+#global-statusbar {
+    height: 1;
+    layout: horizontal;
+    background: #080c12;
+    border-top: solid #1c2333;
+    padding: 0 2;
+    align: left middle;
+}
+#gs-engine { width: auto; color: #3d4451; margin-right: 3; }
+#gs-speed  { width: auto; color: #3fb950; margin-right: 3; }
+#gs-queue  { width: 1fr;  color: #3d4451; text-align: right; }
+
+/* ── Section headers ──────────────────────────────────────────── */
+.section-header {
+    height: 1;
+    color: #606878;
+    text-style: bold;
+    padding: 0;
+    margin-bottom: 1;
+    border-bottom: solid #1c2333;
+}
+
+/* ── Hint bar ─────────────────────────────────────────────────── */
+.hint-bar {
+    height: auto;
+    color: #3d4451;
+    margin-top: 1;
+    text-align: right;
+}
+
+/* ── Inputs ───────────────────────────────────────────────────── */
+.search-bar { margin-bottom: 1; }
+Input {
+    background: #0d1117;
+    border: solid #1c2333;
+    color: #e6edf3;
+    height: 3;
+}
+Input:focus { border: solid #30415e; }
+
+/* ── ListViews ────────────────────────────────────────────────── */
+ListView { border: solid #1c2333; background: #0d1117; height: 1fr; }
+ListView > ListItem {
+    background: transparent;
+    padding: 0 1;
+    color: #9aa0aa;
+}
+ListView > ListItem.--highlight         { background: #0f1520; color: #e6edf3; }
+ListView:focus > ListItem.--highlight   { background: #0f1520; border-left: thick #58a6ff; }
+
+/* ── ◈ BROWSE pane ────────────────────────────────────────────── */
+#browse-layout { height: 1fr; layout: horizontal; }
+#browse-left {
+    width: 1fr;
+    min-width: 28;
+    max-width: 55;
+    height: 1fr;
+    background: #080c12;
+    border-right: solid #1c2333;
+    padding: 1 1 1 2;
+    layout: vertical;
+}
+#browse-console-header {
+    height: 1;
+    layout: horizontal;
+    margin-bottom: 1;
+}
+#browse-console-header .section-header { width: 1fr; margin-bottom: 0; border-bottom: none; }
+#console-count { width: auto; height: 1; color: #3d4451; content-align: right middle; }
+#browse-right {
+    width: 2fr;
+    height: 1fr;
+    padding: 1 2;
+    layout: vertical;
+}
+#breadcrumb { height: 1; color: #3d4451; margin-bottom: 0; }
+#browse-search-bar { height: auto; layout: horizontal; align: left middle; }
+#browse-search-bar .search-bar { width: 1fr; }
+.browse-global-btn { width: auto; min-width: 10; height: 3; margin: 0 0 1 1; }
+#browse-toolbar {
+    height: auto;
+    layout: horizontal;
+    align: left middle;
+    margin-bottom: 1;
+}
+#browse-toolbar Button { width: auto; min-width: 8; margin: 0 1 0 0; height: 3; }
+#game-list {
+    height: 1fr;
+    border: solid #1c2333;
+    background: #0d1117;
+}
+#game-list > .datatable--header { display: none; }
+#console-list { height: 1fr; border: solid #1c2333; background: #0d1117; }
+#game-selection-count {
+    width: auto;
+    color: #3fb950;
+    text-style: bold;
+    margin: 0 0 0 1;
+    height: 3;
+    content-align: left middle;
+}
+#browse-empty-state {
+    height: 1fr;
+    width: 1fr;
+    content-align: center middle;
+    color: #3d4451;
+}
+
+/* ── ▶ DOWNLOADS pane ─────────────────────────────────────────── */
+#downloads-layout { height: 1fr; layout: horizontal; }
+#queue-panel {
+    width: 40%;
+    min-width: 34;
+    max-width: 60;
+    height: 1fr;
+    background: #080c12;
+    border-right: solid #1c2333;
+    padding: 1 2;
+    layout: vertical;
+}
+#queue-table { height: 1fr; border: solid #1c2333; background: #0d1117; }
+#queue-total-size { height: 1; color: #3d4451; margin-top: 1; }
+.queue-toolbar  { height: auto; margin-bottom: 1; layout: vertical; }
+.queue-controls { height: auto; layout: horizontal; margin-top: 1; align: left middle; }
+/* Queue settings collapsible replaces old .queue-settings-row */
+#queue-settings-collapsible {
+    height: auto;
+    margin-top: 1;
+}
+
+/* Progress panel */
+#progress-panel {
+    width: 1fr;
+    height: 1fr;
+    padding: 1 2;
+    layout: vertical;
+}
+#lbl-global-progress { height: 1; color: #9aa0aa; margin-bottom: 0; }
+#global-progress     { margin-bottom: 1; display: none; }
+#progress-area       { height: 1fr; overflow-y: auto; layout: vertical; }
+#history-collapsible { height: auto; max-height: 16; margin-top: 1; }
+#history-table       { height: auto; max-height: 12; border: solid #1c2333; background: #0d1117; }
+#progress-grid {
+    layout: grid;
+    grid-size: 2;
+    grid-gutter: 1 2;
+    height: auto;
+    min-height: 4;
+}
+.progress-container {
+    height: 7;
+    padding: 1;
+    border: solid #1c2333;
+    background: #080c12;
+    overflow: hidden;
+}
+ProgressBar > .bar--bar      { color: #58a6ff; }
+ProgressBar > .bar--complete { color: #3fb950; }
+.speed-label { color: #3fb950; height: 1; }
+
+/* ── ⊞ LIBRARY pane ───────────────────────────────────────────── */
+#lib-tab-wrapper { height: 1fr; layout: vertical; }
+#lib-header-bar {
+    height: 1;
+    layout: horizontal;
+    padding: 0 1;
+    background: #080c12;
+}
+#lib-summary-bar {
+    width: 1fr;
+    height: 1;
+    color: #3d4451;
+    content-align: left middle;
+}
+.lib-hdr-btn { width: 5; height: 1; color: #606878; content-align: center middle; background: #161b22; }
+.lib-hdr-btn:hover { color: #c9d1d9; background: #21262d; }
+.lib-hdr-del { color: #f85149; }
+.lib-hdr-del:hover { color: #ff7b72; background: #21262d; }
+#lib-toolbar {
+    height: auto;
+    min-height: 3;
+    layout: horizontal;
+    content-align: left middle;
+    padding: 0 1;
+    background: #080c12;
+    overflow: hidden auto;
+}
+.lib-tb-btn { width: auto; min-width: 8; margin: 0 1 0 0; height: 3; }
+.lib-tb-label { height: 3; content-align: left middle; margin: 0 1 0 0; color: #9aa0aa; }
+.--lib-hidden { display: none; }
+#lib-search { margin: 0 1; }
+#lib-tree {
+    height: 1fr;
+    border: solid #1c2333;
+    background: #0d1117;
+    margin: 0 1 0 1;
+}
+#lib-tree > .tree--guides { color: #1c2333; }
+#lib-tree > .tree--cursor { background: #0f1520; }
+#lib-status-bar {
+    height: 3;
+    padding: 0 2;
+    border-top: solid #1c2333;
+    background: #080c12;
+    layout: horizontal;
+    align: left middle;
+}
+#lib-status-label {
+    width: 1fr;
+    height: auto;
+    color: #9aa0aa;
+    content-align: left middle;
+}
+#lib-status-bar ProgressBar { width: 35%; display: none; }
+#lib-progress-bar { display: none; }
+
+/* ── ◎ SETTINGS pane (TabbedContent layout) ─────────────────── */
+#settings-tabs { height: 1fr; }
+#settings-tabs > ContentSwitcher { height: 1fr; }
+TabPane { padding: 0; }
+TabPane > VerticalScroll { height: 1fr; padding: 1 2; }
+.setting-label { margin-top: 1; color: #9aa0aa; }
+.filter-table  {
+    height: 8;
+    border: solid #1c2333;
+    margin-bottom: 1;
+    background: #0d1117;
+}
+.filter-table > .datatable--header { display: none; }
+.filter-table > .datatable--cursor { background: #0f1520; }
+.preset-row { height: auto; margin-bottom: 1; layout: horizontal; }
+Switch { background: transparent; }
+
+/* ── Collapsible widget styling ───────────────────────────────── */
+Collapsible { background: transparent; padding: 0; margin: 0 0 1 0; }
+CollapsibleTitle {
+    background: #080c12;
+    color: #9aa0aa;
+    border: solid #1c2333;
+    padding: 0 1;
+    height: 3;
+}
+CollapsibleTitle:hover { background: #0f1520; color: #e6edf3; }
+CollapsibleTitle:focus { border: solid #30415e; }
+
+/* ── TabbedContent tab bar styling ────────────────────────────── */
+Tabs { background: #080c12; border-bottom: solid #1c2333; }
+Tab { background: transparent; color: #3d4451; padding: 0 2; height: 3; }
+Tab:hover { color: #9aa0aa; }
+Tab.-active { color: #e6b73e; border-bottom: thick #e6b73e; }
+Tab:focus { text-style: bold; }
+
+/* ── Rule (horizontal divider) ────────────────────────────────── */
+Rule { color: #1c2333; margin: 1 0; }
+
+/* ── ≡ LOGS pane ──────────────────────────────────────────────── */
+#logs-layout { height: 1fr; layout: vertical; }
+#log-toolbar {
+    height: auto;
+    min-height: 3;
+    layout: horizontal;
+    margin-bottom: 1;
+    align: left middle;
+    border-bottom: solid #1c2333;
+    padding-bottom: 1;
+}
+.log-filter-btn {
+    min-width: 8;
+    margin: 0 1 0 0;
+    background: #080c12;
+    border: solid #1c2333;
+    color: #3d4451;
+    height: 3;
+    text-style: none;
+}
+.log-filter-btn:hover { background: #0f1520; color: #9aa0aa; border: solid #1c2333; }
+.log-filter-btn.--log-active { color: #e6b73e; border: solid #30415e; background: #0f1520; }
+#log-search { width: 1fr; margin-left: 1; }
+RichLog {
+    height: 1fr;
+    border: none;
+    background: #0d1117;
+    color: #9aa0aa;
+}
+#sessions-divider {
+    color: #1c2333;
+    margin: 0;
+}
+#sessions-layout { height: 30%; min-height: 8; layout: horizontal; }
+#session-log-list {
+    width: 30%;
+    min-width: 22;
+    height: 1fr;
+    border: solid #1c2333;
+    background: #0d1117;
+}
+#session-log-view {
+    width: 1fr;
+    height: 1fr;
+    border: solid #1c2333;
+    background: #0d1117;
+    color: #9aa0aa;
+    margin-left: 1;
+}
+
+/* ── Buttons — semantic color vocabulary ──────────────────────── */
+Button {
+    background: #0d1117;
+    color: #9aa0aa;
+    border: solid #1c2333;
+    margin: 0 1 0 0;
+    min-width: 10;
+    text-style: none;
+    height: 3;
+}
+Button:hover { background: #0f1520; color: #e6edf3; border: solid #30415e; }
+Button:focus  { border: solid #30415e; color: #e6edf3; }
+
+/* Blue — actions (primary) */
+Button.-primary  { background: #0d1926; color: #58a6ff; border: solid #1f4070; }
+Button.-primary:hover { background: #1f4070; color: #e6edf3; border: solid #58a6ff; }
+
+/* Green — add / confirm */
+Button.-success  { background: #0d2318; color: #3fb950; border: solid #196327; }
+Button.-success:hover { background: #196327; color: #e6edf3; border: solid #3fb950; }
+
+/* Red — destructive */
+Button.-error    { background: #2a0e0e; color: #f85149; border: solid #6e1a1a; }
+Button.-error:hover { background: #6e1a1a; color: #e6edf3; border: solid #f85149; }
+
+/* Amber — warning */
+Button.-warning  { background: #1a1400; color: #d29922; border: solid #5a3e00; }
+Button.-warning:hover { background: #5a3e00; color: #e6edf3; border: solid #d29922; }
+
+.btn-row {
+    height: auto;
+    align: left middle;
+    margin-top: 1;
+    layout: horizontal;
+}
+.reorder-btn { min-width: 5; width: 5; margin: 0 1 0 0; }
+
+/* ── Confirm dialog ───────────────────────────────────────────── */
+ConfirmDeleteScreen { align: center middle; background: rgba(0,0,0,0.82); }
+#dialog {
+    padding: 2 3;
+    width: 68;
+    height: auto;
+    min-height: 10;
+    border: thick #f85149;
+    background: #0d1117;
+    align: center middle;
+}
+#question {
+    width: 1fr;
+    content-align: center middle;
+    text-align: center;
+    height: auto;
+    color: #e6edf3;
+    text-style: bold;
+    padding: 1 0 2 0;
+}
+#dialog-btn-row { height: auto; align: center middle; width: 1fr; layout: horizontal; }
+#dialog-btn-row Button { width: 1fr; margin: 0 1; }
+
+/* ── Help modal ───────────────────────────────────────────────── */
+HelpModal { align: center middle; background: rgba(0,0,0,0.82); }
+#help-dialog {
+    padding: 2 3;
+    width: 62;
+    height: auto;
+    border: solid #30415e;
+    background: #0d1117;
+    layout: vertical;
+}
+#help-title   { color: #e6b73e; text-style: bold; margin-bottom: 1; height: auto; }
+.help-row     { height: 1; color: #9aa0aa; }
+.help-key     { color: #58a6ff; }
+#help-close   { margin-top: 2; }
+
+/* ═══════════════════════════════════════════════════════════════════════
+   LIGHT THEME OVERRIDES
+   Activated when user toggles theme with Ctrl+D
+   Screen.-light-mode is the Textual CSS class added in light mode.
+   ═══════════════════════════════════════════════════════════════════════ */
+Screen.-light-mode { background: #ffffff; color: #1f2328; }
+Screen.-light-mode Header { background: #f6f8fa; color: #656d76; border-bottom: solid #d0d7de; }
+Screen.-light-mode Footer { background: #f6f8fa; color: #656d76; border-top: solid #d0d7de; }
+Screen.-light-mode #nav-sidebar { background: #f6f8fa; border-right: solid #d0d7de; }
+Screen.-light-mode #nav-logo { color: #9a6700; border-bottom: solid #d0d7de; }
+Screen.-light-mode .nav-btn { color: #656d76; }
+Screen.-light-mode .nav-btn:hover { background: #ffffff; color: #1f2328; }
+Screen.-light-mode .nav-btn:focus { background: #ffffff; color: #1f2328; border: solid #d0d7de; }
+Screen.-light-mode .nav-btn.--nav-active { background: #ffffff; color: #9a6700; border-left: thick #9a6700; }
+Screen.-light-mode #nav-status { border-top: solid #d0d7de; color: #656d76; }
+Screen.-light-mode #content-area { background: #ffffff; }
+Screen.-light-mode #global-statusbar { background: #f6f8fa; border-top: solid #d0d7de; }
+Screen.-light-mode #gs-engine { color: #656d76; }
+Screen.-light-mode #gs-speed { color: #1a7f37; }
+Screen.-light-mode #gs-queue { color: #656d76; }
+Screen.-light-mode .section-header { color: #656d76; border-bottom: solid #d0d7de; }
+Screen.-light-mode .search-bar { background: #f6f8fa; color: #1f2328; border: solid #d0d7de; }
+Screen.-light-mode .search-bar:focus { border: solid #0969da; }
+Screen.-light-mode #breadcrumb { color: #656d76; background: #f6f8fa; border-bottom: solid #d0d7de; }
+Screen.-light-mode DataTable { background: #ffffff; color: #1f2328; }
+Screen.-light-mode DataTable > .datatable--header { background: #f6f8fa; color: #656d76; }
+Screen.-light-mode DataTable > .datatable--cursor { background: #ddf4ff; color: #1f2328; }
+Screen.-light-mode .console-list-container { background: #f6f8fa; border-right: solid #d0d7de; }
+Screen.-light-mode ListView { background: #f6f8fa; }
+Screen.-light-mode ListView > ListItem { color: #656d76; }
+Screen.-light-mode ListView > ListItem.-highlight { background: #ddf4ff; }
+Screen.-light-mode Tree { background: #ffffff; color: #1f2328; }
+Screen.-light-mode Tree > .tree--cursor { background: #ddf4ff; color: #1f2328; }
+Screen.-light-mode #lib-header-bar { background: #f6f8fa; border-bottom: solid #d0d7de; }
+Screen.-light-mode #lib-toolbar { background: #f6f8fa; }
+Screen.-light-mode #lib-tree { background: #ffffff; }
+Screen.-light-mode #lib-tree > .tree--cursor { background: #ddf4ff; color: #1f2328; }
+Screen.-light-mode RichLog { background: #ffffff; color: #1f2328; }
+Screen.-light-mode Input { background: #f6f8fa; color: #1f2328; border: solid #d0d7de; }
+Screen.-light-mode Input:focus { border: solid #0969da; }
+Screen.-light-mode Button { background: #f6f8fa; color: #1f2328; border: solid #d0d7de; }
+Screen.-light-mode Button:hover { background: #eaeef2; }
+Screen.-light-mode ProgressBar Bar { background: #eaeef2; }
+Screen.-light-mode ProgressBar Bar > .bar--bar { color: #0969da; }
+Screen.-light-mode Collapsible { background: #ffffff; }
+Screen.-light-mode CollapsibleTitle { color: #656d76; }
+Screen.-light-mode Select { background: #f6f8fa; color: #1f2328; }
+Screen.-light-mode Switch { background: #eaeef2; }
+Screen.-light-mode TabbedContent ContentSwitcher { background: #ffffff; }
+Screen.-light-mode TabbedContent Tab { color: #656d76; }
+Screen.-light-mode TabbedContent Tab.-active { color: #0969da; }
+Screen.-light-mode Rule { color: #d0d7de; }
+Screen.-light-mode #queue-table { background: #ffffff; }
+Screen.-light-mode #help-modal-content { background: #ffffff; }
+Screen.-light-mode #help-title { color: #9a6700; }
+Screen.-light-mode .help-row { color: #1f2328; }
+Screen.-light-mode .help-key { color: #0969da; }
+
+/* ── Light theme: missing overrides ──────────────────────────── */
+Screen.-light-mode ConfirmDeleteScreen { background: rgba(255,255,255,0.82); }
+Screen.-light-mode #dialog { background: #ffffff; border: thick #cf222e; }
+Screen.-light-mode #question { color: #1f2328; }
+Screen.-light-mode #queue-settings-collapsible { background: #ffffff; }
+Screen.-light-mode #queue-settings-collapsible Input { background: #f6f8fa; color: #1f2328; border: solid #d0d7de; }
+Screen.-light-mode #lib-status-bar { background: #f6f8fa; border-top: solid #d0d7de; }
+Screen.-light-mode #lib-status-label { color: #656d76; }
+Screen.-light-mode #queue-total-size { color: #656d76; }
+Screen.-light-mode HelpModal { background: rgba(255,255,255,0.82); }
+Screen.-light-mode #help-dialog { background: #ffffff; border: solid #d0d7de; }
+
+/* ── Nav button flash animation ──────────────────────────────── */
+.nav-btn.--nav-flash { color: #3fb950; text-style: bold; }

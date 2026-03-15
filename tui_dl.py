@@ -112,6 +112,14 @@ _TOOLS_DIR.mkdir(parents=True, exist_ok=True)
 BASE_URL        = "https://myrient.erista.me/files/Redump/"
 DAT_BASE_URL    = "https://myrient.erista.me/dats/Redump/"
 
+# N5: Collection base URLs — selectable via Settings → Engine tab.
+# Each entry maps a display name to (files_base_url, dats_base_url).
+# dats_base_url may be empty if the collection has no DAT audit support.
+_COLLECTIONS: dict[str, tuple[str, str]] = {
+    "Redump":   (BASE_URL, DAT_BASE_URL),
+    "No-Intro": ("https://myrient.erista.me/files/No-Intro/", "https://myrient.erista.me/dats/No-Intro/"),
+}
+
 # PS2 Master Disc Patcher — extracted from the PSDB v1.0.5 x86_64 release zip.
 # The release zip layout is:
 #   playstation-disc-burner-v1.0.5-x86_64/
@@ -423,6 +431,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "watch_library": False,         # auto-rescan library when files change (requires watchdog)
     "dat_dry_run": False,           # preview audit renames without touching files
     "notify_on_batch_complete": True,  # desktop notification when batch finishes
+    "favorite_consoles": [],        # pinned console names shown at top of browse list
+    "collection": "Redump",         # active Myrient collection (Redump, No-Intro)
 }
 
 
@@ -883,36 +893,6 @@ class LibraryStatus:
 
 # --- Custom UI Components & Messages ---
 
-class GameSearchInput(Input):
-    """Search input that intercepts ↑↓ / Tab / Enter before Input consumes them.
-
-    Textual's Input widget handles keys internally in ``_on_key`` before they
-    bubble to the App.  Up/down arrows and enter are all swallowed that
-    way, so App.on_key never sees them when this widget is focused.
-
-    Tab is intercepted here to toggle the highlighted game's selection while
-    keeping focus on the search box, rather than moving focus to the next widget.
-    Space is left alone so users can type multi-word searches freely.
-    """
-
-    class NavUp(Message):           pass
-    class NavDown(Message):         pass
-    class ToggleAtCursor(Message):  pass
-    class QueueSelected(Message):   pass
-
-    def _on_key(self, event: Key) -> None:
-        match event.key:
-            case "up":    self.post_message(self.NavUp())
-            case "down":  self.post_message(self.NavDown())
-            case "tab":   self.post_message(self.ToggleAtCursor())
-            case "enter": self.post_message(self.QueueSelected())
-            case _:
-                super()._on_key(event)
-                return
-        event.prevent_default()
-        event.stop()
-
-
 class SystemLog(Message):
     def __init__(self, message: str, is_error: bool = False):
         self.message = message
@@ -1018,21 +998,28 @@ class HelpModal(ModalScreen):
                 ("Ctrl+D",    "Toggle dark/light theme"),
                 ("Ctrl+R",    "Refresh console list"),
                 ("Ctrl+J",    "Jump queue item → Browser"),
+                ("Escape",    "Blur focused input"),
                 ("?",         "Show this help"),
                 ("",          ""),
                 ("── Browse ──", ""),
                 ("↑ ↓",       "Navigate lists and tables"),
                 ("Space",     "Toggle game selection"),
-                ("Tab",       "Toggle game selection (browser)"),
+                ("Tab",       "Toggle game selection (search box)"),
                 ("Enter / q", "Queue selected games"),
+                ("Global",    "Toggle cross-console search"),
                 ("",          ""),
                 ("── Queue ──", ""),
-                ("Delete",    "Remove highlighted queue item"),
+                ("Space",     "Multi-select queue items"),
+                ("Shift+Spc", "Range-select queue items"),
+                ("Delete",    "Remove selected queue item(s)"),
                 ("Shift+↑",  "Move queue item up"),
                 ("Shift+↓",  "Move queue item down"),
                 ("",          ""),
+                ("── Library ──", ""),
+                ("▸ / ▾ / ✕",  "Expand / collapse / delete (header)"),
+                ("",          ""),
                 ("── Nav ──",  ""),
-                ("1–5",       "Switch nav pane (browse/dl/lib/set/logs)"),
+                ("1–5",       "Switch pane (when not in input)"),
             ]
             for key, desc in rows:
                 if not key:
@@ -1619,198 +1606,615 @@ class Toolchain:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Pane widget classes — purely for compose() organisation.
-# All event handling, state, and workers remain on MyrientTUI.
-# Messages bubble up through the DOM normally; query_one() searches all
-# descendants, so nothing changes for the handler layer.
+# Pane widgets extracted to panes/ package (A2).  Import them here so the
+# rest of the file can reference BrowsePane etc. without changes.
+# ─────────────────────────────────────────────────────────────────────────────
+from panes import BrowsePane, DownloadsPane, GameSearchInput, LibraryPane, SettingsPane, LogsPane
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Library operation base (A4) — shared helpers for cancel-flag management,
+# scope resolution, progress/log posting, and library-status access.
 # ─────────────────────────────────────────────────────────────────────────────
 
-class BrowsePane(Vertical):
-    """Console browser + game selection."""
+class LibraryOperation:
+    """Base class for library worker operations with shared helpers.
 
-    def compose(self) -> ComposeResult:
-        with Horizontal(id="browse-layout"):
-            with Vertical(id="browse-left"):
-                with Horizontal(id="browse-console-header"):
-                    yield Label("Consoles", classes="section-header")
-                    yield Label("", id="console-count")
-                yield Input(placeholder="  filter consoles…", id="search-consoles", classes="search-bar")
-                yield ListView(id="console-list")
-            with Vertical(id="browse-right"):
-                yield Label("", id="breadcrumb")
-                with Horizontal(id="browse-search-bar"):
-                    yield GameSearchInput(placeholder="  search games…", id="search-games", classes="search-bar")
-                    yield Button("Global", id="btn-toggle-global", classes="browse-global-btn")
-                with Horizontal(id="browse-toolbar"):
-                    yield Button("Queue Selected", id="btn-add-queue", variant="success")
-                    yield Button("Select All", id="btn-select-all")
-                    yield Button("Refresh", id="btn-refresh-games")
-                    yield Label("", id="game-selection-count")
-                yield DataTable(id="game-list", cursor_type="row", zebra_stripes=False)
-                yield Label(
-                    "Select a console to browse games",
-                    id="browse-empty-state",
+    Encapsulates the common patterns: cancel-flag management, scope resolution,
+    progress/log posting, and library-status access.
+    """
+
+    def __init__(self, app: MyrientTUI, scope: Path | None = None) -> None:
+        self.app = app
+        self.scope = scope
+        self.cancel = app._lib_cancel
+        self.cancel.clear()
+        self.library = Path(app.state.settings['library_root'])
+        self.lib_status = app._lib_status
+
+    @property
+    def cancelled(self) -> bool:
+        return self.cancel.is_set()
+
+    def log(self, msg: str, error: bool = False) -> None:
+        self.app.post_message(SystemLog(msg, error))
+
+    def progress(self, label: str, detail: str, current: int, total: int) -> None:
+        self.app.post_message(LibraryProgress(label, detail, current, total))
+
+    def resolve_scope(self) -> list[tuple[Path, list[Path]]]:
+        """Resolve scope to list of (console_dir, [game_dirs]) pairs.
+
+        Handles three levels:
+        - scope=None or scope=library root -> all consoles
+        - scope=console dir -> single console
+        - scope=game dir -> single game (parent is console)
+        """
+        if not self.library.exists():
+            self.log("Library path not found.", True)
+            return []
+
+        scope = self.scope
+
+        if scope is None or scope == self.library:
+            # Full library scan
+            try:
+                console_dirs = sorted(
+                    d for d in self.library.iterdir()
+                    if d.is_dir() and not d.name.startswith('.')
                 )
+            except PermissionError:
+                return []
+            result = []
+            for cd in console_dirs:
+                try:
+                    games = sorted(
+                        g for g in cd.iterdir()
+                        if g.is_dir() and not g.name.startswith('.')
+                    )
+                except PermissionError:
+                    continue
+                if games:
+                    result.append((cd, games))
+            return result
 
-
-class DownloadsPane(Vertical):
-    """Queue management + active download progress."""
-
-    def compose(self) -> ComposeResult:
-        with Horizontal(id="downloads-layout"):
-            with Vertical(id="queue-panel"):
-                yield Label("Queue", classes="section-header")
-                with Vertical(classes="queue-toolbar"):
-                    yield Select([], id="queue-select", prompt="active profile…")
-                    yield Input(placeholder="new profile name…", id="input-new-queue")
-                    with Horizontal(classes="btn-row"):
-                        yield Button("Create", id="btn-create-queue", variant="success")
-                        yield Button("Delete", id="btn-delete-queue", variant="error")
-                yield DataTable(id="queue-table")
-                with Horizontal(classes="queue-controls"):
-                    yield Button("▲", id="btn-queue-up", classes="reorder-btn")
-                    yield Button("▼", id="btn-queue-down", classes="reorder-btn")
-                    yield Button("Remove", id="btn-remove-items", variant="warning")
-                    yield Button("▶ Start", id="btn-start-dl", variant="primary")
-                    yield Button("■ Stop", id="btn-pause-dl", variant="error")
-                with Horizontal(classes="btn-row"):
-                    yield Label("[dim]Schedule:[/dim]", classes="setting-label")
-                    yield Input(placeholder="HH:MM (empty=now)", id="input-schedule-time", classes="schedule-input")
-                    yield Button("⏱ Schedule", id="btn-schedule-dl")
-                with Horizontal(classes="btn-row"):
-                    yield Button("Export", id="btn-export-queue", variant="default")
-                    yield Button("Import", id="btn-import-queue", variant="default")
-                with Collapsible(title="Queue Settings", collapsed=True, id="queue-settings-collapsible"):
-                    yield Label("[dim]Per-queue speed limit (MB/s, 0=unlimited)[/dim]")
-                    yield Input(placeholder="0", id="input-queue-speed-limit")
-                    yield Label("[dim]Max concurrent downloads (blank=use global)[/dim]")
-                    yield Input(placeholder="", id="input-queue-max-concurrent")
-                    yield Button("Apply to Queue", id="btn-apply-queue-settings")
-                yield Label(
-                    "[dim]Ctrl+J[/dim] jump to console  [dim]?[/dim] help",
-                    classes="hint-bar",
+        if scope.parent == self.library:
+            # Console-level scope
+            try:
+                games = sorted(
+                    g for g in scope.iterdir()
+                    if g.is_dir() and not g.name.startswith('.')
                 )
+            except PermissionError:
+                return []
+            return [(scope, games)] if games else []
 
-            with Vertical(id="progress-panel"):
-                yield Label("▸ DOWNLOAD PROGRESS", id="lbl-global-progress")
-                yield ProgressBar(id="global-progress", show_eta=True)
-                with VerticalScroll(id="progress-area"):
-                    with Container(id="progress-grid"):
-                        pass
-                with Collapsible(title="Download History", collapsed=True, id="history-collapsible"):
-                    yield DataTable(id="history-table")
-                    yield Button("Clear History", id="btn-clear-history", variant="warning")
+        # Game-level scope
+        console_dir = scope.parent
+        return [(console_dir, [scope])]
 
-
-class LibraryPane(Vertical):
-    """Library tree view + contextual detail panel."""
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="lib-tab-wrapper"):
-            # ── Header: merged summary + compact tree controls ────────────
-            with Horizontal(id="lib-header-bar"):
-                yield Label("", id="lib-summary-bar")
-                yield Label(" ▸ ", id="btn-lib-expand-all", classes="lib-hdr-btn")
-                yield Label(" ▾ ", id="btn-lib-collapse-all", classes="lib-hdr-btn")
-                yield Label(" ✕ ", id="btn-lib-delete", classes="lib-hdr-btn lib-hdr-del")
-            # ── Contextual toolbar (horizontal, above tree) ──────────────
-            with Horizontal(id="lib-toolbar"):
-                yield Button("Verify DAT", id="btn-lib-dat-audit", classes="lib-tb-btn")
-                yield Button("Convert CHD", id="btn-lib-convert", classes="lib-tb-btn")
-                yield Button("CHD→Orig", id="btn-lib-chd-to-orig", classes="lib-tb-btn")
-                yield Button("Organize", id="btn-lib-organize", classes="lib-tb-btn")
-                yield Button("Refresh", id="btn-lib-refresh-status", classes="lib-tb-btn")
-                yield Button("PS2 Patch", id="btn-ps2-md-patch", classes="lib-tb-btn")
-                yield Button("Requeue ✗", id="btn-requeue-failed", classes="lib-tb-btn")
-                yield Button("Requeue ~", id="btn-requeue-corrupted", classes="lib-tb-btn")
-                yield Button("Requeue Console", id="btn-requeue-console", classes="lib-tb-btn")
-                yield Label("Dry Run", id="lbl-dat-dry-run", classes="lib-tb-label --lib-hidden")
-                yield Switch(value=False, id="sw-dat-dry-run", classes="--lib-hidden")
-            # ── Tree (full width) ─────────────────────────────────────────
-            yield Tree("Library", id="lib-tree")
-            # ── Status bar ────────────────────────────────────────────────
-            with Container(id="lib-status-bar"):
-                yield Label("Idle", id="lib-status-label")
-                yield ProgressBar(id="lib-progress-bar", show_eta=True)
+    def scope_label(self) -> str:
+        """Return a human-readable label for the current scope."""
+        scope = self.scope
+        if scope is None or scope == self.library:
+            return "full library"
+        if scope.parent == self.library:
+            return f"console [{scope.name}]"
+        return f"game [{scope.name}]"
 
 
-class SettingsPane(Vertical):
-    """Settings organised into tabbed sections."""
+# ─────────────────────────────────────────────────────────────────────────────
+# Download worker (A3) — encapsulates per-download state so MyrientTUI only
+# needs a thin one-liner to kick off a download.
+# ─────────────────────────────────────────────────────────────────────────────
 
-    def compose(self) -> ComposeResult:
-        with TabbedContent(id="settings-tabs"):
-            with TabPane("Engine", id="tab-engine"):
-                with VerticalScroll():
-                    yield Label("Library root path", classes="setting-label")
-                    yield Input(id="set-lib-path")
-                    yield Label("Max concurrent downloads  [dim](1–10)[/dim]", classes="setting-label")
-                    yield Input(id="set-threads")
-                    yield Label("Global speed limit per download  [dim](MB/s, 0=unlimited)[/dim]", classes="setting-label")
-                    yield Input(id="set-speed-limit")
-                    yield Label("DAT cache TTL  [dim](hours, 0=always refresh)[/dim]", classes="setting-label")
-                    yield Input(id="set-dat-ttl")
-                    yield Rule()
-                    yield Label("Auto-convert to CHD after download", classes="setting-label")
-                    yield Switch(id="set-auto-chd")
-                    yield Label("Watch library for changes  [dim](requires watchdog)[/dim]", classes="setting-label")
-                    yield Switch(id="set-watch-library")
-                    yield Label("Desktop notification on batch complete", classes="setting-label")
-                    yield Switch(id="set-notify-batch")
-                    yield Rule()
-                    yield Button("▸ Save Settings", id="btn-save-settings", variant="success")
-            with TabPane("Filters", id="tab-filters"):
-                with VerticalScroll():
-                    yield Label("Include Filter", classes="section-header")
-                    yield Label("[dim]Show only matching regions (empty = show all)[/dim]", classes="setting-label")
-                    yield DataTable(id="set-include", classes="filter-table")
-                    yield Label("[dim]Additional include regex[/dim]", classes="setting-label")
-                    yield Input(placeholder="e.g. (USA|World).*Disc 1", id="set-custom-include")
-                    yield Label("Exclude Filter", classes="section-header")
-                    yield Label("[dim]Hide games matching these tags[/dim]", classes="setting-label")
-                    yield DataTable(id="set-exclude", classes="filter-table")
-                    yield Label("[dim]Additional exclude regex[/dim]", classes="setting-label")
-                    yield Input(placeholder="e.g. Demo|Sample|Promo", id="set-custom-exclude")
-                    yield Rule()
-                    yield Button("✕ Clear Filters", id="btn-clear-filters", variant="warning", classes="ops-btn")
-                    yield Rule()
-                    yield Label("Filter Presets", classes="section-header")
-                    yield Label("[dim]Save/load current filter combination as a named preset[/dim]", classes="setting-label")
-                    yield Input(placeholder="preset name…", id="input-preset-name")
-                    with Horizontal(classes="preset-row"):
-                        yield Button("Save Preset", id="btn-save-preset", variant="success")
-                        yield Button("Load Preset", id="btn-load-preset", variant="primary")
-                        yield Button("Del Preset", id="btn-del-preset", variant="error")
-                    yield Select([], id="preset-select", prompt="choose preset…")
-            with TabPane("Tools", id="tab-tools"):
-                with VerticalScroll():
-                    yield Label("[dim]Install or locate conversion / patching tools[/dim]", classes="setting-label")
-                    yield Button("Setup chdman", id="btn-setup-chdman", classes="ops-btn")
-                    yield Button("Setup PS2 Patcher", id="btn-setup-ps2mdp", classes="ops-btn")
-                    yield Rule()
-                    yield Label("[dim]Pre-cache all console game lists for faster browsing[/dim]", classes="setting-label")
-                    yield Button("Prefetch All Consoles", id="btn-prefetch-consoles", classes="ops-btn")
-                    yield Rule()
-                    yield Label("Batch Queue Import", classes="section-header")
-                    yield Label("[dim]Import game URLs or names from a text file (one per line)[/dim]", classes="setting-label")
-                    yield Input(placeholder="path to .txt file…", id="input-batch-import-path")
-                    yield Button("Import from File", id="btn-batch-import", classes="ops-btn")
+class DownloadWorker:
+    """Encapsulates all state and logic for a single download task.
 
+    Created by ``MyrientTUI._download_worker`` with the owning app instance
+    and the ``QueueItem`` to process.  Call :meth:`run` to execute the full
+    download pipeline: skip-check -> retry-loop -> extract -> CHD.
+    """
 
-class LogsPane(Vertical):
-    """System log + session file browser."""
+    def __init__(self, app: "MyrientTUI", item: QueueItem) -> None:
+        self.app = app
+        self.item = item
+        self.dest_dir = Path(item["dest_path"])
+        _url_path = urllib.parse.urlparse(item["game_url"]).path
+        self.target_file = self.dest_dir / unquote(_url_path.split("/")[-1])
+        self.item_name = item["name"]
+        self.size_bytes = 1
+        self.speed_samples: deque[tuple[float, int]] = deque()
+        self.speed_limit_bps = 0
 
-    def compose(self) -> ComposeResult:
-        with Vertical(id="logs-layout"):
-            with Horizontal(id="log-toolbar"):
-                yield Button("All", id="log-filter-all", classes="log-filter-btn")
-                yield Button("Errors", id="log-filter-err", classes="log-filter-btn")
-                yield Input(placeholder="  search logs…", id="log-search")
-                yield Button("↺ Sessions", id="btn-refresh-session-logs")
-            yield RichLog(id="sys-log", markup=True, wrap=True, max_lines=2000)
-            yield Rule(id="sessions-divider")
-            with Horizontal(id="sessions-layout"):
-                yield ListView(id="session-log-list")
-                yield RichLog(id="session-log-view", markup=False, wrap=True, max_lines=5000)
+    # ── Speed computation ────────────────────────────────────────────────
+
+    @staticmethod
+    def _compute_speed(
+        cur_bytes: int,
+        size_bytes: int,
+        speed_samples: "deque[tuple[float, int]]",
+    ) -> tuple[float, float]:
+        """Return ``(speed_bps, eta_secs)`` from a rolling sample window.
+
+        Appends the current snapshot to *speed_samples*, evicts entries older
+        than ``_SPEED_WINDOW``, then computes an instantaneous speed and ETA.
+        Returns ``(0.0, -1.0)`` when there are fewer than two samples.
+        """
+        now = time.monotonic()
+        speed_samples.append((now, cur_bytes))
+        cutoff = now - _SPEED_WINDOW
+        while speed_samples and speed_samples[0][0] < cutoff:
+            speed_samples.popleft()
+        if len(speed_samples) < 2:
+            return 0.0, -1.0
+        dt = speed_samples[-1][0] - speed_samples[0][0]
+        db = speed_samples[-1][1] - speed_samples[0][1]
+        if dt <= 0:
+            return 0.0, -1.0
+        spd = db / dt
+        remaining = size_bytes - cur_bytes
+        eta = (remaining / spd) if spd > 0 and remaining > 0 else -1.0
+        return spd, eta
+
+    # ── Phase 1a: wget download ──────────────────────────────────────────
+
+    def _run_wget(
+        self,
+        item: QueueItem,
+        target_file: Path,
+        item_name: str,
+        size_bytes: int,
+        speed_limit_bps: int,
+        speed_samples: "deque[tuple[float, int]]",
+    ) -> tuple[bool, int]:
+        """Run wget for one download attempt.
+
+        Returns ``(True, updated_size_bytes)`` on success (rc=0).
+        Returns ``(False, size_bytes)`` on any failure so the caller can fall
+        through to the urllib fallback on the same attempt.
+
+        Side effects: posts ``DownloadProgress`` messages; terminates process
+        and returns early on cancel.
+        """
+        cmd = [
+            "wget", "--progress=dot:mega", "-c", "--timeout=20", "--tries=1",
+            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "-e", "robots=off", "-O", str(target_file), item["game_url"],
+        ]
+        # A8: Use shared bucket rate, divided across concurrent workers
+        bucket = getattr(self.app, "_bandwidth_bucket", None)
+        effective_rate = bucket.rate if bucket and bucket.rate > 0 else speed_limit_bps
+        if effective_rate > 0:
+            # Divide evenly across max threads so aggregate ≈ cap
+            q_settings = self.app.state.get_queue_settings(self.app.state.active_queue_name)
+            n_threads = q_settings.get("max_concurrent",
+                                       self.app.state.settings.get("max_concurrent", 4))
+            per_thread = max(1, effective_rate // n_threads)
+            cmd.insert(1, f"--limit-rate={per_thread}")
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True, env=_WGET_ENV,
+        )
+        self.app._register_process(proc)
+
+        stderr_log    = deque(maxlen=5)
+        last_ui_update = 0.0
+
+        try:
+            for line in proc.stderr:
+                if self.app.cancel_flag.is_set():
+                    proc.terminate()
+                    return False, size_bytes
+
+                stderr_log.append(line.strip())
+
+                len_match = WGET_LENGTH_REGEX.search(line)
+                if len_match:
+                    reported = int(len_match.group(1))
+                    if reported > 0:
+                        size_bytes = reported
+
+                match = WGET_PROG_REGEX.search(line)
+                if match:
+                    current_time = time.monotonic()
+                    if current_time - last_ui_update > _UI_UPDATE_INTERVAL:
+                        pct = float(match.group(1))
+                        current_bytes = int((pct / 100.0) * size_bytes)
+                        spd, eta = self._compute_speed(current_bytes, size_bytes, speed_samples)
+                        self.app.post_message(
+                            DownloadProgress(item["id"], item_name, current_bytes,
+                                             size_bytes, "Downloading", spd, eta)
+                        )
+                        last_ui_update = current_time
+        finally:
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            self.app._unregister_process(proc)
+
+        if self.app.cancel_flag.is_set():
+            return False, size_bytes
+
+        if proc.returncode == 0:
+            return True, size_bytes
+
+        error_msg = " | ".join(stderr_log)
+        self.app.post_message(SystemLog(
+            f"wget failed for {item_name}. "
+            f"Falling back to urllib… ({error_msg})", True
+        ))
+        return False, size_bytes
+
+    # ── Phase 1b: urllib fallback ────────────────────────────────────────
+
+    def _run_urllib_fallback(
+        self,
+        item: QueueItem,
+        target_file: Path,
+        item_name: str,
+        size_bytes: int,
+        speed_limit_bps: int,
+        speed_samples: "deque[tuple[float, int]]",
+    ) -> tuple[bool, int]:
+        """Stream the download via urllib with optional token-bucket throttling.
+
+        Supports HTTP range-resume if *target_file* already exists and is
+        smaller than *size_bytes*.
+
+        Returns ``(True, updated_size_bytes)`` on success.
+        Returns ``(False, size_bytes)`` and lets the caller handle the exception
+        (i.e. the retry-loop ``last_error`` is set by the caller's try/except).
+        """
+        req = urllib.request.Request(
+            item["game_url"],
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+        )
+
+        if target_file.exists():
+            existing_size = target_file.stat().st_size
+            if existing_size < size_bytes:
+                req.add_header("Range", f"bytes={existing_size}-")
+                open_mode      = "ab"
+                downloaded     = existing_size
+                _resume_offset = existing_size   # used to verify 206 below
+            else:
+                open_mode      = "wb"
+                downloaded     = 0
+                _resume_offset = 0
+        else:
+            open_mode      = "wb"
+            downloaded     = 0
+            _resume_offset = 0
+
+        with urllib.request.urlopen(req, timeout=30) as response:
+            # If we sent a Range header but the server returned 200 (not 206),
+            # it is sending the full file from byte 0.  Opening in "ab" would
+            # prepend the already-downloaded bytes, corrupting the file.
+            # Detect this and restart the write from scratch.
+            actual_status = response.status
+            if _resume_offset > 0 and actual_status != 206:
+                open_mode  = "wb"
+                downloaded = 0
+            cl = response.headers.get("Content-Length")
+            if cl and cl.isdigit() and int(cl) > 0:
+                size_bytes = downloaded + int(cl)
+            with open(target_file, open_mode) as file:
+                last_ui_update = 0.0
+                while True:
+                    if self.app.cancel_flag.is_set():
+                        return False, size_bytes
+                    chunk = response.read(_DL_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    file.write(chunk)
+                    downloaded += len(chunk)
+
+                    # ── Shared bandwidth throttle ─────────────────────────────
+                    bucket = getattr(self.app, "_bandwidth_bucket", None)
+                    if bucket is not None:
+                        bucket.consume(len(chunk))
+
+                    current_time = time.monotonic()
+                    if current_time - last_ui_update > _UI_UPDATE_INTERVAL:
+                        spd, eta = self._compute_speed(
+                            downloaded, max(size_bytes, downloaded), speed_samples
+                        )
+                        self.app.post_message(
+                            DownloadProgress(
+                                item["id"], item_name, downloaded,
+                                max(size_bytes, downloaded), "Downloading", spd, eta,
+                            )
+                        )
+                        last_ui_update = current_time
+
+        return True, size_bytes
+
+    # ── Phase 3: extraction ──────────────────────────────────────────────
+
+    def _run_extraction(
+        self,
+        target_file: Path,
+        dest_dir: Path,
+        item_name: str,
+    ) -> bool:
+        """Extract *target_file* (ZIP) into *dest_dir*.
+
+        Tries the ``unzip`` system binary first for speed; falls back to
+        Python's ``zipfile`` module on timeout or non-zero exit.
+
+        Updates ``_lib_status`` to ``"validated"`` on success or
+        ``"corrupted"`` on failure.  Posts ``SystemLog`` on errors.
+
+        Returns ``True`` on success, raises ``Exception`` on failure.
+        """
+        if not (target_file.exists() and target_file.suffix.lower() == ".zip"):
+            # Non-zip payload (e.g. bare ISO/CHD): mark validated and return
+            if target_file.exists():
+                self.app._lib_status.set_status(dest_dir, "validated")
+            return True
+
+        extracted_ok  = False
+        unzip_err_msg = ""
+
+        if self.app._unzip_available:
+            unzip_proc = subprocess.Popen(
+                ["unzip", "-q", "-o", str(target_file), "-d", str(dest_dir)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            )
+            self.app._register_process(unzip_proc)
+            try:
+                _, unzip_err_msg = unzip_proc.communicate(timeout=_UNZIP_TIMEOUT)
+                if unzip_proc.returncode == 0:
+                    extracted_ok = True
+                else:
+                    self.app.post_message(SystemLog(
+                        f"unzip failed for {item_name} (rc={unzip_proc.returncode}), "
+                        "falling back to Python zipfile…"
+                    ))
+            except subprocess.TimeoutExpired:
+                unzip_proc.kill()
+                unzip_proc.wait()
+                self.app.post_message(SystemLog(
+                    f"unzip timed out for {item_name}, falling back to Python zipfile…"
+                ))
+            finally:
+                self.app._unregister_process(unzip_proc)
+
+        if not extracted_ok:
+            try:
+                with _zf.ZipFile(target_file, "r") as zf:
+                    _safe_extractall(zf, dest_dir)
+                extracted_ok = True
+            except (_zf.BadZipFile, OSError, ValueError) as zf_err:
+                unzip_err_msg = str(zf_err)
+
+        if extracted_ok:
+            try:
+                target_file.unlink()
+            except OSError as ose:
+                self.app.post_message(SystemLog(
+                    f"Extraction succeeded but could not delete zip "
+                    f"{target_file.name}: {ose}", True
+                ))
+            self.app._lib_status.set_status(dest_dir, "validated")
+            return True
+        else:
+            self.app._lib_status.set_status(dest_dir, "corrupted")
+            raise Exception(f"Extraction failed: {unzip_err_msg}")
+
+    # ── Phase 4: auto-CHD conversion ─────────────────────────────────────
+
+    def _run_chd_auto(
+        self,
+        item: QueueItem,
+        item_name: str,
+        dest_dir: Path,
+        size_bytes: int,
+    ) -> None:
+        """Trigger auto-CHD conversion if enabled in settings.
+
+        No-ops when ``auto_convert_chd`` is False or chdman is not available.
+        Posts a ``DownloadProgress`` message with action "Converting CHD" so
+        the progress bar shows the conversion phase while chdman runs.
+        """
+        if not self.app.state.settings.get("auto_convert_chd", False):
+            return
+        # Resolve locally rather than writing back to the shared Toolchain attribute —
+        # multiple concurrent workers calling this method would race on that write.
+        chdman = self.app.toolchain.chdman_path or Toolchain.find_chdman()
+        if chdman:
+            self.app.post_message(
+                DownloadProgress(item["id"], item_name, size_bytes, size_bytes, "Converting CHD")
+            )
+            self.app._convert_to_chd(dest_dir, silent=True)
+        else:
+            self.app.post_message(SystemLog(
+                f"Auto-CHD skipped for {item_name}: chdman not found. "
+                "Run 'Setup chdman' in Settings."
+            ))
+
+    # ── Main entry point ─────────────────────────────────────────────────
+
+    def run(self) -> dict[str, Any]:
+        """Orchestrate a single download: skip-check -> retry-loop -> extract -> CHD.
+
+        Each network phase is delegated to a focused sub-method:
+          * ``_run_wget``           -- wget subprocess with progress parsing
+          * ``_run_urllib_fallback`` -- urllib streaming with token-bucket throttle
+          * ``_run_extraction``     -- ZIP extraction (unzip binary or zipfile fallback)
+          * ``_run_chd_auto``       -- optional post-download CHD conversion
+
+        Returns ``{"success": True}`` on completion, ``{"success": False}`` on
+        unrecoverable error, or ``{"success": False, "cancelled": True}`` when
+        the cancel flag fires.
+        """
+        item = self.item
+        dest_dir = self.dest_dir
+        target_file = self.target_file
+        item_name = self.item_name
+
+        if self.app.cancel_flag.is_set():
+            return {"success": False, "cancelled": True}
+
+        _is_resume = target_file.exists() and target_file.stat().st_size > 0
+
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+
+            # ── Fast-skip if the game is already in good shape ───────────────
+            if any(dest_dir.rglob("*.chd")) or target_file.with_suffix(".chd").exists():
+                self.app.post_message(SystemLog(f"Skipped (CHD exists): {item_name}"))
+                return {"success": True}
+            if self.app._lib_status.get(dest_dir) == "validated":
+                # Verify game files still exist — a stale "validated" entry
+                # persists after files are deleted or the directory is recreated
+                # empty (common with multi-disc games where individual discs are
+                # re-queued after partial deletion).
+                try:
+                    has_game_files = any(
+                        f.suffix.lower() in _GAME_EXTS
+                        for f in dest_dir.iterdir()
+                        if f.is_file()
+                    )
+                except (PermissionError, OSError):
+                    has_game_files = False
+                if has_game_files:
+                    self.app.post_message(SystemLog(f"Skipped (Already validated): {item_name}"))
+                    return {"success": True}
+                # Stale validated status — game files are missing; clear and re-download.
+                self.app._lib_status.remove(dest_dir)
+                self.app.post_message(SystemLog(
+                    f"Cleared stale validation for {item_name} — re-downloading."
+                ))
+
+            # ── Stale-zip cleanup for corrupted games ────────────────────────
+            if self.app._lib_status.get(dest_dir) == "corrupted":
+                for stale_zip in dest_dir.glob("*.zip"):
+                    try:
+                        stale_zip.unlink()
+                        self.app.post_message(SystemLog(
+                            f"Removed stale zip before retry: {stale_zip.name}"
+                        ))
+                    except OSError as ose:
+                        self.app.post_message(SystemLog(
+                            f"Could not remove stale zip {stale_zip.name}: {ose} "
+                            "(file may be locked — retry may fail)", True
+                        ))
+
+            size_bytes = max(MyrientTUI._parse_size_bytes(item["size_str"]), 1)
+
+            # ── Resolve per-queue speed limit (convert MB/s → B/s) ───────────
+            q_settings      = self.app.state.get_queue_settings(self.app.state.active_queue_name)
+            speed_limit_bps = (q_settings.get("speed_limit_mbps", 0) or
+                               self.app.state.settings.get("speed_limit_mbps", 0))
+            speed_limit_bps = int(speed_limit_bps * 1024 * 1024)
+
+            speed_samples: deque[tuple[float, int]] = deque()
+
+            # ── Retry loop with exponential backoff + jitter ─────────────────
+            attempt          = 0
+            download_success = False
+            last_error: Exception | None = None
+
+            while attempt < _RETRY_MAX_ATTEMPTS:
+                if self.app.cancel_flag.is_set():
+                    return {"success": False, "cancelled": True}
+
+                if attempt > 0:
+                    delay = min(
+                        _RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 1),
+                        _RETRY_MAX_DELAY,
+                    )
+                    self.app.post_message(SystemLog(
+                        f"Retry {attempt}/{_RETRY_MAX_ATTEMPTS - 1} for {item_name} "
+                        f"(backoff {delay:.1f}s)…"
+                    ))
+                    deadline = time.monotonic() + delay
+                    while time.monotonic() < deadline:
+                        if self.app.cancel_flag.is_set():
+                            return {"success": False, "cancelled": True}
+                        time.sleep(0.2)
+
+                attempt += 1
+                speed_samples.clear()
+
+                if _is_resume and attempt == 1 and target_file.exists():
+                    existing_bytes = target_file.stat().st_size
+                    if existing_bytes > 0:
+                        self.app.post_message(SystemLog(
+                            f"Resuming {item_name} from {MyrientTUI._format_size(existing_bytes)}"
+                        ))
+                        self.app.post_message(DownloadProgress(
+                            item["id"], item_name, existing_bytes, size_bytes, "Resuming"
+                        ))
+
+                # ── Phase 1: wget ────────────────────────────────────────────
+                # Skip entirely when wget is not installed — avoids a failing
+                # Popen call (FileNotFoundError) on every retry attempt.
+                if self.app._wget_available:
+                    ok, size_bytes = self._run_wget(
+                        item, target_file, item_name, size_bytes,
+                        speed_limit_bps, speed_samples,
+                    )
+                    if self.app.cancel_flag.is_set():
+                        return {"success": False, "cancelled": True}
+                    if ok:
+                        download_success = True
+                        break
+                else:
+                    ok = False
+
+                # ── Phase 2: urllib fallback ─────────────────────────────────
+                try:
+                    ok, size_bytes = self._run_urllib_fallback(
+                        item, target_file, item_name,
+                        size_bytes, speed_limit_bps, speed_samples,
+                    )
+                    if self.app.cancel_flag.is_set():
+                        return {"success": False, "cancelled": True}
+                    if ok:
+                        download_success = True
+                        break
+                except Exception as err:
+                    last_error = err
+                    # Loop continues — next iteration retries with backoff
+
+            if not download_success:
+                raise Exception(
+                    f"All {_RETRY_MAX_ATTEMPTS} attempts failed: {last_error}"
+                ) from last_error
+
+            if self.app.cancel_flag.is_set():
+                return {"success": False, "cancelled": True}
+
+            # ── Phase 3: extraction ──────────────────────────────────────────
+            self.app.post_message(
+                DownloadProgress(item["id"], item_name, size_bytes, size_bytes, "Extracting ZIP")
+            )
+            self._run_extraction(target_file, dest_dir, item_name)
+
+            if self.app.cancel_flag.is_set():
+                return {"success": False, "cancelled": True}
+
+            # ── Phase 4: optional auto-CHD conversion ────────────────────────
+            self._run_chd_auto(item, item_name, dest_dir, size_bytes)
+
+            # B1: Record in download history
+            console_name = item["name"].split(" / ")[0].strip() if " / " in item["name"] else ""
+            self.app.state.record_download(
+                item_name,
+                console_name,
+                item["size_str"],
+            )
+            return {"success": True}
+
+        except Exception as err:
+            logging.exception("Worker error for %s", item_name)
+            self.app.post_message(SystemLog(f"Worker Error {item_name}: {err}", True))
+            return {"success": False}
 
 
 # --- Main Application ---
@@ -1818,526 +2222,14 @@ class MyrientTUI(App):
     TITLE = "MYRIENT"
     SUB_TITLE = "ROM Library Manager"
 
-    CSS = """
-    /* ═══════════════════════════════════════════════════════════════════════
-       MYRIENT  —  Redesigned Terminal UI
-       Left-sidebar nav · semantic color vocabulary · responsive panels
-       Color roles: amber=nav-active  blue=actions  green=success  red=error
-       ═══════════════════════════════════════════════════════════════════════ */
-
-    /* ── Base ─────────────────────────────────────────────────────── */
-    Screen { background: #0d1117; color: #e6edf3; }
-
-    /* ── Header / Footer ──────────────────────────────────────────── */
-    Header {
-        background: #080c12;
-        color: #9aa0aa;
-        border-bottom: solid #1c2333;
-        height: 1;
-    }
-    Footer {
-        background: #080c12;
-        color: #3d4451;
-        border-top: solid #1c2333;
-    }
-
-    /* ── App body: sidebar + content ──────────────────────────────── */
-    #app-body { height: 1fr; layout: horizontal; }
-
-    /* ── Left navigation sidebar ──────────────────────────────────── */
-    #nav-sidebar {
-        width: 20;
-        min-width: 18;
-        height: 1fr;
-        background: #080c12;
-        border-right: solid #1c2333;
-        layout: vertical;
-        padding: 0;
-    }
-    #nav-logo {
-        height: 3;
-        padding: 1 2;
-        color: #e6b73e;
-        text-style: bold;
-        border-bottom: solid #1c2333;
-        content-align: left middle;
-    }
-    .nav-btn {
-        width: 100%;
-        height: 3;
-        background: transparent;
-        border: none;
-        color: #3d4451;
-        text-align: left;
-        padding: 0 2;
-        margin: 0;
-        min-width: 1;
-        text-style: none;
-    }
-    .nav-btn:hover  { background: #0d1117; color: #9aa0aa; border: none; }
-    .nav-btn:focus  { background: #0d1117; color: #9aa0aa; border: solid #1c2333; }
-    .nav-btn.--nav-active {
-        background: #0d1117;
-        color: #e6b73e;
-        text-style: bold;
-        border-left: thick #e6b73e;
-    }
-    #nav-status {
-        height: auto;
-        padding: 1 2;
-        border-top: solid #1c2333;
-        color: #3d4451;
-        margin-top: 1;
-    }
-
-    /* ── Content area ─────────────────────────────────────────────── */
-    #content-area { height: 1fr; width: 1fr; background: #0d1117; }
-    .content-pane { height: 1fr; display: none; }
-
-    /* ── Global status bar (engine · speed · queue) ───────────────── */
-    #global-statusbar {
-        height: 1;
-        layout: horizontal;
-        background: #080c12;
-        border-top: solid #1c2333;
-        padding: 0 2;
-        align: left middle;
-    }
-    #gs-engine { width: auto; color: #3d4451; margin-right: 3; }
-    #gs-speed  { width: auto; color: #3fb950; margin-right: 3; }
-    #gs-queue  { width: 1fr;  color: #3d4451; text-align: right; }
-
-    /* ── Section headers ──────────────────────────────────────────── */
-    .section-header {
-        height: 1;
-        color: #606878;
-        text-style: bold;
-        padding: 0;
-        margin-bottom: 1;
-        border-bottom: solid #1c2333;
-    }
-
-    /* ── Hint bar ─────────────────────────────────────────────────── */
-    .hint-bar {
-        height: auto;
-        color: #3d4451;
-        margin-top: 1;
-        text-align: right;
-    }
-
-    /* ── Inputs ───────────────────────────────────────────────────── */
-    .search-bar { margin-bottom: 1; }
-    Input {
-        background: #0d1117;
-        border: solid #1c2333;
-        color: #e6edf3;
-        height: 3;
-    }
-    Input:focus { border: solid #30415e; }
-
-    /* ── ListViews ────────────────────────────────────────────────── */
-    ListView { border: solid #1c2333; background: #0d1117; height: 1fr; }
-    ListView > ListItem {
-        background: transparent;
-        padding: 0 1;
-        color: #9aa0aa;
-    }
-    ListView > ListItem.--highlight         { background: #0f1520; color: #e6edf3; }
-    ListView:focus > ListItem.--highlight   { background: #0f1520; border-left: thick #58a6ff; }
-
-    /* ── ◈ BROWSE pane ────────────────────────────────────────────── */
-    #browse-layout { height: 1fr; layout: horizontal; }
-    #browse-left {
-        width: 1fr;
-        min-width: 28;
-        max-width: 55;
-        height: 1fr;
-        background: #080c12;
-        border-right: solid #1c2333;
-        padding: 1 1 1 2;
-        layout: vertical;
-    }
-    #browse-console-header {
-        height: 1;
-        layout: horizontal;
-        margin-bottom: 1;
-    }
-    #browse-console-header .section-header { width: 1fr; margin-bottom: 0; border-bottom: none; }
-    #console-count { width: auto; height: 1; color: #3d4451; content-align: right middle; }
-    #browse-right {
-        width: 2fr;
-        height: 1fr;
-        padding: 1 2;
-        layout: vertical;
-    }
-    #breadcrumb { height: 1; color: #3d4451; margin-bottom: 0; }
-    #browse-search-bar { height: auto; layout: horizontal; align: left middle; }
-    #browse-search-bar .search-bar { width: 1fr; }
-    .browse-global-btn { width: auto; min-width: 10; height: 3; margin: 0 0 1 1; }
-    #browse-toolbar {
-        height: auto;
-        layout: horizontal;
-        align: left middle;
-        margin-bottom: 1;
-    }
-    #browse-toolbar Button { width: auto; min-width: 8; margin: 0 1 0 0; height: 3; }
-    #game-list {
-        height: 1fr;
-        border: solid #1c2333;
-        background: #0d1117;
-    }
-    #game-list > .datatable--header { display: none; }
-    #game-list > .datatable--cursor { background: #0f1520; }
-    #console-list { height: 1fr; border: solid #1c2333; background: #0d1117; }
-    #game-selection-count {
-        width: auto;
-        color: #3fb950;
-        text-style: bold;
-        margin: 0 0 0 1;
-        height: 3;
-        content-align: left middle;
-    }
-    #browse-empty-state {
-        height: 1fr;
-        width: 1fr;
-        content-align: center middle;
-        color: #3d4451;
-    }
-
-    /* ── ▶ DOWNLOADS pane ─────────────────────────────────────────── */
-    #downloads-layout { height: 1fr; layout: horizontal; }
-    #queue-panel {
-        width: 40%;
-        min-width: 34;
-        max-width: 60;
-        height: 1fr;
-        background: #080c12;
-        border-right: solid #1c2333;
-        padding: 1 2;
-        layout: vertical;
-    }
-    #queue-table { height: 1fr; border: solid #1c2333; background: #0d1117; }
-    .queue-toolbar  { height: auto; margin-bottom: 1; layout: vertical; }
-    .queue-controls { height: auto; layout: horizontal; margin-top: 1; align: left middle; }
-    /* Queue settings collapsible replaces old .queue-settings-row */
-    #queue-settings-collapsible {
-        height: auto;
-        margin-top: 1;
-    }
-
-    /* Progress panel */
-    #progress-panel {
-        width: 1fr;
-        height: 1fr;
-        padding: 1 2;
-        layout: vertical;
-    }
-    #lbl-global-progress { height: 1; color: #9aa0aa; margin-bottom: 0; }
-    #global-progress     { margin-bottom: 1; display: none; }
-    #progress-area       { height: 1fr; overflow-y: auto; layout: vertical; }
-    #history-collapsible { height: auto; max-height: 16; margin-top: 1; }
-    #history-table       { height: auto; max-height: 12; border: solid #1c2333; background: #0d1117; }
-    #progress-grid {
-        layout: grid;
-        grid-size: 2;
-        grid-gutter: 1 2;
-        height: auto;
-        min-height: 4;
-    }
-    .progress-container {
-        height: 7;
-        padding: 1;
-        border: solid #1c2333;
-        background: #080c12;
-        overflow: hidden;
-    }
-    ProgressBar > .bar--bar      { color: #58a6ff; }
-    ProgressBar > .bar--complete { color: #3fb950; }
-    .speed-label { color: #3fb950; height: 1; }
-
-    /* ── ⊞ LIBRARY pane ───────────────────────────────────────────── */
-    #lib-tab-wrapper { height: 1fr; layout: vertical; }
-    #lib-header-bar {
-        height: 1;
-        layout: horizontal;
-        padding: 0 1;
-        background: #080c12;
-    }
-    #lib-summary-bar {
-        width: 1fr;
-        height: 1;
-        color: #3d4451;
-        content-align: left middle;
-    }
-    .lib-hdr-btn { width: 5; height: 1; color: #606878; content-align: center middle; background: #161b22; }
-    .lib-hdr-btn:hover { color: #c9d1d9; background: #21262d; }
-    .lib-hdr-del { color: #f85149; }
-    .lib-hdr-del:hover { color: #ff7b72; background: #21262d; }
-    #lib-toolbar {
-        height: auto;
-        min-height: 3;
-        layout: horizontal;
-        content-align: left middle;
-        padding: 0 1;
-        background: #080c12;
-        overflow: hidden auto;
-    }
-    .lib-tb-btn { width: auto; min-width: 8; margin: 0 1 0 0; height: 3; }
-    .lib-tb-label { height: 3; content-align: left middle; margin: 0 1 0 0; color: #9aa0aa; }
-    .--lib-hidden { display: none; }
-    #lib-tree {
-        height: 1fr;
-        border: solid #1c2333;
-        background: #0d1117;
-        margin: 0 1 0 1;
-    }
-    #lib-tree > .tree--guides { color: #1c2333; }
-    #lib-tree > .tree--cursor { background: #0f1520; }
-    #lib-status-bar {
-        height: 3;
-        padding: 0 2;
-        border-top: solid #1c2333;
-        background: #080c12;
-        layout: horizontal;
-        align: left middle;
-    }
-    #lib-status-label {
-        width: 1fr;
-        height: auto;
-        color: #9aa0aa;
-        content-align: left middle;
-    }
-    #lib-status-bar ProgressBar { width: 35%; display: none; }
-    #lib-progress-bar { display: none; }
-
-    /* ── ◎ SETTINGS pane (TabbedContent layout) ─────────────────── */
-    #settings-tabs { height: 1fr; }
-    #settings-tabs > ContentSwitcher { height: 1fr; }
-    TabPane { padding: 0; }
-    TabPane > VerticalScroll { height: 1fr; padding: 1 2; }
-    .setting-label { margin-top: 1; color: #9aa0aa; }
-    .filter-table  {
-        height: 8;
-        border: solid #1c2333;
-        margin-bottom: 1;
-        background: #0d1117;
-    }
-    .filter-table > .datatable--header { display: none; }
-    .filter-table > .datatable--cursor { background: #0f1520; }
-    .preset-row { height: auto; margin-bottom: 1; layout: horizontal; }
-    Switch { background: transparent; }
-
-    /* ── Collapsible widget styling ───────────────────────────────── */
-    Collapsible { background: transparent; padding: 0; margin: 0 0 1 0; }
-    CollapsibleTitle {
-        background: #080c12;
-        color: #9aa0aa;
-        border: solid #1c2333;
-        padding: 0 1;
-        height: 3;
-    }
-    CollapsibleTitle:hover { background: #0f1520; color: #e6edf3; }
-    CollapsibleTitle:focus { border: solid #30415e; }
-
-    /* ── TabbedContent tab bar styling ────────────────────────────── */
-    Tabs { background: #080c12; border-bottom: solid #1c2333; }
-    Tab { background: transparent; color: #3d4451; padding: 0 2; height: 3; }
-    Tab:hover { color: #9aa0aa; }
-    Tab.-active { color: #e6b73e; border-bottom: thick #e6b73e; }
-    Tab:focus { text-style: bold; }
-
-    /* ── Rule (horizontal divider) ────────────────────────────────── */
-    Rule { color: #1c2333; margin: 1 0; }
-
-    /* ── ≡ LOGS pane ──────────────────────────────────────────────── */
-    #logs-layout { height: 1fr; layout: vertical; }
-    #log-toolbar {
-        height: auto;
-        min-height: 3;
-        layout: horizontal;
-        margin-bottom: 1;
-        align: left middle;
-        border-bottom: solid #1c2333;
-        padding-bottom: 1;
-    }
-    .log-filter-btn {
-        min-width: 8;
-        margin: 0 1 0 0;
-        background: #080c12;
-        border: solid #1c2333;
-        color: #3d4451;
-        height: 3;
-        text-style: none;
-    }
-    .log-filter-btn:hover { background: #0f1520; color: #9aa0aa; border: solid #1c2333; }
-    .log-filter-btn.--log-active { color: #e6b73e; border: solid #30415e; background: #0f1520; }
-    #log-search { width: 1fr; margin-left: 1; }
-    RichLog {
-        height: 1fr;
-        border: none;
-        background: #0d1117;
-        color: #9aa0aa;
-    }
-    #sessions-divider {
-        color: #1c2333;
-        margin: 0;
-    }
-    #sessions-layout { height: 30%; min-height: 8; layout: horizontal; }
-    #session-log-list {
-        width: 30%;
-        min-width: 22;
-        height: 1fr;
-        border: solid #1c2333;
-        background: #0d1117;
-    }
-    #session-log-view {
-        width: 1fr;
-        height: 1fr;
-        border: solid #1c2333;
-        background: #0d1117;
-        color: #9aa0aa;
-        margin-left: 1;
-    }
-
-    /* ── Buttons — semantic color vocabulary ──────────────────────── */
-    Button {
-        background: #0d1117;
-        color: #9aa0aa;
-        border: solid #1c2333;
-        margin: 0 1 0 0;
-        min-width: 10;
-        text-style: none;
-        height: 3;
-    }
-    Button:hover { background: #0f1520; color: #e6edf3; border: solid #30415e; }
-    Button:focus  { border: solid #30415e; color: #e6edf3; }
-
-    /* Blue — actions (primary) */
-    Button.-primary  { background: #0d1926; color: #58a6ff; border: solid #1f4070; }
-    Button.-primary:hover { background: #1f4070; color: #e6edf3; border: solid #58a6ff; }
-
-    /* Green — add / confirm */
-    Button.-success  { background: #0d2318; color: #3fb950; border: solid #196327; }
-    Button.-success:hover { background: #196327; color: #e6edf3; border: solid #3fb950; }
-
-    /* Red — destructive */
-    Button.-error    { background: #2a0e0e; color: #f85149; border: solid #6e1a1a; }
-    Button.-error:hover { background: #6e1a1a; color: #e6edf3; border: solid #f85149; }
-
-    /* Amber — warning */
-    Button.-warning  { background: #1a1400; color: #d29922; border: solid #5a3e00; }
-    Button.-warning:hover { background: #5a3e00; color: #e6edf3; border: solid #d29922; }
-
-    .btn-row {
-        height: auto;
-        align: left middle;
-        margin-top: 1;
-        layout: horizontal;
-    }
-    .reorder-btn { min-width: 5; width: 5; margin: 0 1 0 0; }
-
-    /* ── Confirm dialog ───────────────────────────────────────────── */
-    ConfirmDeleteScreen { align: center middle; background: rgba(0,0,0,0.82); }
-    #dialog {
-        padding: 2 3;
-        width: 68;
-        height: auto;
-        min-height: 10;
-        border: thick #f85149;
-        background: #0d1117;
-        align: center middle;
-    }
-    #question {
-        width: 1fr;
-        content-align: center middle;
-        text-align: center;
-        height: auto;
-        color: #e6edf3;
-        text-style: bold;
-        padding: 1 0 2 0;
-    }
-    #dialog-btn-row { height: auto; align: center middle; width: 1fr; layout: horizontal; }
-    #dialog-btn-row Button { width: 1fr; margin: 0 1; }
-
-    /* ── Help modal ───────────────────────────────────────────────── */
-    HelpModal { align: center middle; background: rgba(0,0,0,0.82); }
-    #help-dialog {
-        padding: 2 3;
-        width: 62;
-        height: auto;
-        border: solid #30415e;
-        background: #0d1117;
-        layout: vertical;
-    }
-    #help-title   { color: #e6b73e; text-style: bold; margin-bottom: 1; height: auto; }
-    .help-row     { height: 1; color: #9aa0aa; }
-    .help-key     { color: #58a6ff; }
-    #help-close   { margin-top: 2; }
-
-    /* ═══════════════════════════════════════════════════════════════════════
-       LIGHT THEME OVERRIDES
-       Activated when user toggles theme with Ctrl+D
-       Screen.-light-mode is the Textual CSS class added in light mode.
-       ═══════════════════════════════════════════════════════════════════════ */
-    Screen.-light-mode { background: #ffffff; color: #1f2328; }
-    Screen.-light-mode Header { background: #f6f8fa; color: #656d76; border-bottom: solid #d0d7de; }
-    Screen.-light-mode Footer { background: #f6f8fa; color: #656d76; border-top: solid #d0d7de; }
-    Screen.-light-mode #nav-sidebar { background: #f6f8fa; border-right: solid #d0d7de; }
-    Screen.-light-mode #nav-logo { color: #9a6700; border-bottom: solid #d0d7de; }
-    Screen.-light-mode .nav-btn { color: #656d76; }
-    Screen.-light-mode .nav-btn:hover { background: #ffffff; color: #1f2328; }
-    Screen.-light-mode .nav-btn:focus { background: #ffffff; color: #1f2328; border: solid #d0d7de; }
-    Screen.-light-mode .nav-btn.--nav-active { background: #ffffff; color: #9a6700; border-left: thick #9a6700; }
-    Screen.-light-mode #nav-status { border-top: solid #d0d7de; color: #656d76; }
-    Screen.-light-mode #content-area { background: #ffffff; }
-    Screen.-light-mode #global-statusbar { background: #f6f8fa; border-top: solid #d0d7de; }
-    Screen.-light-mode #gs-engine { color: #656d76; }
-    Screen.-light-mode #gs-speed { color: #1a7f37; }
-    Screen.-light-mode #gs-queue { color: #656d76; }
-    Screen.-light-mode .section-header { color: #656d76; border-bottom: solid #d0d7de; }
-    Screen.-light-mode .search-bar { background: #f6f8fa; color: #1f2328; border: solid #d0d7de; }
-    Screen.-light-mode .search-bar:focus { border: solid #0969da; }
-    Screen.-light-mode #breadcrumb { color: #656d76; background: #f6f8fa; border-bottom: solid #d0d7de; }
-    Screen.-light-mode DataTable { background: #ffffff; color: #1f2328; }
-    Screen.-light-mode DataTable > .datatable--header { background: #f6f8fa; color: #656d76; }
-    Screen.-light-mode DataTable > .datatable--cursor { background: #ddf4ff; color: #1f2328; }
-    Screen.-light-mode .console-list-container { background: #f6f8fa; border-right: solid #d0d7de; }
-    Screen.-light-mode ListView { background: #f6f8fa; }
-    Screen.-light-mode ListView > ListItem { color: #656d76; }
-    Screen.-light-mode ListView > ListItem.-highlight { background: #ddf4ff; }
-    Screen.-light-mode Tree { background: #ffffff; color: #1f2328; }
-    Screen.-light-mode Tree > .tree--cursor { background: #ddf4ff; color: #1f2328; }
-    Screen.-light-mode #lib-header-bar { background: #f6f8fa; border-bottom: solid #d0d7de; }
-    Screen.-light-mode #lib-toolbar { background: #f6f8fa; }
-    Screen.-light-mode #lib-tree { background: #ffffff; }
-    Screen.-light-mode #lib-tree > .tree--cursor { background: #ddf4ff; color: #1f2328; }
-    Screen.-light-mode RichLog { background: #ffffff; color: #1f2328; }
-    Screen.-light-mode Input { background: #f6f8fa; color: #1f2328; border: solid #d0d7de; }
-    Screen.-light-mode Input:focus { border: solid #0969da; }
-    Screen.-light-mode Button { background: #f6f8fa; color: #1f2328; border: solid #d0d7de; }
-    Screen.-light-mode Button:hover { background: #eaeef2; }
-    Screen.-light-mode ProgressBar Bar { background: #eaeef2; }
-    Screen.-light-mode ProgressBar Bar > .bar--bar { color: #0969da; }
-    Screen.-light-mode Collapsible { background: #ffffff; }
-    Screen.-light-mode CollapsibleTitle { color: #656d76; }
-    Screen.-light-mode Select { background: #f6f8fa; color: #1f2328; }
-    Screen.-light-mode Switch { background: #eaeef2; }
-    Screen.-light-mode TabbedContent ContentSwitcher { background: #ffffff; }
-    Screen.-light-mode TabbedContent Tab { color: #656d76; }
-    Screen.-light-mode TabbedContent Tab.-active { color: #0969da; }
-    Screen.-light-mode Rule { color: #d0d7de; }
-    Screen.-light-mode #queue-table { background: #ffffff; }
-    Screen.-light-mode #help-modal-content { background: #ffffff; }
-    Screen.-light-mode #help-title { color: #9a6700; }
-    Screen.-light-mode .help-row { color: #1f2328; }
-    Screen.-light-mode .help-key { color: #0969da; }
-    """
+    CSS_PATH = "tui_dl.tcss"
 
     BINDINGS = [
         ("ctrl+q", "quit",           "Quit"),
         ("ctrl+d", "toggle_dark",    "Theme"),
         ("ctrl+r", "refresh_browser","Refresh"),
         ("ctrl+j", "jump_to_console","Jump→Browser"),
+        ("escape",  "escape_input",  "Escape"),
         ("question_mark", "show_help", "Help"),
         ("1", "nav_pane('pane-browse')",    "Browse"),
         ("2", "nav_pane('pane-downloads')", "Downloads"),
@@ -2445,6 +2337,36 @@ class MyrientTUI(App):
         # Global search state
         self._global_search_results: dict[str, str] = {}  # key → console_name
         self._global_search_timer: Timer | None = None
+
+        # F1: Per-worker speed tracking for aggregate display
+        self._worker_speeds: dict[str, float] = {}
+
+        # N6: Queue range selection — last toggled index
+        self._last_queue_selected_idx: int = -1
+
+        # N1: Library search
+        self._lib_search_timer: Timer | None = None
+        self._lib_search_text: str = ""
+        self._last_lib_tree_data: LibraryTreeReady | None = None
+
+        # F3: In-library path set (populated on library scan)
+        self._library_game_names: set[str] = set()
+
+    # ── N5: Dynamic collection URLs ──────────────────────────────────────
+    @property
+    def _active_base_url(self) -> str:
+        col = self.state.settings.get("collection", "Redump")
+        return _COLLECTIONS.get(col, _COLLECTIONS["Redump"])[0]
+
+    @property
+    def _active_dat_url(self) -> str:
+        col = self.state.settings.get("collection", "Redump")
+        return _COLLECTIONS.get(col, _COLLECTIONS["Redump"])[1]
+
+    def action_escape_input(self) -> None:
+        """Escape: blur the focused Input widget so pane-nav keys work again."""
+        if isinstance(self.focused, Input):
+            self.focused.blur()
 
     @property
     def engine_running(self) -> bool:
@@ -2764,6 +2686,11 @@ class MyrientTUI(App):
         self._refresh_queue_dropdown()
         self._refresh_queue_table()
         self._load_settings_toggles()
+        try:
+            col = self.state.settings.get("collection", "Redump")
+            self.query_one("#set-collection", Select).value = col
+        except Exception:
+            pass
         self.fetch_consoles()
         # Load library status store before scanning so the tree renders correctly.
         self._lib_status.load(Path(self.state.settings['library_root']))
@@ -3002,6 +2929,8 @@ class MyrientTUI(App):
                 nav_status.update(Text(""))
         except Exception as e:
             logging.debug("Update global statusbar failed: %s", e)
+        # F2: Keep queue total size label in sync
+        self._update_queue_total_size()
 
     def _set_log_filter(self, filter_id: str) -> None:
         """Switch active log severity filter and re-render the log widget."""
@@ -3141,6 +3070,9 @@ class MyrientTUI(App):
                 t.append(f" [{MyrientTUI._format_size(disk_bytes)}]", style=_TREE_DIM)
             return t
 
+        self._last_lib_tree_data = message
+        search_text = self._lib_search_text
+
         try:
             tree = self.query_one("#lib-tree", Tree)
             tree.clear()
@@ -3157,10 +3089,6 @@ class MyrientTUI(App):
                 # Use pre-computed disk usage from the worker thread — avoids
                 # blocking the main thread with heavy I/O on large libraries.
                 disk_bytes = message.disk_usage.get(console_name, 0)
-                console_node = tree.root.add(
-                    _console_label(console_name, n_ok, n_bad, n_inc, disk_bytes),
-                    data=console_path,
-                )
                 # C6+A2: Group multi-disc games into inline labels
                 # Partition into disc entries (keyed by base name) and singles
                 # disc_groups values: (game_dir, status, disc_label_str, has_chd)
@@ -3219,6 +3147,20 @@ class MyrientTUI(App):
                     group_path = discs[0][0].parent
                     tree_entries.append((base_name.lower(), t, group_path))
 
+                # N1: Filter by library search text
+                if search_text:
+                    tree_entries = [
+                        e for e in tree_entries if search_text in e[0]
+                    ]
+                    # Skip entire console if no games match and console name doesn't match
+                    if not tree_entries and search_text not in console_name.lower():
+                        continue
+
+                console_node = tree.root.add(
+                    _console_label(console_name, n_ok, n_bad, n_inc, disk_bytes),
+                    data=console_path,
+                )
+
                 # Render all entries in alphabetical order
                 tree_entries.sort(key=lambda e: e[0])
                 for _, label, data_path in tree_entries:
@@ -3272,6 +3214,11 @@ class MyrientTUI(App):
             self._update_lib_toolbar(tree.root)
         except Exception as e:
             self._log(f"Tree build error: {e}", is_error=True)
+
+    def _filter_library_tree(self) -> None:
+        """Re-render the library tree applying the current search filter."""
+        if self._last_lib_tree_data is not None:
+            self.on_library_tree_ready(self._last_lib_tree_data)
 
     # ── Library detail panel — contextual toolbar + file detail view ─────
 
@@ -3369,6 +3316,15 @@ class MyrientTUI(App):
             else:
                 t.append("~ ", style="yellow")
             t.append(node_path.name, style="#c9d1d9")
+            # Show file details for game dirs
+            try:
+                files = [f for f in node_path.iterdir() if f.is_file() and not f.name.startswith('.')]
+                if files:
+                    total_size = sum(f.stat().st_size for f in files)
+                    t.append(f"  {len(files)} file(s)", style="dim")
+                    t.append(f"  {MyrientTUI._format_size(total_size)}", style="dim #9aa0aa")
+            except (PermissionError, OSError):
+                pass
         status_label.update(t)
 
     def on_library_progress(self, message: LibraryProgress) -> None:
@@ -3502,9 +3458,34 @@ class MyrientTUI(App):
                 event.prevent_default()
                 event.stop()
 
+        elif fid == "console-list":
+            if event.key == "f":
+                self._toggle_console_favorite()
+                event.prevent_default()
+                event.stop()
+
         elif fid == "queue-table":
             if event.key == "space":
                 self._queue_toggle_selection()
+                event.prevent_default()
+                event.stop()
+            elif event.key == "shift+space":
+                # N6: Queue range selection
+                try:
+                    table = self.query_one("#queue-table", DataTable)
+                    cursor = table.cursor_row
+                    if cursor is not None and self._last_queue_selected_idx >= 0:
+                        rows = table.ordered_rows
+                        lo = min(self._last_queue_selected_idx, cursor)
+                        hi = max(self._last_queue_selected_idx, cursor)
+                        for i in range(lo, min(hi + 1, len(rows))):
+                            item_id = rows[i].key.value
+                            self._queue_selected.add(item_id)
+                            self._refresh_queue_row_visual(table, item_id)
+                    if cursor is not None:
+                        self._last_queue_selected_idx = cursor
+                except Exception:
+                    pass
                 event.prevent_default()
                 event.stop()
             elif event.key == "delete":
@@ -3623,9 +3604,9 @@ class MyrientTUI(App):
                 if self._global_search_timer is not None:
                     self._global_search_timer.stop()
                 val = event.value.strip()
-                if len(val) >= 3:
+                if len(val) >= 2:
                     self._global_search_timer = self.set_timer(
-                        1.0, lambda: self.run_global_search(val)
+                        0.5, lambda: self.run_global_search(val)
                     )
             else:
                 if self._games_search_timer is not None:
@@ -3633,6 +3614,13 @@ class MyrientTUI(App):
                 self._games_search_timer = self.set_timer(
                     _SEARCH_DEBOUNCE, lambda: self._render_games(event.value)
                 )
+        elif event.input.id == "lib-search":
+            self._lib_search_text = event.value.lower().strip()
+            if self._lib_search_timer is not None:
+                self._lib_search_timer.stop()
+            self._lib_search_timer = self.set_timer(
+                _SEARCH_DEBOUNCE, self._filter_library_tree
+            )
         elif event.input.id == "log-search":
             self._log_search_text = event.value.lower().strip()
             if self._log_search_timer is not None:
@@ -3646,10 +3634,31 @@ class MyrientTUI(App):
         list_view.clear()
 
         filtered_consoles = [c for c in self._all_consoles_data if self.fuzzy_match(query, c["name"])]
+
+        # N2: Partition into favorites and non-favorites, render favorites first
+        fav_set = set(self.state.settings.get("favorite_consoles", []))
+        favorites = [c for c in filtered_consoles if c["name"].strip('/') in fav_set]
+        non_favorites = [c for c in filtered_consoles if c["name"].strip('/') not in fav_set]
+        ordered_consoles = favorites + non_favorites
+
         new_items = []
 
-        for console in filtered_consoles:
-            highlighted_name = self.fuzzy_highlight_fast(console["name"].strip('/'), query)
+        for console in ordered_consoles:
+            console_label = console["name"].strip('/')
+            is_fav = console_label in fav_set
+            # U8: Highlight the currently selected console
+            is_active = (
+                self.selected_console is not None
+                and console["url_part"] == self.selected_console["url_part"]
+            )
+            if is_active:
+                prefix = "\u2605 " if is_fav else ""
+                highlighted_name = Text(f"{prefix}{console_label} \u25c2", style="bold #e6b73e")
+            else:
+                if is_fav:
+                    highlighted_name = Text(f"\u2605 {console_label}", style="#e6b73e")
+                else:
+                    highlighted_name = self.fuzzy_highlight_fast(console_label, query)
             item = ListItem(Label(highlighted_name))
             item.link_data = console
             new_items.append(item)
@@ -3671,6 +3680,29 @@ class MyrientTUI(App):
                 )
         except Exception:
             pass
+
+    def _toggle_console_favorite(self) -> None:
+        """Toggle the highlighted console in/out of favorites and re-render."""
+        try:
+            lv = self.query_one("#console-list", ListView)
+            idx = lv.index
+            if idx is None or idx >= len(lv.children):
+                return
+            item = lv.children[idx]
+            data = getattr(item, "link_data", None)
+            if not data:
+                return
+            console_name = data["name"].strip('/')
+            favs = list(self.state.settings.get("favorite_consoles", []))
+            if console_name in favs:
+                favs.remove(console_name)
+            else:
+                favs.append(console_name)
+            self.state.set_setting("favorite_consoles", favs)
+            query = self.query_one("#search-consoles", Input).value
+            self._render_consoles(query)
+        except Exception as e:
+            logging.debug("Toggle console favorite failed: %s", e)
 
     def _render_games(self, query: str = "") -> None:
         """
@@ -3707,7 +3739,15 @@ class MyrientTUI(App):
             else:
                 name_cell = Text(name, style="dim", no_wrap=True)
 
-            game_table.add_row(sel_cell, name_cell, game["size_str"], key=url_part)
+            # F3: "Already in library" indicator — check validated game names
+            bare_name = name[:-4] if name.lower().endswith(".zip") else name
+            in_library = bare_name in self._library_game_names
+            if in_library:
+                size_cell = Text(game["size_str"], style="bold #3fb950")
+            else:
+                size_cell = Text(game["size_str"])
+
+            game_table.add_row(sel_cell, name_cell, size_cell, key=url_part)
             found += 1
 
         if found == 0 and self._all_games_data:
@@ -3732,9 +3772,29 @@ class MyrientTUI(App):
         during active downloads, use _remove_queue_row() instead."""
         table = self.query_one("#queue-table", DataTable)
         table.clear()
-        for item in self.state.get_active_queue():
+        queue = self.state.get_active_queue()
+        for item in queue:
             table.add_row(item['name'], item['size_str'], "Queued", key=item['id'])
+        # F2: Update queue total size indicator
+        self._update_queue_total_size(queue)
         self._update_global_statusbar()
+
+    def _update_queue_total_size(self, queue: list | None = None) -> None:
+        """Compute and display total queue size in the #queue-total-size label."""
+        try:
+            if queue is None:
+                queue = self.state.get_active_queue()
+            total_bytes = sum(self._parse_size_bytes(item['size_str']) for item in queue)
+            count = len(queue)
+            if count > 0:
+                size_str = self._format_size(total_bytes)
+                self.query_one("#queue-total-size", Label).update(
+                    Text(f"{count} item{'s' if count != 1 else ''} \u00b7 {size_str}", style="#3d4451")
+                )
+            else:
+                self.query_one("#queue-total-size", Label).update(Text(""))
+        except Exception as e:
+            logging.debug("Update queue total size failed: %s", e)
 
     def _remove_queue_row(self, item_id: str) -> None:
         """Remove a single row by item id without touching the rest of the table.
@@ -3902,7 +3962,7 @@ class MyrientTUI(App):
                 search_input = self.query_one("#search-games", Input)
                 if self._browse_global_mode:
                     btn.variant = "primary"
-                    btn.label = "Global"
+                    btn.label = "\u2715 Local"
                     search_input.placeholder = "  search all consoles… (min 3 chars)"
                     search_input.value = ""
                     search_input.focus()
@@ -4003,7 +4063,16 @@ class MyrientTUI(App):
                 
         elif button_id == "btn-remove-items":
             self._remove_selected_queue_items()
-                    
+
+        elif button_id == "btn-clear-queue":
+            if self.engine_running:
+                self.notify("Cannot clear queue while downloads are active", severity="warning")
+            else:
+                self.state.update_active_queue([])
+                self._queue_selected.clear()
+                self._refresh_queue_table()
+                self.notify("Queue cleared")
+
         elif button_id == "btn-start-dl":
             if self.state.get_active_queue():
                 self.start_download_engine()
@@ -4082,6 +4151,7 @@ class MyrientTUI(App):
                     "filter_exclude":           sorted(self._filter_exclude_sel),
                     "custom_include_regex":     custom_inc,
                     "custom_exclude_regex":     custom_exc,
+                    "collection":               str(self.query_one("#set-collection", Select).value) if self.query_one("#set-collection", Select).value != Select.BLANK else "Redump",
                 })
 
                 new_path.mkdir(parents=True, exist_ok=True)
@@ -4112,20 +4182,31 @@ class MyrientTUI(App):
                 
         elif button_id == "btn-export-queue":
             try:
-                export_path = _DATA_DIR / f"queue_export_{self.state.active_queue_name}.json"
+                io_input = self.query_one("#input-queue-io-path", Input)
+                custom = io_input.value.strip()
+                if custom:
+                    export_path = Path(custom).expanduser().resolve()
+                else:
+                    export_path = _DATA_DIR / f"queue_export_{self.state.active_queue_name}.json"
                 queue = self.state.get_active_queue()
+                export_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(export_path, 'w', encoding='utf-8') as f:
                     json.dump(queue, f, indent=2)
-                self.notify(f"Queue exported to {export_path.name}")
+                io_input.value = str(export_path)
+                self.notify(f"Queue exported to {export_path}")
                 self.post_message(SystemLog(f"Queue exported: {export_path}"))
             except Exception as e:
                 self.notify(f"Export failed: {e}", severity="error")
 
         elif button_id == "btn-import-queue":
             try:
-                import_path = _DATA_DIR / f"queue_export_{self.state.active_queue_name}.json"
+                io_input = self.query_one("#input-queue-io-path", Input)
+                custom = io_input.value.strip()
+                if custom:
+                    import_path = Path(custom).expanduser().resolve()
+                else:
+                    import_path = _DATA_DIR / f"queue_export_{self.state.active_queue_name}.json"
                 if not import_path.exists():
-                    # Try generic name
                     candidates = list(_DATA_DIR.glob("queue_export_*.json"))
                     if candidates:
                         import_path = candidates[0]
@@ -4148,7 +4229,8 @@ class MyrientTUI(App):
                 if added:
                     self.state.update_active_queue(current, immediate=True)
                     self._refresh_queue_table()
-                self.notify(f"Imported {added} item(s) from {import_path.name}")
+                io_input.value = str(import_path)
+                self.notify(f"Imported {added} item(s) from {import_path}")
             except Exception as e:
                 self.notify(f"Import failed: {e}", severity="error")
 
@@ -4234,7 +4316,7 @@ class MyrientTUI(App):
                     dest_path = library_root / gs_console / sub_folder
                 if str(dest_path) in existing_paths:
                     continue
-                game_url = BASE_URL + quote(gs_console, safe="") + "/" + quote(data["url_part"], safe="")
+                game_url = self._active_base_url + quote(gs_console, safe="") + "/" + quote(data["url_part"], safe="")
                 current_queue.append({
                     "id": f"dl_{uuid.uuid4().hex[:8]}",
                     "name": f"{gs_console} / {data['name']}",
@@ -4249,6 +4331,13 @@ class MyrientTUI(App):
             self.state.update_active_queue(current_queue)
             self._refresh_queue_table()
             self.notify(f"Queued {added_count} item(s)")
+            # U7: Flash Downloads nav button on queue add
+            try:
+                btn = self.query_one("#nav-btn-downloads", Button)
+                btn.add_class("--nav-flash")
+                self.set_timer(1.5, lambda: btn.remove_class("--nav-flash"))
+            except Exception:
+                pass
             self._update_global_statusbar()
             return
 
@@ -4257,7 +4346,7 @@ class MyrientTUI(App):
 
         library_root = Path(self.state.settings["library_root"])
         console_name = self.selected_console["name"].strip('/')
-        base_url = urljoin(BASE_URL, self.selected_console["url_part"])
+        base_url = urljoin(self._active_base_url, self.selected_console["url_part"])
         current_queue = self.state.get_active_queue()
 
         # Build a set of already-queued dest_paths to prevent duplicate entries
@@ -4299,6 +4388,13 @@ class MyrientTUI(App):
         self.state.update_active_queue(current_queue)
         self._refresh_queue_table()
         self.notify(f"Queued {added_count} item(s)")
+        # U7: Flash Downloads nav button on queue add
+        try:
+            btn = self.query_one("#nav-btn-downloads", Button)
+            btn.add_class("--nav-flash")
+            self.set_timer(1.5, lambda: btn.remove_class("--nav-flash"))
+        except Exception:
+            pass
         self._update_global_statusbar()
 
     # --- UI Message Receivers ---
@@ -4330,7 +4426,7 @@ class MyrientTUI(App):
                 logging.debug("Show console loading indicator failed: %s", e)
         self.call_from_thread(_show_loading)
         self.post_message(SystemLog("Scraping console list..."))
-        items = self.scraper.scrape_links(BASE_URL)
+        items = self.scraper.scrape_links(self._active_base_url)
         _SKIP_NAMES = {"files", "donate", "upload", "faq", "contact", "login", "register"}
         consoles = [
             i for i in items
@@ -4343,7 +4439,7 @@ class MyrientTUI(App):
     def prefetch_all_consoles(self) -> None:
         """Concurrently scrape all console game pages and warm the link cache."""
         self._lib_cancel.clear()
-        items = self.scraper.scrape_links(BASE_URL)
+        items = self.scraper.scrape_links(self._active_base_url)
         consoles = [i for i in items if i["url_part"].endswith('/')]
         if not consoles:
             return
@@ -4355,7 +4451,7 @@ class MyrientTUI(App):
             with semaphore:
                 if self._lib_cancel.is_set():
                     return
-                url = urljoin(BASE_URL, console["url_part"])
+                url = urljoin(self._active_base_url, console["url_part"])
                 self.post_message(LibraryProgress(
                     "Pre-caching", console["name"].strip('/'), idx, total
                 ))
@@ -4376,7 +4472,7 @@ class MyrientTUI(App):
 
     @work(exclusive=True, thread=True)
     def fetch_games(self, console_data: ConsoleItem) -> None:
-        url = urljoin(BASE_URL, console_data["url_part"])
+        url = urljoin(self._active_base_url, console_data["url_part"])
         # C2: Show loading indicator in breadcrumb
         def _show_loading() -> None:
             try:
@@ -4481,6 +4577,13 @@ class MyrientTUI(App):
         except OSError:
             pass  # best-effort; proceed if we can't stat the filesystem
 
+        # N3: Batch size estimate log message
+        total_bytes = sum(self._parse_size_bytes(it["size_str"]) for it in queue)
+        if total_bytes > 0:
+            self.post_message(SystemLog(
+                f"Batch estimate: {len(queue)} items, {self._format_size(total_bytes)}"
+            ))
+
         with self._progress_lock:
             self.global_total     = len(queue)
             self.global_completed = 0
@@ -4538,6 +4641,8 @@ class MyrientTUI(App):
                 self._engine_state = EngineState.IDLE
 
         def _finish_ui() -> None:
+            # F1: Clear aggregate speed tracking
+            self._worker_speeds.clear()
             try:
                 self.query_one("#global-progress", ProgressBar).display = False
                 self.query_one("#lbl-global-progress", Label).update(
@@ -4563,476 +4668,9 @@ class MyrientTUI(App):
                 failed=_batch_fail,
             ))
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Download-worker sub-methods
-    # Extracted from the old monolithic _download_worker to satisfy SRP and
-    # make each phase independently testable.
-    # ──────────────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _compute_speed(
-        cur_bytes: int,
-        size_bytes: int,
-        speed_samples: "deque[tuple[float, int]]",
-    ) -> tuple[float, float]:
-        """Return ``(speed_bps, eta_secs)`` from a rolling sample window.
-
-        Appends the current snapshot to *speed_samples*, evicts entries older
-        than ``_SPEED_WINDOW``, then computes an instantaneous speed and ETA.
-        Returns ``(0.0, -1.0)`` when there are fewer than two samples.
-        """
-        now = time.monotonic()
-        speed_samples.append((now, cur_bytes))
-        cutoff = now - _SPEED_WINDOW
-        while speed_samples and speed_samples[0][0] < cutoff:
-            speed_samples.popleft()
-        if len(speed_samples) < 2:
-            return 0.0, -1.0
-        dt = speed_samples[-1][0] - speed_samples[0][0]
-        db = speed_samples[-1][1] - speed_samples[0][1]
-        if dt <= 0:
-            return 0.0, -1.0
-        spd = db / dt
-        remaining = size_bytes - cur_bytes
-        eta = (remaining / spd) if spd > 0 and remaining > 0 else -1.0
-        return spd, eta
-
-    def _run_wget(
-        self,
-        item: QueueItem,
-        target_file: Path,
-        item_name: str,
-        size_bytes: int,
-        speed_limit_bps: int,
-        speed_samples: "deque[tuple[float, int]]",
-    ) -> tuple[bool, int]:
-        """Run wget for one download attempt.
-
-        Returns ``(True, updated_size_bytes)`` on success (rc=0).
-        Returns ``(False, size_bytes)`` on any failure so the caller can fall
-        through to the urllib fallback on the same attempt.
-
-        Side effects: posts ``DownloadProgress`` messages; terminates process
-        and returns early on cancel.
-        """
-        cmd = [
-            "wget", "--progress=dot:mega", "-c", "--timeout=20", "--tries=1",
-            "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "-e", "robots=off", "-O", str(target_file), item["game_url"],
-        ]
-        # A8: Use shared bucket rate, divided across concurrent workers
-        bucket = getattr(self, "_bandwidth_bucket", None)
-        effective_rate = bucket.rate if bucket and bucket.rate > 0 else speed_limit_bps
-        if effective_rate > 0:
-            # Divide evenly across max threads so aggregate ≈ cap
-            q_settings = self.state.get_queue_settings(self.state.active_queue_name)
-            n_threads = q_settings.get("max_concurrent",
-                                       self.state.settings.get("max_concurrent", 4))
-            per_thread = max(1, effective_rate // n_threads)
-            cmd.insert(1, f"--limit-rate={per_thread}")
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            text=True, env=_WGET_ENV,
-        )
-        self._register_process(proc)
-
-        stderr_log    = deque(maxlen=5)
-        last_ui_update = 0.0
-
-        try:
-            for line in proc.stderr:
-                if self.cancel_flag.is_set():
-                    proc.terminate()
-                    return False, size_bytes
-
-                stderr_log.append(line.strip())
-
-                len_match = WGET_LENGTH_REGEX.search(line)
-                if len_match:
-                    reported = int(len_match.group(1))
-                    if reported > 0:
-                        size_bytes = reported
-
-                match = WGET_PROG_REGEX.search(line)
-                if match:
-                    current_time = time.monotonic()
-                    if current_time - last_ui_update > _UI_UPDATE_INTERVAL:
-                        pct = float(match.group(1))
-                        current_bytes = int((pct / 100.0) * size_bytes)
-                        spd, eta = self._compute_speed(current_bytes, size_bytes, speed_samples)
-                        self.post_message(
-                            DownloadProgress(item["id"], item_name, current_bytes,
-                                             size_bytes, "Downloading", spd, eta)
-                        )
-                        last_ui_update = current_time
-        finally:
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-            self._unregister_process(proc)
-
-        if self.cancel_flag.is_set():
-            return False, size_bytes
-
-        if proc.returncode == 0:
-            return True, size_bytes
-
-        error_msg = " | ".join(stderr_log)
-        self.post_message(SystemLog(
-            f"wget failed for {item_name}. "
-            f"Falling back to urllib… ({error_msg})", True
-        ))
-        return False, size_bytes
-
-    def _run_urllib_fallback(
-        self,
-        item: QueueItem,
-        target_file: Path,
-        item_name: str,
-        size_bytes: int,
-        speed_limit_bps: int,
-        speed_samples: "deque[tuple[float, int]]",
-    ) -> tuple[bool, int]:
-        """Stream the download via urllib with optional token-bucket throttling.
-
-        Supports HTTP range-resume if *target_file* already exists and is
-        smaller than *size_bytes*.
-
-        Returns ``(True, updated_size_bytes)`` on success.
-        Returns ``(False, size_bytes)`` and lets the caller handle the exception
-        (i.e. the retry-loop ``last_error`` is set by the caller's try/except).
-        """
-        req = urllib.request.Request(
-            item["game_url"],
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-        )
-
-        if target_file.exists():
-            existing_size = target_file.stat().st_size
-            if existing_size < size_bytes:
-                req.add_header("Range", f"bytes={existing_size}-")
-                open_mode      = "ab"
-                downloaded     = existing_size
-                _resume_offset = existing_size   # used to verify 206 below
-            else:
-                open_mode      = "wb"
-                downloaded     = 0
-                _resume_offset = 0
-        else:
-            open_mode      = "wb"
-            downloaded     = 0
-            _resume_offset = 0
-
-        with urllib.request.urlopen(req, timeout=30) as response:
-            # If we sent a Range header but the server returned 200 (not 206),
-            # it is sending the full file from byte 0.  Opening in "ab" would
-            # prepend the already-downloaded bytes, corrupting the file.
-            # Detect this and restart the write from scratch.
-            actual_status = response.status
-            if _resume_offset > 0 and actual_status != 206:
-                open_mode  = "wb"
-                downloaded = 0
-            cl = response.headers.get("Content-Length")
-            if cl and cl.isdigit() and int(cl) > 0:
-                size_bytes = downloaded + int(cl)
-            with open(target_file, open_mode) as file:
-                last_ui_update = 0.0
-                while True:
-                    if self.cancel_flag.is_set():
-                        return False, size_bytes
-                    chunk = response.read(_DL_CHUNK_BYTES)
-                    if not chunk:
-                        break
-                    file.write(chunk)
-                    downloaded += len(chunk)
-
-                    # ── Shared bandwidth throttle ─────────────────────────────
-                    bucket = getattr(self, "_bandwidth_bucket", None)
-                    if bucket is not None:
-                        bucket.consume(len(chunk))
-
-                    current_time = time.monotonic()
-                    if current_time - last_ui_update > _UI_UPDATE_INTERVAL:
-                        spd, eta = self._compute_speed(
-                            downloaded, max(size_bytes, downloaded), speed_samples
-                        )
-                        self.post_message(
-                            DownloadProgress(
-                                item["id"], item_name, downloaded,
-                                max(size_bytes, downloaded), "Downloading", spd, eta,
-                            )
-                        )
-                        last_ui_update = current_time
-
-        return True, size_bytes
-
-    def _run_extraction(
-        self,
-        target_file: Path,
-        dest_dir: Path,
-        item_name: str,
-    ) -> bool:
-        """Extract *target_file* (ZIP) into *dest_dir*.
-
-        Tries the ``unzip`` system binary first for speed; falls back to
-        Python's ``zipfile`` module on timeout or non-zero exit.
-
-        Updates ``_lib_status`` to ``"validated"`` on success or
-        ``"corrupted"`` on failure.  Posts ``SystemLog`` on errors.
-
-        Returns ``True`` on success, raises ``Exception`` on failure.
-        """
-        if not (target_file.exists() and target_file.suffix.lower() == ".zip"):
-            # Non-zip payload (e.g. bare ISO/CHD): mark validated and return
-            if target_file.exists():
-                self._lib_status.set_status(dest_dir, "validated")
-            return True
-
-        extracted_ok  = False
-        unzip_err_msg = ""
-
-        if self._unzip_available:
-            unzip_proc = subprocess.Popen(
-                ["unzip", "-q", "-o", str(target_file), "-d", str(dest_dir)],
-                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-            )
-            self._register_process(unzip_proc)
-            try:
-                _, unzip_err_msg = unzip_proc.communicate(timeout=_UNZIP_TIMEOUT)
-                if unzip_proc.returncode == 0:
-                    extracted_ok = True
-                else:
-                    self.post_message(SystemLog(
-                        f"unzip failed for {item_name} (rc={unzip_proc.returncode}), "
-                        "falling back to Python zipfile…"
-                    ))
-            except subprocess.TimeoutExpired:
-                unzip_proc.kill()
-                unzip_proc.wait()
-                self.post_message(SystemLog(
-                    f"unzip timed out for {item_name}, falling back to Python zipfile…"
-                ))
-            finally:
-                self._unregister_process(unzip_proc)
-
-        if not extracted_ok:
-            try:
-                with _zf.ZipFile(target_file, "r") as zf:
-                    _safe_extractall(zf, dest_dir)
-                extracted_ok = True
-            except (_zf.BadZipFile, OSError, ValueError) as zf_err:
-                unzip_err_msg = str(zf_err)
-
-        if extracted_ok:
-            try:
-                target_file.unlink()
-            except OSError as ose:
-                self.post_message(SystemLog(
-                    f"Extraction succeeded but could not delete zip "
-                    f"{target_file.name}: {ose}", True
-                ))
-            self._lib_status.set_status(dest_dir, "validated")
-            return True
-        else:
-            self._lib_status.set_status(dest_dir, "corrupted")
-            raise Exception(f"Extraction failed: {unzip_err_msg}")
-
-    def _run_chd_auto(
-        self,
-        item: QueueItem,
-        item_name: str,
-        dest_dir: Path,
-        size_bytes: int,
-    ) -> None:
-        """Trigger auto-CHD conversion if enabled in settings.
-
-        No-ops when ``auto_convert_chd`` is False or chdman is not available.
-        Posts a ``DownloadProgress`` message with action "Converting CHD" so
-        the progress bar shows the conversion phase while chdman runs.
-        """
-        if not self.state.settings.get("auto_convert_chd", False):
-            return
-        # Resolve locally rather than writing back to the shared Toolchain attribute —
-        # multiple concurrent workers calling this method would race on that write.
-        chdman = self.toolchain.chdman_path or Toolchain.find_chdman()
-        if chdman:
-            self.post_message(
-                DownloadProgress(item["id"], item_name, size_bytes, size_bytes, "Converting CHD")
-            )
-            self._convert_to_chd(dest_dir, silent=True)
-        else:
-            self.post_message(SystemLog(
-                f"Auto-CHD skipped for {item_name}: chdman not found. "
-                "Run 'Setup chdman' in Settings."
-            ))
-
     def _download_worker(self, item: QueueItem) -> dict[str, Any]:
-        """Orchestrate a single download: skip-check → retry-loop → extract → CHD.
-
-        Each network phase is delegated to a focused sub-method:
-          * ``_run_wget``          — wget subprocess with progress parsing
-          * ``_run_urllib_fallback`` — urllib streaming with token-bucket throttle
-          * ``_run_extraction``    — ZIP extraction (unzip binary or zipfile fallback)
-          * ``_run_chd_auto``      — optional post-download CHD conversion
-
-        Returns ``{"success": True}`` on completion, ``{"success": False}`` on
-        unrecoverable error, or ``{"success": False, "cancelled": True}`` when
-        the cancel flag fires.
-        """
-        if self.cancel_flag.is_set():
-            return {"success": False, "cancelled": True}
-
-        dest_dir    = Path(item["dest_path"])
-        _url_path   = urllib.parse.urlparse(item["game_url"]).path
-        target_file = dest_dir / unquote(_url_path.split("/")[-1])
-        item_name   = item["name"]
-
-        try:
-            dest_dir.mkdir(parents=True, exist_ok=True)
-
-            # ── Fast-skip if the game is already in good shape ───────────────
-            if any(dest_dir.rglob("*.chd")) or target_file.with_suffix(".chd").exists():
-                self.post_message(SystemLog(f"Skipped (CHD exists): {item_name}"))
-                return {"success": True}
-            if self._lib_status.get(dest_dir) == "validated":
-                # Verify game files still exist — a stale "validated" entry
-                # persists after files are deleted or the directory is recreated
-                # empty (common with multi-disc games where individual discs are
-                # re-queued after partial deletion).
-                try:
-                    has_game_files = any(
-                        f.suffix.lower() in _GAME_EXTS
-                        for f in dest_dir.iterdir()
-                        if f.is_file()
-                    )
-                except (PermissionError, OSError):
-                    has_game_files = False
-                if has_game_files:
-                    self.post_message(SystemLog(f"Skipped (Already validated): {item_name}"))
-                    return {"success": True}
-                # Stale validated status — game files are missing; clear and re-download.
-                self._lib_status.remove(dest_dir)
-                self.post_message(SystemLog(
-                    f"Cleared stale validation for {item_name} — re-downloading."
-                ))
-
-            # ── Stale-zip cleanup for corrupted games ────────────────────────
-            if self._lib_status.get(dest_dir) == "corrupted":
-                for stale_zip in dest_dir.glob("*.zip"):
-                    try:
-                        stale_zip.unlink()
-                        self.post_message(SystemLog(
-                            f"Removed stale zip before retry: {stale_zip.name}"
-                        ))
-                    except OSError as ose:
-                        self.post_message(SystemLog(
-                            f"Could not remove stale zip {stale_zip.name}: {ose} "
-                            "(file may be locked — retry may fail)", True
-                        ))
-
-            size_bytes = max(self._parse_size_bytes(item["size_str"]), 1)
-
-            # ── Resolve per-queue speed limit (convert MB/s → B/s) ───────────
-            q_settings      = self.state.get_queue_settings(self.state.active_queue_name)
-            speed_limit_bps = (q_settings.get("speed_limit_mbps", 0) or
-                               self.state.settings.get("speed_limit_mbps", 0))
-            speed_limit_bps = int(speed_limit_bps * 1024 * 1024)
-
-            speed_samples: deque[tuple[float, int]] = deque()
-
-            # ── Retry loop with exponential backoff + jitter ─────────────────
-            attempt          = 0
-            download_success = False
-            last_error: Exception | None = None
-
-            while attempt < _RETRY_MAX_ATTEMPTS:
-                if self.cancel_flag.is_set():
-                    return {"success": False, "cancelled": True}
-
-                if attempt > 0:
-                    delay = min(
-                        _RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 1),
-                        _RETRY_MAX_DELAY,
-                    )
-                    self.post_message(SystemLog(
-                        f"Retry {attempt}/{_RETRY_MAX_ATTEMPTS - 1} for {item_name} "
-                        f"(backoff {delay:.1f}s)…"
-                    ))
-                    deadline = time.monotonic() + delay
-                    while time.monotonic() < deadline:
-                        if self.cancel_flag.is_set():
-                            return {"success": False, "cancelled": True}
-                        time.sleep(0.2)
-
-                attempt += 1
-                speed_samples.clear()
-
-                # ── Phase 1: wget ────────────────────────────────────────────
-                # Skip entirely when wget is not installed — avoids a failing
-                # Popen call (FileNotFoundError) on every retry attempt.
-                if self._wget_available:
-                    ok, size_bytes = self._run_wget(
-                        item, target_file, item_name, size_bytes,
-                        speed_limit_bps, speed_samples,
-                    )
-                    if self.cancel_flag.is_set():
-                        return {"success": False, "cancelled": True}
-                    if ok:
-                        download_success = True
-                        break
-                else:
-                    ok = False
-
-                # ── Phase 2: urllib fallback ─────────────────────────────────
-                try:
-                    ok, size_bytes = self._run_urllib_fallback(
-                        item, target_file, item_name,
-                        size_bytes, speed_limit_bps, speed_samples,
-                    )
-                    if self.cancel_flag.is_set():
-                        return {"success": False, "cancelled": True}
-                    if ok:
-                        download_success = True
-                        break
-                except Exception as err:
-                    last_error = err
-                    # Loop continues — next iteration retries with backoff
-
-            if not download_success:
-                raise Exception(
-                    f"All {_RETRY_MAX_ATTEMPTS} attempts failed: {last_error}"
-                ) from last_error
-
-            if self.cancel_flag.is_set():
-                return {"success": False, "cancelled": True}
-
-            # ── Phase 3: extraction ──────────────────────────────────────────
-            self.post_message(
-                DownloadProgress(item["id"], item_name, size_bytes, size_bytes, "Extracting ZIP")
-            )
-            self._run_extraction(target_file, dest_dir, item_name)
-
-            if self.cancel_flag.is_set():
-                return {"success": False, "cancelled": True}
-
-            # ── Phase 4: optional auto-CHD conversion ────────────────────────
-            self._run_chd_auto(item, item_name, dest_dir, size_bytes)
-
-            # B1: Record in download history
-            console_name = item["name"].split(" / ")[0].strip() if " / " in item["name"] else ""
-            self.state.record_download(
-                item_name,
-                console_name,
-                item["size_str"],
-            )
-            return {"success": True}
-
-        except Exception as err:
-            logging.exception("Worker error for %s", item_name)
-            self.post_message(SystemLog(f"Worker Error {item_name}: {err}", True))
-            return {"success": False}
+        """Delegate to :class:`DownloadWorker` (A3 extraction)."""
+        return DownloadWorker(self, item).run()
 
     def _convert_to_chd(self, dest_dir: Path, silent: bool = False,
                          cancel: threading.Event | None = None) -> tuple[int, int]:
@@ -5065,10 +4703,13 @@ class MyrientTUI(App):
         if message.speed_bps > 0:
             speed_str = f"{self._format_size(int(message.speed_bps))}/s"
             status_line.append(f"  {speed_str}", style="bold #3fb950")
-            # Update global statusbar speed indicator
+            # F1: Track per-worker speed and show aggregate in statusbar
+            self._worker_speeds[message.task_id] = message.speed_bps
             try:
+                agg_speed = sum(self._worker_speeds.values())
+                agg_str = f"{self._format_size(int(agg_speed))}/s"
                 self.query_one("#gs-speed", Label).update(
-                    Text(speed_str, style="#3fb950")
+                    Text(agg_str, style="#3fb950")
                 )
             except Exception as e:
                 logging.debug("Update speed indicator failed: %s", e)
@@ -5089,6 +4730,14 @@ class MyrientTUI(App):
                 eta_str = f"{int(message.eta_secs // 3600)}h{int((message.eta_secs % 3600) // 60)}m"
             status_line.append(f"  ETA {eta_str}", style="dim #58a6ff")
 
+        # U6: Update queue table status cell for the active item
+        try:
+            self.query_one("#queue-table", DataTable).update_cell(
+                message.task_id, "Status", message.action
+            )
+        except Exception:
+            pass
+
         if task_id in self._active_progress_containers:
             try:
                 self.query_one(f"#{pb_id}", ProgressBar).update(
@@ -5108,6 +4757,9 @@ class MyrientTUI(App):
             )
 
     def on_download_complete(self, message: DownloadComplete) -> None:
+        # F1: Remove completed worker from aggregate speed tracking
+        self._worker_speeds.pop(message.item["id"], None)
+
         if message.success:
             with self._progress_lock:
                 self.global_completed   += 1
@@ -5182,18 +4834,17 @@ class MyrientTUI(App):
 
     @work(exclusive=True, thread=True)
     def run_lib_organize(self) -> None:
-        self._lib_cancel.clear()
-        self.post_message(SystemLog("Library Scan: Building target list..."))
-        library = Path(self.state.settings['library_root'])
+        op = LibraryOperation(self)
+        op.log("Library Scan: Building target list...")
 
         targets = []
         # Collect empty orphaned directories for cleanup (e.g. multi-disc
         # parent folders left behind after all disc subfolders were deleted).
         empty_dirs: list[Path] = []
 
-        if library.exists():
+        if op.library.exists():
             try:
-                console_dirs = [d for d in library.iterdir()
+                console_dirs = [d for d in op.library.iterdir()
                                 if d.is_dir() and not d.name.startswith('.')]
             except PermissionError:
                 console_dirs = []
@@ -5219,53 +4870,53 @@ class MyrientTUI(App):
 
         total_ops = len(targets) + len(empty_dirs)
         if total_ops == 0:
-            self.post_message(SystemLog("Library Scan: No valid targets found. (Library is already organized)"))
-            self.post_message(LibraryProgress("Organize", "Done", 100, 100))
+            op.log("Library Scan: No valid targets found. (Library is already organized)")
+            op.progress("Organize", "Done", 100, 100)
             return
 
         changed = 0
         step = 0
         for game_dir, parent_dir in targets:
             step += 1
-            if self._lib_cancel.is_set():
-                self.post_message(SystemLog("[yellow]Organize cancelled.[/]"))
+            if op.cancelled:
+                op.log("[yellow]Organize cancelled.[/]")
                 break
-            self.post_message(LibraryProgress(f"Organizing ({step}/{total_ops})", game_dir.name, step, total_ops))
+            op.progress(f"Organizing ({step}/{total_ops})", game_dir.name, step, total_ops)
             parent_dir.mkdir(parents=True, exist_ok=True)
             new_location = parent_dir / game_dir.name
             try:
                 # Carry the status entry over to the new path so the library tree
                 # doesn't lose validated/corrupted state after a Scan & Organize.
-                old_status = self._lib_status.get(game_dir)
+                old_status = op.lib_status.get(game_dir)
                 shutil.move(game_dir, new_location)
-                self._lib_status.remove(game_dir)
+                op.lib_status.remove(game_dir)
                 if old_status in ("validated", "corrupted"):
-                    self._lib_status.set_status(new_location, old_status)
+                    op.lib_status.set_status(new_location, old_status)
                 changed += 1
             except Exception as e:
-                self.post_message(SystemLog(f"Move failed [{game_dir.name}]: {e}", True))
+                op.log(f"Move failed [{game_dir.name}]: {e}", True)
 
         # Remove empty orphaned directories
         for empty_dir in empty_dirs:
             step += 1
-            if self._lib_cancel.is_set():
+            if op.cancelled:
                 break
-            self.post_message(LibraryProgress(f"Cleanup ({step}/{total_ops})", empty_dir.name, step, total_ops))
+            op.progress(f"Cleanup ({step}/{total_ops})", empty_dir.name, step, total_ops)
             try:
                 # Re-check emptiness in case something changed since the scan
                 if empty_dir.exists() and not any(empty_dir.iterdir()):
-                    self._lib_status.remove(empty_dir)
+                    op.lib_status.remove(empty_dir)
                     empty_dir.rmdir()
-                    self.post_message(SystemLog(f"Removed empty folder: {empty_dir.name}"))
+                    op.log(f"Removed empty folder: {empty_dir.name}")
                     changed += 1
             except OSError:
                 pass
 
-        self.post_message(LibraryProgress("Organize", "Complete", total_ops, total_ops))
+        op.progress("Organize", "Complete", total_ops, total_ops)
         if changed:
             # Only rescan if the directory tree actually changed
             self.run_lib_status_scan()
-        self.post_message(SystemLog(f"Clean-up Complete. {changed} folder(s) organized/removed."))
+        op.log(f"Clean-up Complete. {changed} folder(s) organized/removed.")
 
     @work(exclusive=True, thread=True)
     def run_bulk_dat_audit(self, scope: Path | None = None) -> None:
@@ -5281,20 +4932,20 @@ class MyrientTUI(App):
         When the dry-run switch (sw-dat-dry-run) is enabled, planned renames are
         logged but no files are moved and no status markers are written.
         """
-        self._lib_cancel.clear()
+        op = LibraryOperation(self, scope)
+        library = op.library
         dry_run = self.state.settings.get("dat_dry_run", False)
 
         if dry_run:
-            self.post_message(SystemLog(
+            op.log(
                 "[bold cyan]DAT Audit — DRY RUN mode[/bold cyan]  "
                 "(no files will be moved or marked)"
-            ))
+            )
 
         dat_ttl = self.state.settings.get("dat_cache_ttl_hours", 168) * 3600.0
-        library = Path(self.state.settings['library_root'])
 
         if not library.exists():
-            self.post_message(SystemLog("DAT Audit: Library path not found.", True))
+            op.log("DAT Audit: Library path not found.", True)
             return
 
         if scope is None:
@@ -5306,38 +4957,36 @@ class MyrientTUI(App):
                 d for d in library.iterdir()
                 if d.is_dir() and not d.name.startswith('.')
             )
-            scope_label = "full library"
         elif scope.parent == library:
             # Single console
             console_dirs = [scope] if scope.is_dir() else []
-            scope_label = f"console [{scope.name}]"
         else:
             # Game dir — resolve to its console parent
             console_parent = scope.parent
             while console_parent.parent != library and console_parent != library:
                 console_parent = console_parent.parent
             console_dirs = [console_parent] if console_parent.is_dir() else []
-            scope_label = f"game [{scope.name}]"
+        scope_label = op.scope_label()
 
         if not console_dirs:
-            self.post_message(SystemLog("DAT Audit: No console folders found in library."))
+            op.log("DAT Audit: No console folders found in library.")
             return
 
-        self.post_message(SystemLog(
+        op.log(
             f"DAT Audit [{scope_label}]: Starting audit of {len(console_dirs)} console(s)..."
-        ))
+        )
 
         # ── Phase 2: fetch the DAT index page once ──────────────────────────
-        self.post_message(LibraryProgress("DAT Audit", "Fetching DAT index...", 0, 100))
+        op.progress("DAT Audit", "Fetching DAT index...", 0, 100)
         try:
             try:
                 index_html = subprocess.check_output(
-                    ["wget", "-qO-", DAT_BASE_URL],
+                    ["wget", "-qO-", self._active_dat_url],
                     text=True, errors="ignore", timeout=30,
                 )
             except Exception:
                 req = urllib.request.Request(
-                    DAT_BASE_URL,
+                    self._active_dat_url,
                     headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
                 )
                 with urllib.request.urlopen(req, timeout=60) as res:
@@ -5352,8 +5001,8 @@ class MyrientTUI(App):
                 if name.endswith('.dat'):
                     dat_index[name] = href
         except Exception as err:
-            self.post_message(SystemLog(f"DAT Audit: Failed to fetch DAT index: {err}", True))
-            self.post_message(LibraryProgress("DAT Audit", "Failed", 0, 100))
+            op.log(f"DAT Audit: Failed to fetch DAT index: {err}", True)
+            op.progress("DAT Audit", "Failed", 0, 100)
             return
 
         # ── Phase 3: per-console audit ───────────────────────────────────────
@@ -5361,15 +5010,13 @@ class MyrientTUI(App):
 
         for con_idx, console_dir in enumerate(console_dirs, 1):
             # Respect cancel between consoles — audit can take many minutes
-            if self._lib_cancel.is_set():
-                self.post_message(SystemLog("[yellow]DAT Audit cancelled.[/]"))
+            if op.cancelled:
+                op.log("[yellow]DAT Audit cancelled.[/]")
                 break
 
             console_name = console_dir.name
             phase_label = f"[{con_idx}/{len(console_dirs)}] {console_name}"
-            self.post_message(LibraryProgress(
-                "DAT Audit", phase_label, con_idx - 1, len(console_dirs)
-            ))
+            op.progress("DAT Audit", phase_label, con_idx - 1, len(console_dirs))
 
             # ── 3a: find matching DAT ────────────────────────────────────────
             # Build list of prefixes to try for this console.  Most consoles use
@@ -5392,17 +5039,17 @@ class MyrientTUI(App):
                     break
 
             if not dat_href:
-                self.post_message(SystemLog(
+                op.log(
                     f"DAT Audit [{console_name}]: No matching DAT found on Myrient — skipping.\n"
                     f"  (Tried prefixes: {', '.join(prefixes_to_try)})"
-                ))
+                )
                 continue
 
             if matched_prefix != standard_prefix:
-                self.post_message(SystemLog(
+                op.log(
                     f"DAT Audit [{_escape_markup(console_name)}]: Using alternate DAT format "
                     f"[bold]{_escape_markup(Path(unquote(dat_href)).name)}[/bold]"
-                ))
+                )
 
             # ── 3b: download DAT if not cached or stale ─────────────────────
             dat_dir  = DAT_CACHE_DIR / console_name
@@ -5421,16 +5068,16 @@ class MyrientTUI(App):
                     age = time.time() - dat_path.stat().st_mtime
                     if age > dat_ttl:
                         _dat_is_stale = True
-                        self.post_message(SystemLog(
+                        op.log(
                             f"DAT Audit [{console_name}]: Cached DAT is "
                             f"{int(age // 86400)}d old — refreshing."
-                        ))
+                        )
                 except OSError:
                     pass
 
             if not dat_path.exists() or _dat_is_stale:
-                dat_url = urljoin(DAT_BASE_URL, dat_href)
-                self.post_message(SystemLog(f"DAT Audit [{console_name}]: Downloading DAT..."))
+                dat_url = urljoin(self._active_dat_url, dat_href)
+                op.log(f"DAT Audit [{console_name}]: Downloading DAT...")
                 dat_tmp = dat_path.with_suffix('.tmp')
                 try:
                     proc = subprocess.run(
@@ -5452,9 +5099,9 @@ class MyrientTUI(App):
                         dat_tmp.replace(dat_path)      # atomic rename on success
                     except Exception as err:
                         dat_tmp.unlink(missing_ok=True)
-                        self.post_message(SystemLog(
+                        op.log(
                             f"DAT Audit [{console_name}]: Could not download DAT: {err}", True
-                        ))
+                        )
                         continue
 
             # ── 3c: parse DAT into sha1 → {name, game} ──────────────────────
@@ -5469,6 +5116,7 @@ class MyrientTUI(App):
             # excluded from renaming — the file is still counted as verified-good.
             dat_by_sha1: dict[str, dict[str, str]] = {}
             ambiguous_sha1s: set[str] = set()
+            dat_all_games: set[str] = set()
             try:
                 context = ET.iterparse(dat_path, events=('start', 'end'))
                 _, xml_root = next(context)
@@ -5476,6 +5124,7 @@ class MyrientTUI(App):
                 for event, elem in context:
                     if event == 'start' and elem.tag == 'game':
                         current_game = elem.get('name', 'Unknown')
+                        dat_all_games.add(current_game)
                     elif event == 'end' and elem.tag == 'rom':
                         sha1_val = elem.get('sha1')
                         rom_name = elem.get('name')
@@ -5495,10 +5144,18 @@ class MyrientTUI(App):
                     elif event == 'end' and elem.tag == 'game':
                         xml_root.clear()
             except Exception as err:
-                self.post_message(SystemLog(
+                op.log(
                     f"DAT Audit [{console_name}]: Failed to parse DAT: {err}", True
-                ))
+                )
                 continue
+
+            # Build disc groups: base_game_name → {full disc game names}
+            # e.g. "0 story (Japan)" → {"0 story (Japan) (Disc 1)", "0 story (Japan) (Disc 2)"}
+            dat_disc_groups: dict[str, set[str]] = {}
+            for gname in dat_all_games:
+                base = DISC_REGEX.sub('', gname).strip()
+                if base != gname:
+                    dat_disc_groups.setdefault(base, set()).add(gname)
 
             # ── 3d: collect game dirs and their auditable files ──────────────
             # Use per-extension glob instead of rglob('*') to avoid materialising
@@ -5511,9 +5168,9 @@ class MyrientTUI(App):
                         game_dirs.setdefault(item.parent, []).append(item)
 
             if not game_dirs:
-                self.post_message(SystemLog(
+                op.log(
                     f"DAT Audit [{console_name}]: No auditable files found."
-                ))
+                )
                 continue
 
             # ── 3e: load SHA-1 sidecar cache for this console ───────────────
@@ -5547,7 +5204,7 @@ class MyrientTUI(App):
             # Defer LibraryStatus disk flushes for the entire per-console pass.
             # set_status/remove are called once per game dir in step 3h (and per
             # rename in 3f); deferring reduces I/O from O(games) to O(1) per console.
-            self._lib_status.defer_flushes(True)
+            op.lib_status.defer_flushes(True)
             con_perfect = con_misnamed = con_bad = con_ambiguous = 0
             all_files = [(gd, fp) for gd, fps in game_dirs.items() for fp in fps]
             total_files = len(all_files)
@@ -5557,38 +5214,63 @@ class MyrientTUI(App):
             # markers in step 3h rather than "corrupted".
             renamed_old_dirs: set[Path] = set()
 
-            for f_idx, (game_dir, file_path) in enumerate(all_files, 1):
-                if self._lib_cancel.is_set():
-                    break
-                self.post_message(LibraryProgress(
-                    f"Hashing {console_name} ({f_idx}/{total_files})",
-                    file_path.name, f_idx, total_files
-                ))
+            # ── Parallel hashing phase ────────────────────────────────────
+            hash_lock = threading.Lock()
+            hash_counter = [0]
 
-                file_hash: str | None = None
+            def _hash_file(game_dir_fp_pair: tuple[Path, Path]) -> tuple[Path, Path, str | None]:
+                game_dir_h, file_path_h = game_dir_fp_pair
+                if op.cancelled:
+                    return (game_dir_h, file_path_h, None)
+                with hash_lock:
+                    hash_counter[0] += 1
+                    idx = hash_counter[0]
+                op.progress(
+                    f"Hashing {console_name} ({idx}/{total_files})",
+                    file_path_h.name, idx, total_files
+                )
+                file_hash_h: str | None = None
                 try:
-                    stat   = file_path.stat()
-                    # Relative POSIX key — portable across library relocations.
-                    key    = file_path.relative_to(console_dir).as_posix()
+                    stat = file_path_h.stat()
+                    key = file_path_h.relative_to(console_dir).as_posix()
                     cached = sha1_cache.get(key)
-
                     if (cached
                             and cached.get("mtime") == stat.st_mtime
                             and cached.get("size")  == stat.st_size):
-                        file_hash = cached["sha1"]
+                        file_hash_h = cached["sha1"]
                     else:
                         sha1_obj = hashlib.sha1(usedforsecurity=False)
-                        with open(file_path, 'rb') as fh:
+                        with open(file_path_h, 'rb') as fh:
                             while chunk := fh.read(_HASH_CHUNK_BYTES):
                                 sha1_obj.update(chunk)
-                        file_hash = sha1_obj.hexdigest().lower()
-                        sha1_cache[key] = {
-                            "mtime": stat.st_mtime,
-                            "size":  stat.st_size,
-                            "sha1":  file_hash,
-                        }
-                        cache_dirty = True
+                        file_hash_h = sha1_obj.hexdigest().lower()
+                        with hash_lock:
+                            sha1_cache[key] = {
+                                "mtime": stat.st_mtime,
+                                "size":  stat.st_size,
+                                "sha1":  file_hash_h,
+                            }
+                            nonlocal cache_dirty
+                            cache_dirty = True
+                except Exception:
+                    pass
+                return (game_dir_h, file_path_h, file_hash_h)
 
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as hash_pool:
+                hash_results_raw = list(hash_pool.map(_hash_file, all_files))
+
+            # ── Sequential matching / renaming phase ──────────────────────
+            for game_dir, file_path, file_hash in hash_results_raw:
+                if op.cancelled:
+                    break
+
+                if file_hash is None:
+                    con_bad += 1
+                    hash_results[file_path] = False
+                    logging.debug("DAT audit hash returned None: %s", file_path)
+                    continue
+
+                try:
                     if file_hash in ambiguous_sha1s:
                         # Hash is shared by multiple games in the DAT (e.g. identical
                         # silent audio tracks common to many PS1 titles).  The data is
@@ -5619,11 +5301,11 @@ class MyrientTUI(App):
                             if dry_run:
                                 # Dry run: report the planned rename but don't touch files
                                 hash_results[file_path] = True
-                                self.post_message(SystemLog(
+                                op.log(
                                     f"[cyan][DRY-RUN][/cyan] Would rename: "
                                     f"[dim]{_escape_markup(file_path.name)}[/dim]"
                                     f" → [bold]{_escape_markup(str(correct_path.relative_to(library)))}[/bold]"
-                                ))
+                                )
                             else:
                                 try:
                                     correct_dir.mkdir(parents=True, exist_ok=True)
@@ -5637,38 +5319,38 @@ class MyrientTUI(App):
                                         cache_dirty = True
 
                                     hash_results[correct_path] = True
-                                    self._lib_status.set_status(correct_dir, "validated")
+                                    op.lib_status.set_status(correct_dir, "validated")
                                     renamed_old_dirs.add(game_dir)
 
-                                    self.post_message(SystemLog(
+                                    op.log(
                                         f"Fixed [{console_name}]: "
                                         f"'{file_path.name}' → '{correct_dir.name}/{expected_name}'"
-                                    ))
+                                    )
 
                                 except Exception as rename_err:
                                     hash_results[file_path] = True
                                     logging.exception(
                                         "DAT audit rename failed: %s → %s", file_path, correct_path
                                     )
-                                    self.post_message(SystemLog(
+                                    op.log(
                                         f"Rename failed [{console_name}]: "
                                         f"'{file_path.name}': {rename_err}", True
-                                    ))
+                                    )
                     else:
                         con_bad += 1
-                        self.post_message(SystemLog(
+                        op.log(
                             f"Bad/Unknown [{console_name}]: "
                             f"'{file_path.name}' (SHA1: {file_hash})"
-                        ))
+                        )
                         hash_results[file_path] = False
 
                 except Exception as err:
                     con_bad += 1
                     hash_results[file_path] = False
                     logging.exception("DAT audit read error: %s", file_path)
-                    self.post_message(SystemLog(
+                    op.log(
                         f"Read error [{console_name}]: '{file_path.name}': {err}", True
-                    ))
+                    )
 
             # ── 3g: persist the SHA-1 cache if any entries changed ───────────
             if cache_dirty:
@@ -5693,36 +5375,72 @@ class MyrientTUI(App):
                 if not dry_run:
                     for game_dir, files in game_dirs.items():
                         if game_dir in renamed_old_dirs:
-                            self._lib_status.remove(game_dir)
+                            op.lib_status.remove(game_dir)
                         else:
                             dir_ok = all(hash_results.get(fp, False) for fp in files)
                             if dir_ok:
-                                self._lib_status.set_status(game_dir, "validated")
+                                op.lib_status.set_status(game_dir, "validated")
                             else:
-                                self._lib_status.set_status(game_dir, "corrupted")
+                                op.lib_status.set_status(game_dir, "corrupted")
+
+                    # ── 3i: multi-disc completeness check ─────────────────────
+                    # For multi-disc games, check if all expected discs from the
+                    # DAT are present.  A game with only disc 2 but missing disc 1
+                    # should be marked incomplete, not validated.
+                    incomplete_parents: set[Path] = set()
+                    for game_dir in game_dirs:
+                        dir_name = game_dir.name
+                        base_name = DISC_REGEX.sub('', dir_name).strip()
+                        if base_name == dir_name:
+                            continue  # not a multi-disc entry
+                        if base_name not in dat_disc_groups:
+                            continue  # DAT has no multi-disc set for this base
+                        expected_discs = dat_disc_groups[base_name]
+                        parent_dir = game_dir.parent
+                        for disc_name in expected_discs:
+                            disc_dir = parent_dir / disc_name
+                            if not disc_dir.exists() or not any(
+                                f.suffix.lower() in _DAT_AUDITABLE_EXTS
+                                for f in disc_dir.iterdir() if f.is_file()
+                            ):
+                                # Missing disc — demote all present discs and
+                                # mark parent as incomplete
+                                incomplete_parents.add(parent_dir)
+                                break
+
+                    for parent_dir in incomplete_parents:
+                        # Remove validated status from present disc dirs so the
+                        # library tree shows them as incomplete
+                        for child in parent_dir.iterdir():
+                            if child.is_dir() and op.lib_status.get(child) == "validated":
+                                op.lib_status.remove(child)
+                        op.log(
+                            f"Incomplete [{console_name}]: "
+                            f"'{parent_dir.name}' — missing disc(s)"
+                        )
             finally:
                 # Single flush for all status changes in this console.
-                self._lib_status.defer_flushes(False)
+                op.lib_status.defer_flushes(False)
 
-            self.post_message(SystemLog(
+            op.log(
                 f"DAT Audit [{console_name}]: "
                 f"Perfect: {con_perfect}  Fixed: {con_misnamed}  "
                 f"Ambiguous: {con_ambiguous}  Bad/Unknown: {con_bad}"
-            ))
+            )
             grand_perfect  += con_perfect
             grand_misnamed += con_misnamed
             grand_ambiguous += con_ambiguous
             grand_bad      += con_bad
 
         # ── Phase 4: finish ──────────────────────────────────────────────────
-        self.post_message(LibraryProgress("DAT Audit", "Complete", 100, 100))
-        self.post_message(SystemLog(
+        op.progress("DAT Audit", "Complete", 100, 100)
+        op.log(
             f"[bold]Bulk DAT Audit Complete[/bold] — "
             f"Perfect: [bold green]{grand_perfect}[/]  "
             f"Fixed: [bold yellow]{grand_misnamed}[/]  "
             f"Ambiguous: [bold cyan]{grand_ambiguous}[/]  "
             f"Bad/Unknown: [bold red]{grand_bad}[/]"
-        ))
+        )
         self.run_lib_status_scan()
 
 
@@ -5735,26 +5453,22 @@ class MyrientTUI(App):
         a game directory (convert that one game), or None / the library root
         to convert everything.
         """
-        self._lib_cancel.clear()
+        op = LibraryOperation(self, scope)
+        library = op.library
+        scope_label = op.scope_label()
         # Resolve locally — worker threads must not write back to toolchain.chdman_path
         # since concurrent @work threads could race on that shared attribute.
         chdman = self.toolchain.chdman_path or Toolchain.find_chdman()
         if not chdman:
-            self.post_message(SystemLog(
+            op.log(
                 "[bold red]chdman not found.[/bold red] "
                 "Run 'Setup chdman' first, or install it manually.", True
-            ))
+            )
             return
-        library = Path(self.state.settings['library_root'])
         if scope is None or scope == library:
             scope = library
-            scope_label = "full library"
-        elif scope.parent == library:
-            scope_label = f"console [{scope.name}]"
-        else:
-            scope_label = f"game [{scope.name}]"
 
-        self.post_message(SystemLog(f"CHD Conversion: Scanning {scope_label}…"))
+        op.log(f"CHD Conversion: Scanning {scope_label}\u2026")
 
         # If scope is a specific game dir, treat it as the only candidate;
         # otherwise build targets by walking the library and filtering to scope.
@@ -5806,7 +5520,7 @@ class MyrientTUI(App):
             # dir to _walk_library_game_dirs as if it were the library root,
             # which caused the walker to treat game dirs as consoles and miss
             # all single-disc games).
-            for _, game_dir, status in self._walk_library_game_dirs(library, self._lib_status):
+            for _, game_dir, status in self._walk_library_game_dirs(library, op.lib_status):
                 if scope != library and not game_dir.is_relative_to(scope):
                     continue
                 if status == "corrupted":
@@ -5829,26 +5543,26 @@ class MyrientTUI(App):
 
         total_ops = len(targets)
         if total_ops == 0:
-            self.post_message(SystemLog(f"CHD Conversion [{scope_label}]: No convertible files found."))
-            self.post_message(LibraryProgress("CHD Conversion", "Done", 100, 100))
+            op.log(f"CHD Conversion [{scope_label}]: No convertible files found.")
+            op.progress("CHD Conversion", "Done", 100, 100)
             return
 
         converted = failed = 0
         for i, game_dir in enumerate(targets, 1):
-            if self._lib_cancel.is_set():
-                self.post_message(SystemLog("[yellow]CHD conversion cancelled.[/]"))
+            if op.cancelled:
+                op.log("[yellow]CHD conversion cancelled.[/]")
                 break
-            self.post_message(LibraryProgress(f"Converting ({i}/{total_ops})", game_dir.name, i, total_ops))
-            self.post_message(SystemLog(f"Converting: {game_dir.name}"))
-            c, f = self._convert_to_chd(game_dir, silent=False, cancel=self._lib_cancel)
+            op.progress(f"Converting ({i}/{total_ops})", game_dir.name, i, total_ops)
+            op.log(f"Converting: {game_dir.name}")
+            c, f = self._convert_to_chd(game_dir, silent=False, cancel=op.cancel)
             converted += c
             failed    += f
 
-        self.post_message(LibraryProgress("CHD Conversion", "Complete", total_ops, total_ops))
-        self.post_message(SystemLog(
+        op.progress("CHD Conversion", "Complete", total_ops, total_ops)
+        op.log(
             f"CHD Conversion [{scope_label}] finished — "
             f"[bold green]{converted}[/] converted, [bold red]{failed}[/] failed."
-        ))
+        )
 
     @work(exclusive=True, thread=True)
     def run_chd_to_original(self, scope: Path | None = None) -> None:
@@ -5859,26 +5573,22 @@ class MyrientTUI(App):
         then falls back to extracthd (→ .img).  Source .chd is removed only on
         confirmed success.
         """
-        self._lib_cancel.clear()
+        op = LibraryOperation(self, scope)
+        library = op.library
+        scope_label = op.scope_label()
         # Resolve locally — same race-safety rationale as run_lib_convert.
         chdman = self.toolchain.chdman_path or Toolchain.find_chdman()
         if not chdman:
-            self.post_message(SystemLog(
+            op.log(
                 "[bold red]chdman not found.[/bold red] "
                 "Run 'Setup chdman' first, or install it manually.", True
-            ))
+            )
             return
 
-        library = Path(self.state.settings['library_root'])
         if scope is None or scope == library:
             scope = library
-            scope_label = "full library"
-        elif scope.parent == library:
-            scope_label = f"console [{scope.name}]"
-        else:
-            scope_label = f"game [{scope.name}]"
 
-        self.post_message(SystemLog(f"CHD → Original: Scanning {scope_label}…"))
+        op.log(f"CHD → Original: Scanning {scope_label}\u2026")
 
         chd_files: list[Path] = [
             f for f in scope.rglob("*.chd")
@@ -5887,22 +5597,20 @@ class MyrientTUI(App):
 
         total_ops = len(chd_files)
         if total_ops == 0:
-            self.post_message(SystemLog(f"CHD → Original: No .chd files found in {scope_label}."))
-            self.post_message(LibraryProgress("CHD → Original", "Done", 100, 100))
+            op.log(f"CHD → Original: No .chd files found in {scope_label}.")
+            op.progress("CHD → Original", "Done", 100, 100)
             return
 
-        self.post_message(SystemLog(f"CHD → Original: Extracting {total_ops} file(s)..."))
+        op.log(f"CHD → Original: Extracting {total_ops} file(s)...")
         converted = failed = 0
 
         for i, chd_path in enumerate(chd_files, 1):
-            if self._lib_cancel.is_set():
-                self.post_message(SystemLog("[yellow]CHD extraction cancelled.[/]"))
+            if op.cancelled:
+                op.log("[yellow]CHD extraction cancelled.[/]")
                 break
 
-            self.post_message(LibraryProgress(
-                f"Extracting ({i}/{total_ops})", chd_path.name, i, total_ops
-            ))
-            self.post_message(SystemLog(f"Extracting: {chd_path.name}"))
+            op.progress(f"Extracting ({i}/{total_ops})", chd_path.name, i, total_ops)
+            op.log(f"Extracting: {chd_path.name}")
 
             dest_dir = chd_path.parent
 
@@ -5945,9 +5653,9 @@ class MyrientTUI(App):
                         proc.kill()
                         proc.wait()
                         self._unregister_process(proc)
-                        self.post_message(SystemLog(
+                        op.log(
                             f"CHD Extract [{chd_path.name}] {subcommand} timed out — killed.", True
-                        ))
+                        )
                         break
                     self._unregister_process(proc)
 
@@ -5990,7 +5698,7 @@ class MyrientTUI(App):
                         except OSError:
                             pass
                         # Update validation status — game is now incomplete until re-verified
-                        self._lib_status.remove(dest_dir)
+                        op.lib_status.remove(dest_dir)
                         break
 
                     # Extraction failed — discard any partial output before trying next subcommand
@@ -6011,23 +5719,23 @@ class MyrientTUI(App):
                             pass
                     # If extractcd fails it's probably an HD image — try next subcommand
                 except Exception as e:
-                    self.post_message(SystemLog(
+                    op.log(
                         f"CHD Extract [{chd_path.name}] {subcommand} error: {e}", True
-                    ))
+                    )
                     break
 
             if not success:
                 failed += 1
-                self.post_message(SystemLog(
+                op.log(
                     f"[red]Failed to extract:[/red] {_escape_markup(chd_path.name)} "
                     "(not a CD or HD image, or chdman error)", True
-                ))
+                )
 
-        self.post_message(LibraryProgress("CHD → Original", "Complete", total_ops, total_ops))
-        self.post_message(SystemLog(
+        op.progress("CHD → Original", "Complete", total_ops, total_ops)
+        op.log(
             f"CHD → Original complete: "
             f"[bold green]{converted}[/] extracted, [bold red]{failed}[/] failed."
-        ))
+        )
         if converted:
             self.run_lib_status_scan()
 
@@ -6288,6 +5996,8 @@ class MyrientTUI(App):
             else:
                 self._queue_selected.add(item_id)
             self._refresh_queue_row_visual(table, item_id)
+            # N6: Track last toggled index for range selection
+            self._last_queue_selected_idx = cursor
         except Exception:
             pass
 
@@ -6521,6 +6231,14 @@ class MyrientTUI(App):
                 structure[console_name] = (library / console_name, [])
             structure[console_name][1].append((game_dir, status, has_chd))
 
+        # F3: Build set of validated game directory names for browser indicator
+        validated_names: set[str] = set()
+        for _cname, (_cpath, games_list) in structure.items():
+            for game_dir, status, _has_chd in games_list:
+                if status == "validated":
+                    validated_names.add(game_dir.name)
+        self.call_from_thread(setattr, self, "_library_game_names", validated_names)
+
         # Pre-compute disk usage per console on this worker thread so the main
         # thread's on_library_tree_ready handler never blocks on heavy I/O.
         disk_usage: dict[str, int] = {}
@@ -6532,7 +6250,7 @@ class MyrientTUI(App):
     def _lookup_game_size(self, console_name: str, game_zip: str) -> str:
         """Look up a game's size from the scrape cache. Returns 'N/A' on miss."""
         try:
-            url = BASE_URL + quote(console_name, safe="") + "/"
+            url = self._active_base_url + quote(console_name, safe="") + "/"
             games = self.scraper.scrape_links(url)
             for g in games:
                 if g["name"] == game_zip:
@@ -6548,7 +6266,7 @@ class MyrientTUI(App):
         Used by the requeue methods to expand multi-disc parent folders into
         individual per-disc queue items.
         """
-        console_url = BASE_URL + quote(console_name, safe="") + "/"
+        console_url = self._active_base_url + quote(console_name, safe="") + "/"
         all_games = self.scraper.scrape_links(console_url)
         variants: list[GameItem] = []
         for g in all_games:
@@ -6581,7 +6299,7 @@ class MyrientTUI(App):
             return 0
 
         added = 0
-        console_url = BASE_URL + quote(console_name, safe="") + "/"
+        console_url = self._active_base_url + quote(console_name, safe="") + "/"
         for g in variants:
             disc_folder = g["name"][:-4]  # strip .zip
             disc_dest = library / console_name / game_dir.name / disc_folder
@@ -6657,10 +6375,12 @@ class MyrientTUI(App):
             # carries the old "validated" value from a previous download).
             self._lib_status.remove(game_dir)
 
-            # ── Multi-disc parent detection ────────────────────────────────
-            # If the dir name has no disc suffix, it may be a grouping folder
-            # whose disc subfolders were deleted.  Scrape the console page to
-            # find individual disc zips and queue each one.
+            # ── Multi-disc detection ────────────────────────────────────────
+            # Case A: dir name has NO disc suffix → grouping folder whose disc
+            #   subfolders were deleted.  Scrape to find disc zips.
+            # Case B: dir name HAS a disc suffix AND status is incomplete →
+            #   some sibling discs may be missing.  Scrape to find all disc
+            #   variants and queue whichever ones are absent or incomplete.
             if DISC_REGEX.search(game_dir.name) is None:
                 disc_added = self._queue_disc_variants(
                     console_name, game_dir, status, library,
@@ -6674,10 +6394,43 @@ class MyrientTUI(App):
                         n_incomplete += disc_added
                     continue
                 # No disc variants found — queue as a normal single-file game
+            elif status == "incomplete":
+                # Disc-suffixed dir is incomplete — check for missing siblings
+                base_name = DISC_REGEX.sub('', game_dir.name).strip()
+                parent_dir = game_dir.parent
+                variants = self._find_disc_variants(console_name, base_name)
+                if variants:
+                    console_url = self._active_base_url + quote(console_name, safe="") + "/"
+                    sibling_added = 0
+                    for g in variants:
+                        disc_folder = g["name"][:-4]  # strip .zip
+                        disc_dest = parent_dir / disc_folder
+                        if str(disc_dest) in existing_paths:
+                            continue
+                        # Queue if the disc dir doesn't exist or isn't validated
+                        disc_status = self._lib_status.get(disc_dest)
+                        if disc_dest.exists() and disc_status == "validated":
+                            continue
+                        self._lib_status.remove(disc_dest)
+                        disc_url = urljoin(console_url, g["url_part"])
+                        current_queue.append({
+                            "id":        f"dl_{uuid.uuid4().hex[:8]}",
+                            "name":      f"{console_name} / {g['name']} (incomplete)",
+                            "game_url":  disc_url,
+                            "dest_path": str(disc_dest),
+                            "size_str":  g.get("size_str", "N/A"),
+                        })
+                        existing_paths.add(str(disc_dest))
+                        sibling_added += 1
+                    if sibling_added:
+                        added += sibling_added
+                        n_incomplete += sibling_added
+                        continue
+                # Fall through to single-file queue if no variants found
 
             # Reconstruct the Myrient URL from the library directory structure.
             game_zip = game_dir.name + ".zip"
-            game_url = BASE_URL + quote(console_name, safe="") + "/" + quote(game_zip, safe="")
+            game_url = self._active_base_url + quote(console_name, safe="") + "/" + quote(game_zip, safe="")
             size_str = self._lookup_game_size(console_name, game_zip)
             # Store plain-text name — Rich markup must NOT be embedded in persisted JSON
             # because brackets in console/game names would inject unintended markup at render time.
@@ -6764,7 +6517,7 @@ class MyrientTUI(App):
                     continue
 
             game_zip = game_dir.name + ".zip"
-            game_url = BASE_URL + quote(console_name, safe="") + "/" + quote(game_zip, safe="")
+            game_url = self._active_base_url + quote(console_name, safe="") + "/" + quote(game_zip, safe="")
             size_str = self._lookup_game_size(console_name, game_zip)
             current_queue.append({
                 "id":        f"dl_{uuid.uuid4().hex[:8]}",
@@ -6795,9 +6548,21 @@ class MyrientTUI(App):
         if not query or len(query) < 2:
             return
         self._lib_cancel.clear()
+
+        def _show_searching():
+            try:
+                lbl = self.query_one("#breadcrumb", Label)
+                t = Text()
+                t.append("Global Search", style="#58a6ff")
+                t.append("  Searching\u2026", style="italic #d29922")
+                lbl.update(t)
+            except Exception:
+                pass
+        self.call_from_thread(_show_searching)
+
         self.post_message(SystemLog(f"Global search: \"{_escape_markup(query)}\"…"))
 
-        items = self.scraper.scrape_links(BASE_URL)
+        items = self.scraper.scrape_links(self._active_base_url)
         consoles = [i for i in items if i["url_part"].endswith('/')]
         if not consoles:
             self.post_message(SystemLog("Global search: no consoles found.", True))
@@ -6811,7 +6576,7 @@ class MyrientTUI(App):
             with semaphore:
                 if self._lib_cancel.is_set():
                     return
-                url = urljoin(BASE_URL, console["url_part"])
+                url = urljoin(self._active_base_url, console["url_part"])
                 self.post_message(LibraryProgress(
                     "Searching", console["name"].strip('/'), idx, len(consoles)
                 ))
@@ -6936,7 +6701,7 @@ class MyrientTUI(App):
                     dest_path = library_root / console_name / clean_base / game_name
                 else:
                     dest_path = library_root / console_name / game_name
-                game_url = BASE_URL + quote(console_name, safe="") + "/" + quote(game_zip, safe="")
+                game_url = self._active_base_url + quote(console_name, safe="") + "/" + quote(game_zip, safe="")
                 if str(dest_path) not in existing_paths:
                     current_queue.append({
                         "id": f"dl_{uuid.uuid4().hex[:8]}",

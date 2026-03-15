@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+myrient_data/
+myrient_errors.log
