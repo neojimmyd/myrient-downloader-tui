@@ -149,32 +149,55 @@ ListView:focus > ListItem.--highlight   { background: #0f1520; border-left: thic
     padding: 1 2;
     layout: vertical;
 }
-#breadcrumb { height: 1; color: #3d4451; margin-bottom: 0; }
+/* Merged header: breadcrumb + toolbar on one compact line */
+#browse-header {
+    height: 1;
+    layout: horizontal;
+    align: left middle;
+    margin-bottom: 0;
+}
+#browse-header #breadcrumb { width: 1fr; height: 1; color: #3d4451; }
+#browse-header #game-selection-count {
+    width: auto; height: 1; color: #3fb950; text-style: bold;
+    content-align: right middle; margin: 0 1 0 0;
+}
+#browse-header Button {
+    width: auto; min-width: 1; height: 1; margin: 0; padding: 0 1;
+    border: none; background: transparent; color: #6e7681; text-style: none;
+}
+#browse-header Button:hover { color: #e6edf3; background: #21262d; }
+#browse-header Button.-success { color: #3fb950; border: none; background: transparent; }
+#browse-header Button.-success:hover { color: #e6edf3; background: #196327; }
+/* Search bar row */
 #browse-search-bar { height: auto; layout: horizontal; align: left middle; }
 #browse-search-bar .search-bar { width: 1fr; }
 .browse-global-btn { width: auto; min-width: 10; height: 3; margin: 0 0 1 1; }
-#browse-toolbar {
-    height: auto;
+#btn-toggle-tags { width: auto; min-width: 8; height: 3; margin: 0 0 1 1; }
+/* Tag filter row (hidden by default, toggled by Tags button) */
+#browse-tag-row {
+    height: 2;
     layout: horizontal;
     align: left middle;
     margin-bottom: 1;
+    display: none;
 }
-#browse-toolbar Button { width: auto; min-width: 8; margin: 0 1 0 0; height: 3; }
+.tag-label { width: 6; color: #6e7681; }
+#browse-tag-scroll { height: 2; width: 1fr; }
+.tag-chip { width: auto; padding: 0 1; color: #6e7681; }
+.tag-chip:hover { color: #c9d1d9; background: #21262d; }
+.tag-active { color: #00d4aa; text-style: bold; }
+/* Game list DataTable — headers visible and clickable for sorting */
 #game-list {
     height: 1fr;
     border: solid #1c2333;
     background: #0d1117;
 }
-#game-list > .datatable--header { display: none; }
-#console-list { height: 1fr; border: solid #1c2333; background: #0d1117; }
-#game-selection-count {
-    width: auto;
-    color: #3fb950;
+#game-list > .datatable--header {
+    background: #161b22;
+    color: #9aa0aa;
     text-style: bold;
-    margin: 0 0 0 1;
-    height: 3;
-    content-align: left middle;
 }
+#console-list { height: 1fr; border: solid #1c2333; background: #0d1117; }
 #browse-empty-state {
     height: 1fr;
     width: 1fr;
@@ -185,9 +208,9 @@ ListView:focus > ListItem.--highlight   { background: #0f1520; border-left: thic
 /* ── ▶ DOWNLOADS pane ─────────────────────────────────────────── */
 #downloads-layout { height: 1fr; layout: horizontal; }
 #queue-panel {
-    width: 40%;
-    min-width: 34;
-    max-width: 60;
+    width: 35%;
+    min-width: 30;
+    max-width: 55;
     height: 1fr;
     background: #080c12;
     border-right: solid #1c2333;
@@ -195,14 +218,12 @@ ListView:focus > ListItem.--highlight   { background: #0f1520; border-left: thic
     layout: vertical;
 }
 #queue-table { height: 1fr; border: solid #1c2333; background: #0d1117; }
-#queue-total-size { height: 1; color: #3d4451; margin-top: 1; }
-.queue-toolbar  { height: auto; margin-bottom: 1; layout: vertical; }
+#queue-total-size { height: 1; color: #3d4451; margin-top: 0; }
 .queue-controls { height: auto; layout: horizontal; margin-top: 1; align: left middle; }
-/* Queue settings collapsible replaces old .queue-settings-row */
-#queue-settings-collapsible {
-    height: auto;
-    margin-top: 1;
-}
+#queue-mgmt-collapsible { height: auto; margin-top: 1; }
+#queue-settings-collapsible { height: auto; }
+#history-collapsible { height: auto; max-height: 16; }
+#history-table { height: auto; max-height: 12; border: solid #1c2333; background: #0d1117; }
 
 /* Progress panel */
 #progress-panel {
@@ -214,25 +235,34 @@ ListView:focus > ListItem.--highlight   { background: #0f1520; border-left: thic
 #lbl-global-progress { height: 1; color: #9aa0aa; margin-bottom: 0; }
 #global-progress     { margin-bottom: 1; display: none; }
 #progress-area       { height: 1fr; overflow-y: auto; layout: vertical; }
-#history-collapsible { height: auto; max-height: 16; margin-top: 1; }
-#history-table       { height: auto; max-height: 12; border: solid #1c2333; background: #0d1117; }
 #progress-grid {
-    layout: grid;
-    grid-size: 2;
-    grid-gutter: 1 2;
+    layout: vertical;
     height: auto;
     min-height: 4;
 }
 .progress-container {
-    height: 7;
-    padding: 1;
+    height: 5;
+    padding: 0 1;
     border: solid #1c2333;
     background: #080c12;
     overflow: hidden;
+    margin-bottom: 1;
 }
 ProgressBar > .bar--bar      { color: #58a6ff; }
 ProgressBar > .bar--complete { color: #3fb950; }
-.speed-label { color: #3fb950; height: 1; }
+.progress-bar-row {
+    layout: horizontal;
+    height: 3;
+}
+.progress-bar-row ProgressBar { width: 1fr; }
+.speed-label {
+    color: #3fb950;
+    height: 1;
+    width: auto;
+    min-width: 16;
+    text-align: right;
+    margin-left: 1;
+}
 
 /* ── ⊞ LIBRARY pane ───────────────────────────────────────────── */
 #lib-tab-wrapper { height: 1fr; layout: vertical; }
@@ -477,7 +507,8 @@ Screen.-light-mode #gs-queue { color: #656d76; }
 Screen.-light-mode .section-header { color: #656d76; border-bottom: solid #d0d7de; }
 Screen.-light-mode .search-bar { background: #f6f8fa; color: #1f2328; border: solid #d0d7de; }
 Screen.-light-mode .search-bar:focus { border: solid #0969da; }
-Screen.-light-mode #breadcrumb { color: #656d76; background: #f6f8fa; border-bottom: solid #d0d7de; }
+Screen.-light-mode #browse-header #breadcrumb { color: #656d76; }
+Screen.-light-mode #browse-header Button { color: #656d76; }
 Screen.-light-mode DataTable { background: #ffffff; color: #1f2328; }
 Screen.-light-mode DataTable > .datatable--header { background: #f6f8fa; color: #656d76; }
 Screen.-light-mode DataTable > .datatable--cursor { background: #ddf4ff; color: #1f2328; }

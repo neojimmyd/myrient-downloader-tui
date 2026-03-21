@@ -14,7 +14,7 @@ class SettingsPane(Vertical):
     """Settings organised into tabbed sections."""
 
     def compose(self) -> ComposeResult:
-        from tui_dl import _COLLECTIONS
+        from myrient_tui.constants import _COLLECTIONS
 
         with TabbedContent(id="settings-tabs"):
             with TabPane("Engine", id="tab-engine"):
@@ -39,6 +39,15 @@ class SettingsPane(Vertical):
                     yield Switch(id="set-watch-library")
                     yield Label("Desktop notification on batch complete", classes="setting-label")
                     yield Switch(id="set-notify-batch")
+                    yield Label("Verify downloads against DAT  [dim](hash check after extraction)[/dim]", classes="setting-label")
+                    yield Switch(id="set-verify-dl")
+                    yield Rule()
+                    yield Label("IGDB Game Ratings  [dim](Twitch Developer credentials)[/dim]", classes="section-header")
+                    yield Label("[dim]Create a free app at dev.twitch.tv for game ratings & genre tags[/dim]", classes="setting-label")
+                    yield Label("Client ID", classes="setting-label")
+                    yield Input(placeholder="Twitch Client ID", id="set-igdb-client-id")
+                    yield Label("Client Secret", classes="setting-label")
+                    yield Input(placeholder="Twitch Client Secret", id="set-igdb-client-secret", password=True)
                     yield Rule()
                     yield Button("▸ Save Settings", id="btn-save-settings", variant="success")
             with TabPane("Filters", id="tab-filters"):
@@ -72,6 +81,9 @@ class SettingsPane(Vertical):
                     yield Rule()
                     yield Label("[dim]Pre-cache all console game lists for faster browsing[/dim]", classes="setting-label")
                     yield Button("Prefetch All Consoles", id="btn-prefetch-consoles", classes="ops-btn")
+                    yield Rule()
+                    yield Label("[dim]Clear cached IGDB game ratings and metadata[/dim]", classes="setting-label")
+                    yield Button("Clear IGDB Cache", id="btn-clear-igdb-cache", classes="ops-btn")
                     yield Rule()
                     yield Label("Batch Queue Import", classes="section-header")
                     yield Label("[dim]Import game URLs or names from a text file (one per line)[/dim]", classes="setting-label")
