@@ -9,11 +9,12 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 import urllib.request
 import urllib.error
 import urllib.parse
-from typing import Any
+from typing import Callable
 
 from .storage import SQLiteStorage
 from .types import GameMetadata
@@ -216,13 +217,21 @@ class RatingsProvider:
     # ── Public API ────────────────────────────────────────────────────────
 
     def fetch_console(
-        self, console_name: str, clean_names: list[str],
+        self,
+        console_name: str,
+        clean_names: list[str],
+        cancel: threading.Event | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
     ) -> dict[str, GameMetadata]:
         """Fetch IGDB metadata for a list of games on a given console.
 
         Returns a dict mapping clean_name → GameMetadata for every game
         that was found (either cached or freshly fetched).  Games not
         matched in IGDB are omitted from the result.
+
+        *cancel*: if set, the batch loop stops early.
+        *on_progress*: called with (fetched_so_far, total_misses) after
+        each batch.
         """
         platform_id = CONSOLE_PLATFORM_MAP.get(console_name)
         if platform_id is None:
@@ -240,17 +249,38 @@ class RatingsProvider:
         if not misses:
             return cached  # type: ignore[return-value]
 
-        # Batch-query IGDB for misses (up to 10 names per query to keep
-        # the where clause reasonable — IGDB has a body size limit).
-        batch_size = 10
+        # Batch-query IGDB for misses.  IGDB handles multi-KB Apicalypse
+        # bodies fine; 50 names ≈ 2.5 KB which is well within limits.
+        batch_size = 50
         fresh: dict[str, dict] = {}
-        for i in range(0, len(misses), batch_size):
+        total_misses = len(misses)
+        consecutive_failures = 0
+        max_consecutive_failures = 3
+        for i in range(0, total_misses, batch_size):
+            if cancel and cancel.is_set():
+                log.info("IGDB: fetch cancelled after %d/%d", i, total_misses)
+                break
             batch = misses[i:i + batch_size]
-            self._fetch_batch(platform_id, batch, fresh)
-
-        # Persist fresh results
-        if fresh:
-            self.db.set_igdb_cache(platform_id, fresh)
+            batch_results: dict[str, dict] = {}
+            try:
+                self._fetch_batch(platform_id, batch, batch_results)
+            except Exception as exc:
+                consecutive_failures += 1
+                log.warning("IGDB batch %d failed: %s", i // batch_size + 1, exc)
+                if consecutive_failures >= max_consecutive_failures:
+                    raise RuntimeError(
+                        f"IGDB: {consecutive_failures} consecutive failures — "
+                        f"last error: {exc}"
+                    ) from exc
+                continue
+            consecutive_failures = 0
+            # Persist each batch immediately so progress survives interruption
+            if batch_results:
+                self.db.set_igdb_cache(platform_id, batch_results)
+                fresh.update(batch_results)
+            done = min(i + batch_size, total_misses)
+            if on_progress:
+                on_progress(done, total_misses)
 
         cached.update(fresh)
         return cached  # type: ignore[return-value]
@@ -261,7 +291,10 @@ class RatingsProvider:
         clean_names: list[str],
         out: dict[str, dict],
     ) -> None:
-        """Query IGDB for a small batch of game names and populate *out*."""
+        """Query IGDB for a small batch of game names and populate *out*.
+
+        Raises on query failure so the caller can track consecutive errors.
+        """
         # Build OR-clauses for each name
         name_clauses = []
         for name in clean_names:
@@ -276,11 +309,7 @@ class RatingsProvider:
             "limit 500;"
         )
 
-        try:
-            results = self._query(body)
-        except Exception as exc:
-            log.warning("IGDB batch query failed: %s", exc)
-            return
+        results = self._query(body)
 
         # Match each result back to a clean_name
         for clean_name in clean_names:

@@ -158,6 +158,7 @@ class MyrientTUI(App):
 
         # IGDB ratings state
         self._ratings_provider: RatingsProvider | None = None
+        self._ratings_cancel = threading.Event()
         self._game_metadata: dict[str, dict] = {}   # clean_name → GameMetadata
         self._browse_sort_key: str = "name"          # "name" | "rating" | "popularity" | "size"
         self._browse_sort_reverse: bool = False
@@ -2055,12 +2056,20 @@ class MyrientTUI(App):
             return
 
         if button_id == "btn-clear-igdb-cache":
+            # Cancel any in-progress IGDB fetch
+            self._ratings_cancel.set()
             self.state._db.clear_igdb_cache()
             self._game_metadata = {}
             self._browse_available_tags = []
             self._browse_active_tags = set()
             await self._render_tag_chips()
             self.notify("IGDB cache cleared")
+            # Re-fetch for the currently displayed console
+            if self.selected_console and self._all_games_data:
+                self._fetch_ratings(
+                    self.selected_console["name"].strip("/"),
+                    self._all_games_data,
+                )
             return
 
         if button_id == "btn-batch-import":
@@ -2590,6 +2599,7 @@ class MyrientTUI(App):
     @work(thread=True, group="ratings")
     def _fetch_ratings(self, console_name: str, games: list) -> None:
         """Background: fetch IGDB metadata for current console's games."""
+        self._ratings_cancel.clear()
         provider = self._get_ratings_provider()
         if provider is None or not provider.configured:
             self.post_message(SystemLog(
@@ -2608,10 +2618,23 @@ class MyrientTUI(App):
         self.post_message(SystemLog(
             f"[dim]IGDB: fetching ratings for {len(clean_names)} games…[/dim]"
         ))
+
+        def _on_progress(done: int, total: int) -> None:
+            self.post_message(SystemLog(
+                f"[dim]IGDB: fetched {done}/{total} games…[/dim]"
+            ))
+
         try:
-            metadata = provider.fetch_console(console_name, clean_names)
+            metadata = provider.fetch_console(
+                console_name, clean_names,
+                cancel=self._ratings_cancel,
+                on_progress=_on_progress,
+            )
         except Exception as exc:
             self.post_message(SystemLog(f"IGDB fetch failed: {exc}", is_error=True))
+            return
+        if self._ratings_cancel.is_set():
+            self.post_message(SystemLog("[dim]IGDB: fetch cancelled[/dim]"))
             return
         if metadata:
             matched = sum(1 for m in metadata.values() if m.get("igdb_id", 0) != 0)
