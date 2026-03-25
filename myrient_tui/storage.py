@@ -8,7 +8,6 @@ Auto-migrates from the legacy JSON config on first run.
 """
 from __future__ import annotations
 
-import copy
 import json
 import logging
 import sqlite3

@@ -45,8 +45,13 @@ CONSOLE_PLATFORM_MAP: dict[str, int] = {
     "Sony - PlayStation Portable":          38,
     # Nintendo
     "Nintendo - GameCube":                  21,
+    "Nintendo - GameCube - NKit RVZ":       21,
+    "Nintendo - GameCube - NKit RVZ [zstd-19-128k]": 21,
     "Nintendo - Wii":                        5,
+    "Nintendo - Wii - NKit RVZ":             5,
+    "Nintendo - Wii - NKit RVZ [zstd-19-128k]": 5,
     "Nintendo - Wii U":                     41,
+    "Nintendo - Wii U - WUX":              41,
     "Nintendo - Game Boy Advance":          24,
     "Nintendo - Game Boy":                  33,
     "Nintendo - Game Boy Color":            22,

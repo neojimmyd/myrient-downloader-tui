@@ -33,7 +33,7 @@ class GameMetadata(TypedDict):
     """IGDB-sourced metadata cached locally for a single game."""
     igdb_id:    int          # IGDB game ID
     rating:     float        # total_rating 0-100, or -1 if unrated
-    popularity: int          # follows count
+    popularity: int          # total_rating_count from IGDB
     genres:     list[str]    # e.g. ["Puzzle", "Adventure"]
     themes:     list[str]    # e.g. ["Horror", "Survival"]
     game_modes: list[str]    # e.g. ["Single player", "Co-operative"]

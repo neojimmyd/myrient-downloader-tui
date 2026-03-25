@@ -79,11 +79,6 @@ _GAME_EXTS: frozenset[str] = frozenset({
     '.rom', '.xiso', '.ecm',
 })
 
-# B6: Downloadable file extensions — archives + raw game files served by Myrient.
-_DOWNLOAD_EXTS: frozenset[str] = frozenset({
-    '.zip', '.7z', '.rvz', '.chd', '.iso', '.wbfs', '.gcz', '.xiso',
-})
-
 _CHD_SOURCE_EXTS: frozenset[str] = frozenset({'.bin', '.iso', '.cue', '.gdi'})
 
 _CHD_CMD_MAP: dict[str, list[str]] = {
@@ -100,8 +95,11 @@ _DAT_AUDITABLE_EXTS: frozenset[str] = frozenset({
 
 _PS2_PATCH_EXTS: frozenset[str] = frozenset({'.iso', '.bin'})
 
-# B6/F4: Accepted download extensions — includes non-zip formats served by Myrient
-_DOWNLOAD_EXTS: frozenset[str] = frozenset({'.zip', '.7z', '.rvz', '.chd', '.iso', '.wux'})
+# B6/F4: Accepted download extensions — archives + raw game files served by Myrient.
+_DOWNLOAD_EXTS: frozenset[str] = frozenset({
+    '.zip', '.7z', '.rvz', '.chd', '.iso', '.wux',
+    '.wbfs', '.gcz', '.xiso',
+})
 
 _OS = _platform.system().lower()
 

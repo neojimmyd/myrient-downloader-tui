@@ -10,13 +10,8 @@ making each operation independently testable and composable.
 """
 from __future__ import annotations
 
-import hashlib
-import itertools
-import json
-import logging
 import shutil
 import threading
-import concurrent.futures
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -272,7 +267,6 @@ class DatAuditCommand(LibraryCommand):
     name = "Verify"
 
     def execute(self, op: LibraryOperation, app: MyrientTUI) -> None:
-        import threading
         from .modals import ConfirmVerifyScreen
 
         library = op.library

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import re
-from pathlib import PurePosixPath
 
 # ── Pre-compiled regexes for ROM name normalization ─────────────────────────
 # Matches common ROM file extensions (archives + raw game files).

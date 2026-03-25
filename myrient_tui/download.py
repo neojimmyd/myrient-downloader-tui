@@ -39,7 +39,7 @@ from myrient_tui.toolchain import Toolchain, _safe_extractall
 from myrient_tui.utils import normalize_game_title
 
 if TYPE_CHECKING:
-    from tui_dl import MyrientTUI
+    from .app import MyrientTUI
 
 
 # ── Global bandwidth limiter ─────────────────────────────────────────────────
@@ -321,6 +321,104 @@ class DownloadWorker:
 
         return True, size_bytes
 
+    # ── Phase 3b: post-download DAT verification ───────────────────
+
+    def _run_post_verify(
+        self,
+        item: QueueItem,
+        item_name: str,
+        dest_dir: Path,
+        size_bytes: int,
+    ) -> None:
+        """F2: Verify extracted files against the console's DAT after download.
+
+        Uses the app's DAT infrastructure to hash files in *dest_dir* and
+        check them against the Redump/No-Intro DAT.  Updates library status
+        to 'validated' or 'corrupted' based on the result.  Failures are
+        logged but never raise — verification is best-effort and must not
+        block the download pipeline.
+        """
+        import hashlib
+        from .constants import _DAT_AUDITABLE_EXTS, _HASH_CHUNK_BYTES
+
+        console_name = (
+            item["name"].split(" / ")[0].strip()
+            if " / " in item["name"]
+            else ""
+        )
+        if not console_name:
+            return
+
+        self.app.post_message(DownloadProgress(
+            item["id"], item_name, size_bytes, size_bytes, "Verifying"
+        ))
+
+        # Lightweight adapter — DAT helpers expect a LibraryOperation-like
+        # object but only call .log() and .progress().
+        app = self.app
+
+        class _Ctx:
+            cancelled = False
+            def log(self, msg, error=False):
+                app.post_message(SystemLog(msg, error))
+            def progress(self, label, detail, current, total):
+                pass  # suppress noisy progress for single-game verify
+
+        ctx = _Ctx()
+
+        try:
+            dat_ttl = app.state.settings.get("dat_cache_ttl_hours", 168) * 3600.0
+            dat_index = app._dat_fetch_index(ctx)
+            if not dat_index:
+                return
+            dat_path = app._dat_resolve_dat_file(
+                console_name, dat_index, dat_ttl, ctx,
+            )
+            if not dat_path:
+                return
+            parsed = type(app)._dat_parse_xml(dat_path)
+            if not parsed:
+                return
+            dat_by_sha1, ambiguous_sha1s, _ = parsed
+
+            all_ok = True
+            checked = 0
+            for f in dest_dir.iterdir():
+                if not f.is_file() or f.suffix.lower() not in _DAT_AUDITABLE_EXTS:
+                    continue
+                sha1 = hashlib.sha1(usedforsecurity=False)
+                with open(f, "rb") as fh:
+                    while chunk := fh.read(_HASH_CHUNK_BYTES):
+                        sha1.update(chunk)
+                file_hash = sha1.hexdigest().lower()
+                checked += 1
+                if file_hash in ambiguous_sha1s:
+                    continue
+                if file_hash not in dat_by_sha1:
+                    all_ok = False
+                    app.post_message(SystemLog(
+                        f"Verify [{item_name}]: {f.name} not found in DAT"
+                    ))
+
+            if checked == 0:
+                return
+
+            if all_ok:
+                app._lib_status.set_status(dest_dir, "validated")
+                app.post_message(SystemLog(
+                    f"Verify [{item_name}]: All {checked} file(s) match DAT"
+                ))
+            else:
+                app._lib_status.set_status(dest_dir, "corrupted")
+                app.post_message(SystemLog(
+                    f"Verify [{item_name}]: Some files do not match DAT", True
+                ))
+        except Exception as exc:
+            logging.debug("Post-download verify failed for %s: %s", item_name, exc)
+            app.post_message(SystemLog(
+                f"Post-download verify skipped for {item_name}: {exc}"
+            ))
+
     # ── Phase 3: extraction ──────────────────────────────────────────────
 
     def _run_extraction(
@@ -396,77 +494,6 @@ class DownloadWorker:
 
     # ── Phase 4: auto-CHD conversion ─────────────────────────────────────
 
-    def _run_post_verify(
-        self,
-        item: QueueItem,
-        item_name: str,
-        dest_dir: Path,
-        size_bytes: int,
-    ) -> None:
-        """F2: Hash extracted files against the DAT and mark validated/corrupted.
-
-        Uses the app's existing lib_status store. If no DAT is cached for this
-        console, silently skips — the next full DAT audit will catch it.
-        """
-        import hashlib
-        from myrient_tui.constants import _DAT_AUDITABLE_EXTS, _HASH_CHUNK_BYTES, DAT_CACHE_DIR
-
-        console_name = item["name"].split(" / ")[0].strip() if " / " in item["name"] else ""
-        if not console_name:
-            return
-
-        # Look for a cached DAT index for this console
-        import json as _json
-        dat_index_file = DAT_CACHE_DIR / f"{console_name}_dat_index.json"
-        if not dat_index_file.exists():
-            return  # No DAT available — skip silently
-
-        self.app.post_message(
-            DownloadProgress(item["id"], item_name, size_bytes, size_bytes, "Verifying")
-        )
-
-        try:
-            with open(dat_index_file, "r", encoding="utf-8") as f:
-                dat_index = _json.load(f)  # {sha1_hex: {"name": ..., "game": ...}}
-        except Exception:
-            return
-
-        # Hash all game files in dest_dir
-        all_ok = True
-        any_checked = False
-        for game_file in dest_dir.iterdir():
-            if not game_file.is_file():
-                continue
-            if game_file.suffix.lower() not in _DAT_AUDITABLE_EXTS:
-                continue
-            any_checked = True
-            sha1 = hashlib.sha1(usedforsecurity=False)
-            try:
-                with open(game_file, "rb") as gf:
-                    while chunk := gf.read(_HASH_CHUNK_BYTES):
-                        sha1.update(chunk)
-                file_hash = sha1.hexdigest().lower()
-                if file_hash not in dat_index:
-                    all_ok = False
-                    self.app.post_message(SystemLog(
-                        f"Verify: {game_file.name} hash not in DAT — may be corrupted", True
-                    ))
-            except Exception as e:
-                self.app.post_message(SystemLog(
-                    f"Verify: failed to hash {game_file.name}: {e}", True
-                ))
-                all_ok = False
-
-        if any_checked:
-            status = "validated" if all_ok else "corrupted"
-            self.app._lib_status.set_status(dest_dir, status)
-            if all_ok:
-                self.app.post_message(SystemLog(f"Verified OK: {item_name}"))
-            else:
-                self.app.post_message(SystemLog(
-                    f"Verification FAILED for {item_name} — marked corrupted", True
-                ))
-
     def _run_chd_auto(
         self,
         item: QueueItem,
@@ -524,7 +551,10 @@ class DownloadWorker:
         if self.app.cancel_flag.is_set():
             return {"success": False, "cancelled": True}
 
-        _is_resume = target_file.exists() and target_file.stat().st_size > 0
+        try:
+            _is_resume = target_file.exists() and target_file.stat().st_size > 0
+        except (FileNotFoundError, OSError):
+            _is_resume = False
 
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)

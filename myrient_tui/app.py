@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import atexit
 import concurrent.futures
-import copy
 import datetime
 import hashlib
 import itertools
@@ -11,12 +10,9 @@ import json
 import logging
 import operator
 import os
-import platform as _platform
 import re
 import shutil
-import socket
 import subprocess
-import sys
 import threading
 import time
 import urllib.parse
@@ -24,23 +20,22 @@ import urllib.request
 from urllib.parse import quote, unquote, urljoin
 import uuid
 import xml.etree.ElementTree as ET
-import zipfile as _zf
 from collections import Counter, deque
 from pathlib import Path
 from typing import Any, Iterator
 
-from bs4 import BeautifulSoup, SoupStrainer
+from bs4 import BeautifulSoup
 from rich.markup import escape as _escape_markup
 from rich.text import Text
 from textual import events, on, work
 from textual.app import App, ComposeResult
-from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.containers import Container, Horizontal, Vertical
 from textual.events import Key
 from textual.timer import Timer
 from textual.widgets import (
-    Button, Collapsible, DataTable, Footer, Header, Input,
-    Label, ListItem, ListView, ProgressBar, RichLog, Rule, Select,
-    Switch, TabbedContent, TabPane, Tree,
+    Button, DataTable, Footer, Header, Input,
+    Label, ListItem, ListView, ProgressBar, RichLog, Select,
+    Switch, Tree,
 )
 
 from panes import BrowsePane, DownloadsPane, GameSearchInput, LibraryPane, SettingsPane, LogsPane
@@ -49,14 +44,14 @@ from .constants import (
     _CHD_SOURCE_EXTS, _CHD_TIMEOUT, _COLLECTIONS, _DATA_DIR,
     _DAT_AUDITABLE_EXTS, _DAT_INDEX_STRAINER, _DAT_SEARCH_PREFIXES,
     _DOWNLOAD_EXTS, _FLUSH_INTERVAL, _GAME_EXTS, _HASH_CHUNK_BYTES,
-    _LOW_PRIO_POPEN, _OS, _PROGRESS_DONE_STATES,
+    _LOW_PRIO_POPEN, _OS, _PROGRESS_DONE_STATES, _PS2_PATCH_EXTS,
     _SCRAPE_CONCURRENCY, _SCRIPT_DIR, _SEARCH_DEBOUNCE,
     _SESSION_LOG_MAX_FILES, _SIZE_MULTIPLIERS, _SIZE_UNITS,
     _TOOLS_DIR, _TREE_AMBER, _TREE_DIM, _TREE_GREEN,
     _TREE_RED, _TREE_YELLOW, _WATCH_DEBOUNCE, CUE_BIN_REGEX,
     CONFIG_FILE, DAT_CACHE_DIR, DISC_REGEX, SESSION_LOG_DIR, SIZE_REGEX,
 )
-from .types import ConsoleItem, DataListItem, GameItem, QueueItem, RomEntry
+from .types import ConsoleItem, DataListItem, GameItem, QueueItem
 from .messages import (
     BatchComplete, ConsolesLoaded, DownloadComplete, DownloadProgress,
     GamesLoaded, LibraryProgress, LibraryTreeReady, LibraryWatchEvent,
@@ -298,6 +293,7 @@ class MyrientTUI(App):
             self.state.set_setting("theme", "dark" if self.dark else "light", immediate=False)
         except AttributeError:
             pass  # .dark reactive not available in this Textual build
+
     def action_jump_to_console(self) -> None:
         """Ctrl+J: from a selected queue row, open the browser tab and highlight the console."""
         try:
@@ -1781,24 +1777,22 @@ class MyrientTUI(App):
             filtered.append((game, clean_name, display_name, spans))
 
         # Sort
-        sort_key = self._browse_sort_key
-        reverse = self._browse_sort_reverse
         if sort_key == "name":
-            filtered.sort(key=lambda e: e[2].lower(), reverse=reverse)
+            filtered.sort(key=lambda e: e[2].lower(), reverse=rev)
         elif sort_key == "rating" and has_metadata:
             filtered.sort(
                 key=lambda e: self._game_metadata.get(e[1], {}).get("rating", -1),
-                reverse=reverse,
+                reverse=rev,
             )
         elif sort_key == "popularity" and has_metadata:
             filtered.sort(
                 key=lambda e: self._game_metadata.get(e[1], {}).get("popularity", 0),
-                reverse=reverse,
+                reverse=rev,
             )
         elif sort_key == "size":
             filtered.sort(
                 key=lambda e: self._parse_size_bytes(e[0]["size_str"]),
-                reverse=reverse,
+                reverse=rev,
             )
 
         found = 0
@@ -1830,7 +1824,7 @@ class MyrientTUI(App):
                 rating_cell = Text("")
 
             # F3: "Already in library" indicator
-            bare_name = game["name"][:-4] if game["name"].lower().endswith(".zip") else game["name"]
+            bare_name = strip_extension(game["name"])
             in_library = bare_name in self._library_game_names
             if in_library:
                 size_cell = Text(game["size_str"], style="bold #3fb950")
@@ -2420,7 +2414,7 @@ class MyrientTUI(App):
                 "auto_convert_chd":         self.query_one("#set-auto-chd", Switch).value,
                 "watch_library":            self.query_one("#set-watch-library", Switch).value,
                 "notify_on_batch_complete": self.query_one("#set-notify-batch", Switch).value,
-                    "verify_after_download":    self.query_one("#set-verify-dl", Switch).value,
+                "verify_after_download":    self.query_one("#set-verify-dl", Switch).value,
                 "filter_include":           sorted(self._filter_include_sel),
                 "filter_exclude":           sorted(self._filter_exclude_sel),
                 "custom_include_regex":     custom_inc,
@@ -2471,7 +2465,7 @@ class MyrientTUI(App):
                 gs_console = self._global_search_results.get(key)
                 if not data or not gs_console:
                     continue
-                sub_folder = data['name'].replace('.zip', '').strip()
+                sub_folder = strip_extension(data['name']).strip()
                 clean_base = DISC_REGEX.sub('', sub_folder).strip()
                 if clean_base != sub_folder:
                     dest_path = library_root / gs_console / clean_base / sub_folder
@@ -2518,7 +2512,7 @@ class MyrientTUI(App):
             if not data:
                 continue
 
-            sub_folder = data['name'].replace('.zip', '').strip()
+            sub_folder = strip_extension(data['name']).strip()
             clean_base = DISC_REGEX.sub('', sub_folder).strip()
 
             # clean_base != sub_folder iff the DISC_REGEX matched — avoids a second .search() call
@@ -3977,8 +3971,6 @@ class MyrientTUI(App):
                     self.notify(f"Error during deletion: {err}", severity="error")
         self.push_screen(ConfirmDeleteScreen(target_path.name), check_delete)
 
-    # ── Disk space dashboard ─────────────────────────────────────────────────
-
     # ── Queue multi-select ───────────────────────────────────────────────────
 
     def _queue_toggle_selection(self) -> None:
@@ -4252,17 +4244,21 @@ class MyrientTUI(App):
 
         self.post_message(LibraryTreeReady(structure, library, disk_usage))
 
-    def _lookup_game_size(self, console_name: str, game_zip: str) -> str:
-        """Look up a game's size from the scrape cache. Returns 'N/A' on miss."""
+    def _find_myrient_game(self, console_name: str, dir_name: str) -> tuple[str, str, str] | None:
+        """Find a game on Myrient by matching its directory name against the console listing.
+
+        Returns ``(game_name, game_url, size_str)`` on hit, or *None* if not found.
+        This replaces the old pattern of assuming ``dir_name + ".zip"`` as the remote filename.
+        """
         try:
-            url = self._active_base_url + quote(console_name, safe="") + "/"
-            games = self.scraper.scrape_links(url)
+            console_url = self._active_base_url + quote(console_name, safe="") + "/"
+            games = self.scraper.scrape_links(console_url)
             for g in games:
-                if g["name"] == game_zip:
-                    return g.get("size_str", "N/A")
+                if strip_extension(g["name"]) == dir_name:
+                    return g["name"], urljoin(console_url, g["url_part"]), g.get("size_str", "N/A")
         except Exception:
             pass
-        return "N/A"
+        return None
 
     def _find_disc_variants(self, console_name: str, base_name: str) -> list[GameItem]:
         """Scrape the console page on Myrient and return disc-specific entries
@@ -4276,9 +4272,9 @@ class MyrientTUI(App):
         variants: list[GameItem] = []
         for g in all_games:
             name: str = g["name"]  # e.g. "Resident Evil 2 (USA) (Disc 1).zip"
-            if not name.lower().endswith(".zip"):
-                continue
-            folder_name = name[:-4]  # strip .zip
+            folder_name = strip_extension(name)
+            if folder_name == name:
+                continue  # no recognized extension — skip
             disc_base = DISC_REGEX.sub("", folder_name).strip()
             if disc_base == base_name and DISC_REGEX.search(folder_name):
                 variants.append(g)  # type: ignore[arg-type]
@@ -4306,7 +4302,7 @@ class MyrientTUI(App):
         added = 0
         console_url = self._active_base_url + quote(console_name, safe="") + "/"
         for g in variants:
-            disc_folder = g["name"][:-4]  # strip .zip
+            disc_folder = strip_extension(g["name"])
             disc_dest = library / console_name / game_dir.name / disc_folder
             if str(disc_dest) in existing_paths:
                 continue
@@ -4395,7 +4391,7 @@ class MyrientTUI(App):
                     console_url = self._active_base_url + quote(console_name, safe="") + "/"
                     sibling_added = 0
                     for g in variants:
-                        disc_folder = g["name"][:-4]  # strip .zip
+                        disc_folder = strip_extension(g["name"])
                         disc_dest = parent_dir / disc_folder
                         if str(disc_dest) in existing_paths:
                             continue
@@ -4417,15 +4413,16 @@ class MyrientTUI(App):
                         continue
                 # Fall through to single-file queue if no variants found
 
-            # Reconstruct the Myrient URL from the library directory structure.
-            game_zip = game_dir.name + ".zip"
-            game_url = self._active_base_url + quote(console_name, safe="") + "/" + quote(game_zip, safe="")
-            size_str = self._lookup_game_size(console_name, game_zip)
+            # Look up the actual remote filename from the scrape cache.
+            match = self._find_myrient_game(console_name, game_dir.name)
+            if not match:
+                continue
+            game_name, game_url, size_str = match
             # Store plain-text name — Rich markup must NOT be embedded in persisted JSON
             # because brackets in console/game names would inject unintended markup at render time.
             plain_status = "corrupted" if status == "corrupted" else "incomplete"
             current_queue.append(self._make_queue_item(
-                console_name, f"{game_zip} ({plain_status})",
+                console_name, f"{game_name} ({plain_status})",
                 game_url, str(game_dir), size_str,
             ))
             existing_paths.add(str(game_dir))
@@ -4502,11 +4499,12 @@ class MyrientTUI(App):
                     added += disc_added
                     continue
 
-            game_zip = game_dir.name + ".zip"
-            game_url = self._active_base_url + quote(console_name, safe="") + "/" + quote(game_zip, safe="")
-            size_str = self._lookup_game_size(console_name, game_zip)
+            match = self._find_myrient_game(console_name, game_dir.name)
+            if not match:
+                continue
+            game_name, game_url, size_str = match
             current_queue.append(self._make_queue_item(
-                console_name, game_zip, game_url, str(game_dir), size_str,
+                console_name, game_name, game_url, str(game_dir), size_str,
             ))
             existing_paths.add(str(game_dir))
             added += 1
@@ -4658,7 +4656,7 @@ class MyrientTUI(App):
                     if len(parts) >= 3:
                         console_name = parts[-2]
                         game_zip = parts[-1]
-                        game_name = game_zip.replace('.zip', '').strip()
+                        game_name = strip_extension(game_zip).strip()
                         clean_base = DISC_REGEX.sub('', game_name).strip()
                         if clean_base != game_name:
                             dest_path = library_root / console_name / clean_base / game_name
@@ -4675,19 +4673,26 @@ class MyrientTUI(App):
             elif " / " in line:
                 parts = line.split(" / ", 1)
                 console_name = parts[0].strip()
-                game_zip = parts[1].strip()
-                if not game_zip.endswith('.zip'):
-                    game_zip += '.zip'
-                game_name = game_zip.replace('.zip', '').strip()
+                game_entry = parts[1].strip()
+                game_name = strip_extension(game_entry)
+                if game_name == game_entry:
+                    # No recognized extension — look up actual filename on Myrient
+                    match = self._find_myrient_game(console_name, game_entry)
+                    if not match:
+                        continue
+                    game_entry, game_url, size_str = match
+                    game_name = strip_extension(game_entry)
+                else:
+                    game_url = self._active_base_url + quote(console_name, safe="") + "/" + quote(game_entry, safe="")
+                    size_str = "N/A"
                 clean_base = DISC_REGEX.sub('', game_name).strip()
                 if clean_base != game_name:
                     dest_path = library_root / console_name / clean_base / game_name
                 else:
                     dest_path = library_root / console_name / game_name
-                game_url = self._active_base_url + quote(console_name, safe="") + "/" + quote(game_zip, safe="")
                 if str(dest_path) not in existing_paths:
                     current_queue.append(self._make_queue_item(
-                        console_name, game_zip, game_url, str(dest_path), "N/A",
+                        console_name, game_entry, game_url, str(dest_path), size_str,
                     ))
                     existing_paths.add(str(dest_path))
                     added += 1

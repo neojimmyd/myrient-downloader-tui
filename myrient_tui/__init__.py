@@ -45,9 +45,3 @@ __all__ = [
     "_sha256_file", "_safe_extractall",
     "normalize_game_title", "normalize_game_title_keep_disc", "strip_extension",
 ]
-
-
-def _get_app_class():
-    """Lazy import to avoid circular dependency."""
-    from .app import MyrientTUI
-    return MyrientTUI
