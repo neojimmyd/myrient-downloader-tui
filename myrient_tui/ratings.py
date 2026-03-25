@@ -14,6 +14,7 @@ import time
 import urllib.request
 import urllib.error
 import urllib.parse
+from difflib import SequenceMatcher
 from typing import Callable
 
 from .storage import SQLiteStorage
@@ -33,6 +34,9 @@ DEFAULT_CACHE_TTL = 30 * 24 * 3600.0
 
 # Characters stripped when comparing IGDB results to ROM names.
 _NORM_RE = re.compile(r"[^a-z0-9 ]")
+
+# Detects title/subtitle separators (' - ' or ': ') for search-key extraction.
+_SEP_RE = re.compile(r'\s+-\s+|:\s+')
 
 # ── Myrient console name → IGDB platform ID mapping ──────────────────────
 # Covers the most common Redump + No-Intro consoles.
@@ -198,8 +202,24 @@ class RatingsProvider:
 
     @staticmethod
     def _normalize_for_match(name: str) -> str:
-        """Lowercase, strip punctuation for fuzzy comparison."""
-        return _NORM_RE.sub("", name.lower()).strip()
+        """Lowercase, replace hyphens with spaces, strip punctuation, collapse whitespace."""
+        n = name.lower().replace('-', ' ')
+        n = _NORM_RE.sub("", n)
+        return ' '.join(n.split())
+
+    @staticmethod
+    def _search_key(name: str) -> str:
+        """Extract a search-friendly key from a clean game name.
+
+        Redump uses ``' - '`` as a title/subtitle separator while IGDB uses
+        ``': '``.  Searching with only the primary title avoids this literal
+        mismatch in the wildcard query; :meth:`_best_match` then disambiguates
+        among the broader result set.
+        """
+        m = _SEP_RE.search(name)
+        if m and m.start() >= 4:
+            return name[:m.start()].strip()
+        return name
 
     def _best_match(
         self, results: list[dict], clean_name: str,
@@ -208,15 +228,43 @@ class RatingsProvider:
         target = self._normalize_for_match(clean_name)
         if not target:
             return None
-        # Exact match first
+
+        # Pass 1: exact normalized match
         for r in results:
             if self._normalize_for_match(r.get("name", "")) == target:
                 return r
-        # Prefix match (IGDB name starts with our name, or vice versa)
+
+        # Pass 2: prefix match — prefer the closest-length name
+        best_prefix: dict | None = None
+        best_diff = float('inf')
         for r in results:
             igdb_norm = self._normalize_for_match(r.get("name", ""))
             if igdb_norm.startswith(target) or target.startswith(igdb_norm):
-                return r
+                diff = abs(len(igdb_norm) - len(target))
+                if diff < best_diff:
+                    best_diff = diff
+                    best_prefix = r
+        if best_prefix is not None:
+            return best_prefix
+
+        # Pass 3: fuzzy matching via SequenceMatcher
+        best_fuzzy: dict | None = None
+        best_ratio = 0.0
+        for r in results:
+            igdb_norm = self._normalize_for_match(r.get("name", ""))
+            ratio = SequenceMatcher(None, target, igdb_norm).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_fuzzy = r
+        if best_ratio >= 0.75:
+            log.debug(
+                "IGDB fuzzy match %r → %r (ratio=%.2f)",
+                clean_name,
+                best_fuzzy.get("name") if best_fuzzy else "?",
+                best_ratio,
+            )
+            return best_fuzzy
+
         return None
 
     # ── Public API ────────────────────────────────────────────────────────
@@ -300,11 +348,18 @@ class RatingsProvider:
 
         Raises on query failure so the caller can track consecutive errors.
         """
-        # Build OR-clauses for each name
-        name_clauses = []
+        # Build OR-clauses using search keys for broader matching.
+        # Redump separators (' - ') differ from IGDB (': '), so we query
+        # with the primary title and let _best_match disambiguate.
+        seen_clauses: set[str] = set()
+        name_clauses: list[str] = []
         for name in clean_names:
-            escaped = name.replace('"', '\\"')
-            name_clauses.append(f'name ~ *"{escaped}"*')
+            key = self._search_key(name)
+            escaped = key.replace('"', '\\"')
+            clause = f'name ~ *"{escaped}"*'
+            if clause not in seen_clauses:
+                seen_clauses.add(clause)
+                name_clauses.append(clause)
 
         where = " | ".join(f"({c})" for c in name_clauses)
         body = (
