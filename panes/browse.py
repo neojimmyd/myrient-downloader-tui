@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from textual.app import ComposeResult
-from textual.containers import Horizontal, HorizontalScroll, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Key
 from textual.message import Message
 from textual.widgets import Button, DataTable, Input, Label, ListView
@@ -39,6 +39,9 @@ class BrowsePane(Vertical):
                     yield Label("", id="console-count")
                 yield Input(placeholder="  filter consoles…", id="search-consoles", classes="search-bar")
                 yield ListView(id="console-list")
+                with Horizontal(id="browse-tags-header"):
+                    yield Label("Tags & Filters", classes="section-header")
+                yield VerticalScroll(id="browse-tags-panel")
             with Vertical(id="browse-right"):
                 # Row 1: breadcrumb + toolbar merged into one compact line
                 with Horizontal(id="browse-header"):
@@ -47,17 +50,11 @@ class BrowsePane(Vertical):
                     yield Button("Queue Selected", id="btn-add-queue", variant="success")
                     yield Button("Select All", id="btn-select-all")
                     yield Button("Refresh", id="btn-refresh-games")
-                # Row 2: search + tags toggle + global toggle
+                # Row 2: search + global toggle
                 with Horizontal(id="browse-search-bar"):
                     yield GameSearchInput(placeholder="  search games…", id="search-games", classes="search-bar")
-                    yield Button("Tags", id="btn-toggle-tags")
                     yield Button("Global", id="btn-toggle-global", classes="browse-global-btn")
-                # Row 3: tag chips (hidden by default, toggled by Tags button)
-                with Horizontal(id="browse-tag-row"):
-                    yield Label("Tags:", classes="tag-label")
-                    with HorizontalScroll(id="browse-tag-scroll"):
-                        pass  # dynamically populated by _render_tag_chips()
-                # Row 4: DataTable with visible clickable column headers for sorting
+                # Row 3: DataTable with visible clickable column headers for sorting
                 yield DataTable(id="game-list", cursor_type="row", zebra_stripes=False)
                 yield Label(
                     "Select a console to browse games",

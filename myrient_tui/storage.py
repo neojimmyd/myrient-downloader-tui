@@ -635,3 +635,13 @@ class SQLiteStorage:
         conn = self._conn()
         conn.execute("DELETE FROM igdb_cache")
         conn.commit()
+
+    def clear_igdb_misses(self) -> int:
+        """Delete only cached IGDB miss entries (igdb_id=0).
+
+        Returns the number of rows deleted so callers can report it.
+        """
+        conn = self._conn()
+        cur = conn.execute("DELETE FROM igdb_cache WHERE igdb_id = 0")
+        conn.commit()
+        return cur.rowcount

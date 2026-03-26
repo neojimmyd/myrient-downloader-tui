@@ -160,6 +160,8 @@ class MyrientTUI(App):
         self._browse_active_tags: set[str] = set()
         self._browse_available_tags: list[str] = []
         self._tag_id_map: dict[str, str] = {}  # widget-id → tag name
+        self._filter_inc_id_map: dict[str, str] = {}  # widget-id → include filter tag
+        self._filter_exc_id_map: dict[str, str] = {}  # widget-id → exclude filter tag
 
         # Separate debounce timers per search box
         self._consoles_search_timer: Timer | None = None
@@ -1165,7 +1167,7 @@ class MyrientTUI(App):
         self._update_lib_selection_status(event.node)
 
     async def on_click(self, event: events.Click) -> None:
-        """Handle clicks on header label controls (library, tags)."""
+        """Handle clicks on header label controls (library, tags, filter chips)."""
         widget = event.widget
         if not isinstance(widget, Label):
             return
@@ -1174,6 +1176,10 @@ class MyrientTUI(App):
             self._lib_delete_selected()
         elif wid.startswith("tag-"):
             await self._handle_tag_click(wid)
+        elif wid.startswith("filter-inc-"):
+            await self._handle_filter_chip_click(wid, is_include=True)
+        elif wid.startswith("filter-exc-"):
+            await self._handle_filter_chip_click(wid, is_include=False)
 
     def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
         """Sort the game list when a column header is clicked."""
@@ -1208,30 +1214,38 @@ class MyrientTUI(App):
             self._browse_active_tags.discard(matched)
         else:
             self._browse_active_tags.add(matched)
-        # Re-render chips so selected tags move to front
-        await self._render_tag_chips()
+        await self._render_tags_panel()
         try:
             query = self.query_one("#search-games", Input).value
         except Exception:
             query = ""
         self._render_games(query)
 
-    def _update_tags_button_label(self) -> None:
-        """Update the Tags toggle button label with active tag count."""
+    async def _handle_filter_chip_click(self, wid: str, *, is_include: bool) -> None:
+        """Toggle an include/exclude filter chip on/off."""
+        chip_map = self._filter_inc_id_map if is_include else self._filter_exc_id_map
+        tag = chip_map.get(wid)
+        if tag is None:
+            return
+        sel_set = self._filter_include_sel if is_include else self._filter_exclude_sel
+        if tag in sel_set:
+            sel_set.discard(tag)
+        else:
+            sel_set.add(tag)
+        # Persist
+        key = "filter_include" if is_include else "filter_exclude"
+        self.state.update_settings({key: sorted(sel_set)})
+        # Sync Settings DataTable
+        tbl_id = "set-include" if is_include else "set-exclude"
         try:
-            btn = self.query_one("#btn-toggle-tags", Button)
-            n = len(self._browse_active_tags)
-            btn.label = f"Tags ({n})" if n else "Tags"
+            tbl = self.query_one(f"#{tbl_id}", DataTable)
+            self._refresh_filter_row(tbl, tag, sel_set)
         except Exception:
             pass
-
-    def _handle_toggle_tags(self) -> None:
-        """Toggle the tag filter row visibility."""
-        try:
-            tag_row = self.query_one("#browse-tag-row")
-            tag_row.display = not tag_row.display
-        except Exception:
-            pass
+        await self._render_tags_panel()
+        # Re-fetch games with updated filters
+        if self.selected_console:
+            self.fetch_games(self.selected_console)
 
     def _update_lib_toolbar(self, node: Any) -> None:
         """Show/hide toolbar buttons based on tree selection context."""
@@ -1582,6 +1596,7 @@ class MyrientTUI(App):
             else:
                 sel_set.add(tag)
             self._refresh_filter_row(tbl, tag, sel_set)
+            self.call_later(self._render_tags_panel)
         except Exception as e:
             logging.debug("Toggle filter at cursor failed: %s", e)
 
@@ -1799,10 +1814,20 @@ class MyrientTUI(App):
         for game, clean_name, display_name, spans in filtered:
             url_part = game["url_part"]
             selected = url_part in self._selected_games
-            sel_cell = Text("✓", style="bold green") if selected else Text(" ", style="dim")
+            bare_name = strip_extension(game["name"])
+            in_library = bare_name in self._library_game_names
+
+            if selected:
+                sel_cell = Text("✓", style="bold green")
+            elif in_library:
+                sel_cell = Text("★", style="bold #3fb950")
+            else:
+                sel_cell = Text(" ", style="dim")
 
             if selected:
                 name_cell = Text(display_name, style="bold green", no_wrap=True, overflow="ellipsis")
+            elif in_library and spans is None:
+                name_cell = Text(display_name, style="#3fb950", no_wrap=True, overflow="ellipsis")
             elif spans is not None:
                 name_cell = self._build_highlight_text(display_name, spans)
             else:
@@ -1823,9 +1848,7 @@ class MyrientTUI(App):
             else:
                 rating_cell = Text("")
 
-            # F3: "Already in library" indicator
-            bare_name = strip_extension(game["name"])
-            in_library = bare_name in self._library_game_names
+            # Already in library indicator
             if in_library:
                 size_cell = Text(game["size_str"], style="bold #3fb950")
             else:
@@ -1979,6 +2002,7 @@ class MyrientTUI(App):
                 self._refresh_filter_row(exc_tbl, row.key.value, self._filter_exclude_sel)
         except Exception as e:
             logging.debug("Restore filter selections failed: %s", e)
+        self.call_later(self._render_tags_panel)
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.control.id == "queue-select" and event.value != Select.BLANK:
@@ -2056,9 +2080,24 @@ class MyrientTUI(App):
             self._game_metadata = {}
             self._browse_available_tags = []
             self._browse_active_tags = set()
-            await self._render_tag_chips()
+            await self._render_tags_panel()
             self.notify("IGDB cache cleared")
             # Re-fetch for the currently displayed console
+            if self.selected_console and self._all_games_data:
+                self._fetch_ratings(
+                    self.selected_console["name"].strip("/"),
+                    self._all_games_data,
+                )
+            return
+
+        if button_id == "btn-clear-igdb-misses":
+            self._ratings_cancel.set()
+            count = self.state._db.clear_igdb_misses()
+            self._game_metadata = {}
+            self._browse_available_tags = []
+            self._browse_active_tags = set()
+            await self._render_tags_panel()
+            self.notify(f"Cleared {count} IGDB miss entries")
             if self.selected_console and self._all_games_data:
                 self._fetch_ratings(
                     self.selected_console["name"].strip("/"),
@@ -2079,10 +2118,6 @@ class MyrientTUI(App):
 
         if button_id == "btn-toggle-global":
             self._handle_toggle_global()
-            return
-
-        if button_id == "btn-toggle-tags":
-            self._handle_toggle_tags()
             return
 
         if button_id == "btn-refresh-games" and self.selected_console:
@@ -2206,6 +2241,7 @@ class MyrientTUI(App):
             except Exception as e:
                 logging.debug("Clear filter table visuals failed: %s", e)
             self.state.update_settings({"filter_include": [], "filter_exclude": []})
+            self.call_later(self._render_tags_panel)
             self.notify("Filters cleared")
 
         elif button_id == "btn-save-settings":
@@ -2618,11 +2654,15 @@ class MyrientTUI(App):
                 f"[dim]IGDB: fetched {done}/{total} games…[/dim]"
             ))
 
+        def _on_log(msg: str) -> None:
+            self.post_message(SystemLog(f"[dim]{msg}[/dim]"))
+
         try:
             metadata = provider.fetch_console(
                 console_name, clean_names,
                 cancel=self._ratings_cancel,
                 on_progress=_on_progress,
+                on_log=_on_log,
             )
         except Exception as exc:
             self.post_message(SystemLog(f"IGDB fetch failed: {exc}", is_error=True))
@@ -2640,44 +2680,51 @@ class MyrientTUI(App):
             self.post_message(SystemLog("[dim]IGDB: no matches found[/dim]"))
 
     def _update_igdb_ui_visibility(self) -> None:
-        """Show/hide the Tags toggle button based on IGDB configuration."""
-        has_creds = bool(
-            self.state.get_setting("igdb_client_id", "")
-            and self.state.get_setting("igdb_client_secret", "")
-        )
-        has_data = bool(self._game_metadata)
-        visible = has_creds or has_data
-        try:
-            self.query_one("#btn-toggle-tags", Button).display = visible
-        except Exception:
-            pass
-        if not visible:
-            try:
-                self.query_one("#browse-tag-row").display = False
-            except Exception:
-                pass
+        """Re-render the tags panel when IGDB state changes."""
+        self.call_later(self._render_tags_panel)
 
-    async def _render_tag_chips(self) -> None:
-        """Populate the tag filter row with available genre/theme/mode chips."""
+    async def _render_tags_panel(self) -> None:
+        """Populate the tags & filters panel with IGDB tags and region filter chips."""
         try:
-            scroll = self.query_one("#browse-tag-scroll")
+            panel = self.query_one("#browse-tags-panel")
         except Exception:
             return
-        await scroll.remove_children()
-        if not self._browse_available_tags:
-            self._update_tags_button_label()
-            return
-        self._update_tags_button_label()
+        await panel.remove_children()
         self._tag_id_map = {}
-        # Show selected tags first, then the rest alphabetically
-        ordered = sorted(self._browse_available_tags,
-                         key=lambda t: (t not in self._browse_active_tags, t))
-        for i, tag in enumerate(ordered):
-            active = tag in self._browse_active_tags
-            cls = "tag-chip tag-active" if active else "tag-chip"
-            wid = f"tag-{i}"
-            self._tag_id_map[wid] = tag
-            scroll.mount(Label(f" {tag} ", classes=cls, id=wid))
+        self._filter_inc_id_map = {}
+        self._filter_exc_id_map = {}
+
+        # ── IGDB genre/theme/mode tags ─────────────────────────────────────
+        if self._browse_available_tags:
+            panel.mount(Label("Genres", classes="tag-section-label"))
+            ordered = sorted(self._browse_available_tags,
+                             key=lambda t: (t not in self._browse_active_tags, t))
+            for i, tag in enumerate(ordered):
+                active = tag in self._browse_active_tags
+                cls = "tag-chip tag-active" if active else "tag-chip"
+                wid = f"tag-{i}"
+                self._tag_id_map[wid] = tag
+                panel.mount(Label(f" {tag} ", classes=cls, id=wid))
+
+        # ── Include region filters ─────────────────────────────────────────
+        inc_tags = self.state.settings.get("include_tags", ["USA", "Europe", "Japan", "World"])
+        panel.mount(Label("Regions", classes="tag-section-label"))
+        for i, tag in enumerate(inc_tags):
+            active = tag in self._filter_include_sel
+            cls = "tag-chip tag-include-active" if active else "tag-chip"
+            wid = f"filter-inc-{i}"
+            self._filter_inc_id_map[wid] = tag
+            panel.mount(Label(f" {tag} ", classes=cls, id=wid))
+
+        # ── Exclude filters ───────────────────────────────────────────────
+        exc_tags = self.state.settings.get("exclude_tags", ["Demo", "Beta", "Proto"])
+        panel.mount(Label("Exclude", classes="tag-section-label"))
+        for i, tag in enumerate(exc_tags):
+            active = tag in self._filter_exclude_sel
+            cls = "tag-chip tag-exclude-active" if active else "tag-chip"
+            wid = f"filter-exc-{i}"
+            self._filter_exc_id_map[wid] = tag
+            panel.mount(Label(f" {tag} ", classes=cls, id=wid))
 
     @on(RatingsLoaded)
     async def on_ratings_loaded(self, message: RatingsLoaded) -> None:
@@ -2695,8 +2742,7 @@ class MyrientTUI(App):
                 tags.update(meta.get("themes", []))
                 tags.update(meta.get("game_modes", []))
             self._browse_available_tags = sorted(tags)
-            await self._render_tag_chips()
-            self._update_igdb_ui_visibility()
+            await self._render_tags_panel()
             # Re-render with metadata (adds rating column, respects current sort)
             try:
                 query = self.query_one("#search-games", Input).value
@@ -4070,6 +4116,7 @@ class MyrientTUI(App):
                 self._refresh_filter_row(exc_tbl, row.key.value, self._filter_exclude_sel)
         except Exception:
             pass
+        self.call_later(self._render_tags_panel)
         self.notify(f"Preset '{name}' loaded")
         # A7: Auto-refresh game list with new filters
         if self.selected_console:

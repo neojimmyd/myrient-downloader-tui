@@ -84,6 +84,8 @@ class SettingsPane(Vertical):
                     yield Rule()
                     yield Label("[dim]Clear cached IGDB game ratings and metadata[/dim]", classes="setting-label")
                     yield Button("Clear IGDB Cache", id="btn-clear-igdb-cache", classes="ops-btn")
+                    yield Label("[dim]Clear only miss cache — re-queries unmatched games[/dim]", classes="setting-label")
+                    yield Button("Clear IGDB Misses", id="btn-clear-igdb-misses", classes="ops-btn")
                     yield Rule()
                     yield Label("Batch Queue Import", classes="section-header")
                     yield Label("[dim]Import game URLs or names from a text file (one per line)[/dim]", classes="setting-label")
