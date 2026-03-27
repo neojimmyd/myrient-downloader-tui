@@ -35,7 +35,7 @@ from textual.timer import Timer
 from textual.widgets import (
     Button, DataTable, Footer, Header, Input,
     Label, ListItem, ListView, ProgressBar, RichLog, Select,
-    Switch, Tree,
+    Static, Switch, Tree,
 )
 
 from panes import BrowsePane, DownloadsPane, GameSearchInput, LibraryPane, SettingsPane, LogsPane
@@ -159,9 +159,7 @@ class MyrientTUI(App):
         self._browse_sort_reverse: bool = False
         self._browse_active_tags: set[str] = set()
         self._browse_available_tags: list[str] = []
-        self._tag_id_map: dict[str, str] = {}  # widget-id → tag name
-        self._filter_inc_id_map: dict[str, str] = {}  # widget-id → include filter tag
-        self._filter_exc_id_map: dict[str, str] = {}  # widget-id → exclude filter tag
+        self._last_loaded_console: str = ""
 
         # Separate debounce timers per search box
         self._consoles_search_timer: Timer | None = None
@@ -1167,19 +1165,13 @@ class MyrientTUI(App):
         self._update_lib_selection_status(event.node)
 
     async def on_click(self, event: events.Click) -> None:
-        """Handle clicks on header label controls (library, tags, filter chips)."""
+        """Handle clicks on header label controls (library)."""
         widget = event.widget
         if not isinstance(widget, Label):
             return
         wid = widget.id or ""
         if wid == "btn-lib-delete":
             self._lib_delete_selected()
-        elif wid.startswith("tag-"):
-            await self._handle_tag_click(wid)
-        elif wid.startswith("filter-inc-"):
-            await self._handle_filter_chip_click(wid, is_include=True)
-        elif wid.startswith("filter-exc-"):
-            await self._handle_filter_chip_click(wid, is_include=False)
 
     def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
         """Sort the game list when a column header is clicked."""
@@ -1205,47 +1197,37 @@ class MyrientTUI(App):
             query = ""
         self._render_games(query)
 
-    async def _handle_tag_click(self, wid: str) -> None:
-        """Toggle a tag filter chip on/off."""
-        matched = self._tag_id_map.get(wid)
-        if matched is None:
-            return
-        if matched in self._browse_active_tags:
-            self._browse_active_tags.discard(matched)
-        else:
-            self._browse_active_tags.add(matched)
-        await self._render_tags_panel()
-        try:
-            query = self.query_one("#search-games", Input).value
-        except Exception:
-            query = ""
-        self._render_games(query)
-
-    async def _handle_filter_chip_click(self, wid: str, *, is_include: bool) -> None:
-        """Toggle an include/exclude filter chip on/off."""
-        chip_map = self._filter_inc_id_map if is_include else self._filter_exc_id_map
-        tag = chip_map.get(wid)
-        if tag is None:
-            return
-        sel_set = self._filter_include_sel if is_include else self._filter_exclude_sel
-        if tag in sel_set:
-            sel_set.discard(tag)
-        else:
-            sel_set.add(tag)
-        # Persist
-        key = "filter_include" if is_include else "filter_exclude"
-        self.state.update_settings({key: sorted(sel_set)})
-        # Sync Settings DataTable
-        tbl_id = "set-include" if is_include else "set-exclude"
-        try:
-            tbl = self.query_one(f"#{tbl_id}", DataTable)
-            self._refresh_filter_row(tbl, tag, sel_set)
-        except Exception:
-            pass
-        await self._render_tags_panel()
-        # Re-fetch games with updated filters
-        if self.selected_console:
-            self.fetch_games(self.selected_console)
+    async def action_toggle_chip(self, prefix: str, tag: str) -> None:
+        """Handle [@click] actions from tag chip markup."""
+        if prefix == "tag":
+            if tag in self._browse_active_tags:
+                self._browse_active_tags.discard(tag)
+            else:
+                self._browse_active_tags.add(tag)
+            await self._render_tags_panel()
+            try:
+                query = self.query_one("#search-games", Input).value
+            except Exception:
+                query = ""
+            self._render_games(query)
+        elif prefix in ("inc", "exc"):
+            is_include = prefix == "inc"
+            sel_set = self._filter_include_sel if is_include else self._filter_exclude_sel
+            if tag in sel_set:
+                sel_set.discard(tag)
+            else:
+                sel_set.add(tag)
+            key = "filter_include" if is_include else "filter_exclude"
+            self.state.update_settings({key: sorted(sel_set)})
+            tbl_id = "set-include" if is_include else "set-exclude"
+            try:
+                tbl = self.query_one(f"#{tbl_id}", DataTable)
+                self._refresh_filter_row(tbl, tag, sel_set)
+            except Exception:
+                pass
+            await self._render_tags_panel()
+            if self.selected_console:
+                self.fetch_games(self.selected_console)
 
     def _update_lib_toolbar(self, node: Any) -> None:
         """Show/hide toolbar buttons based on tree selection context."""
@@ -2593,14 +2575,18 @@ class MyrientTUI(App):
         self._all_games_data = message.games
         # RAM Optimization: Store active dictionary for O(1) queue lookups instead of JSON parsing
         self._games_lookup = {g["url_part"]: g for g in message.games}
-        # Clear stale metadata; new console = new metadata
-        self._game_metadata = {}
-        self._browse_active_tags = set()
-        self._browse_available_tags = []
+        # Only clear IGDB metadata/tags when the console actually changes,
+        # not when filters change for the same console.
+        console_name = self.selected_console["name"] if self.selected_console else ""
+        if console_name != self._last_loaded_console:
+            self._last_loaded_console = console_name
+            self._game_metadata = {}
+            self._browse_active_tags = set()
+            self._browse_available_tags = []
+            # Kick off IGDB metadata fetch in background
+            if self.selected_console:
+                self._fetch_ratings(self.selected_console["name"].strip("/"), message.games)
         self._render_games(self.query_one("#search-games", Input).value)
-        # Kick off IGDB metadata fetch in background
-        if self.selected_console:
-            self._fetch_ratings(self.selected_console["name"].strip("/"), message.games)
         # Focus the search box so the user can immediately type to filter
         # and use ↑↓/Space/Enter without clicking anything.
         try:
@@ -2690,41 +2676,46 @@ class MyrientTUI(App):
         except Exception:
             return
         await panel.remove_children()
-        self._tag_id_map = {}
-        self._filter_inc_id_map = {}
-        self._filter_exc_id_map = {}
+
+        def _build_chip_markup(tags: list[str], active_set: set[str],
+                              action_prefix: str, active_style: str) -> str:
+            """Build a Textual markup string with clickable, comma-separated tag chips."""
+            inactive_style = "#6e7681"
+            parts: list[str] = []
+            for tag in tags:
+                active = tag in active_set
+                style = active_style if active else inactive_style
+                safe = tag.replace('"', '\\"').replace('[', '\\[')
+                display = tag.replace('[', '\\[')
+                action = f'app.toggle_chip("{action_prefix}", "{safe}")'
+                parts.append(f"[{style} @click={action}]{display}[/]")
+            return ", ".join(parts)
 
         # ── IGDB genre/theme/mode tags ─────────────────────────────────────
         if self._browse_available_tags:
             panel.mount(Label("Genres", classes="tag-section-label"))
             ordered = sorted(self._browse_available_tags,
                              key=lambda t: (t not in self._browse_active_tags, t))
-            for i, tag in enumerate(ordered):
-                active = tag in self._browse_active_tags
-                cls = "tag-chip tag-active" if active else "tag-chip"
-                wid = f"tag-{i}"
-                self._tag_id_map[wid] = tag
-                panel.mount(Label(f" {tag} ", classes=cls, id=wid))
+            chip_markup = _build_chip_markup(ordered, self._browse_active_tags, "tag", "bold #00d4aa")
+            s = Static(chip_markup, classes="tag-chip-line")
+            s.auto_links = False
+            panel.mount(s)
 
         # ── Include region filters ─────────────────────────────────────────
         inc_tags = self.state.settings.get("include_tags", ["USA", "Europe", "Japan", "World"])
         panel.mount(Label("Regions", classes="tag-section-label"))
-        for i, tag in enumerate(inc_tags):
-            active = tag in self._filter_include_sel
-            cls = "tag-chip tag-include-active" if active else "tag-chip"
-            wid = f"filter-inc-{i}"
-            self._filter_inc_id_map[wid] = tag
-            panel.mount(Label(f" {tag} ", classes=cls, id=wid))
+        chip_markup = _build_chip_markup(inc_tags, self._filter_include_sel, "inc", "bold #3fb950")
+        s = Static(chip_markup, classes="tag-chip-line")
+        s.auto_links = False
+        panel.mount(s)
 
         # ── Exclude filters ───────────────────────────────────────────────
         exc_tags = self.state.settings.get("exclude_tags", ["Demo", "Beta", "Proto"])
         panel.mount(Label("Exclude", classes="tag-section-label"))
-        for i, tag in enumerate(exc_tags):
-            active = tag in self._filter_exclude_sel
-            cls = "tag-chip tag-exclude-active" if active else "tag-chip"
-            wid = f"filter-exc-{i}"
-            self._filter_exc_id_map[wid] = tag
-            panel.mount(Label(f" {tag} ", classes=cls, id=wid))
+        chip_markup = _build_chip_markup(exc_tags, self._filter_exclude_sel, "exc", "bold #f85149")
+        s = Static(chip_markup, classes="tag-chip-line")
+        s.auto_links = False
+        panel.mount(s)
 
     @on(RatingsLoaded)
     async def on_ratings_loaded(self, message: RatingsLoaded) -> None:

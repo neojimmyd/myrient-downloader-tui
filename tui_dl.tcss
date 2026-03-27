@@ -194,11 +194,7 @@ ListView:focus > ListItem.--highlight   { background: #0f1520; border-left: thic
     text-style: bold;
     margin-top: 1;
 }
-.tag-chip { width: auto; padding: 0 1; color: #6e7681; }
-.tag-chip:hover { color: #c9d1d9; background: #21262d; }
-.tag-active { color: #00d4aa; text-style: bold; }
-.tag-include-active { color: #3fb950; text-style: bold; }
-.tag-exclude-active { color: #f85149; text-style: bold; }
+.tag-chip-line { width: 1fr; height: auto; color: #6e7681; padding: 0 0; }
 /* Game list DataTable — headers visible and clickable for sorting */
 #game-list {
     height: 1fr;
@@ -210,7 +206,7 @@ ListView:focus > ListItem.--highlight   { background: #0f1520; border-left: thic
     color: #9aa0aa;
     text-style: bold;
 }
-#console-list { height: 2fr; border: solid #1c2333; background: #0d1117; }
+#console-list { height: 1fr; border: solid #1c2333; background: #0d1117; }
 #browse-empty-state {
     height: 1fr;
     width: 1fr;
@@ -524,10 +520,7 @@ Screen.-light-mode #browse-header #breadcrumb { color: #656d76; }
 Screen.-light-mode #browse-header Button { color: #656d76; }
 Screen.-light-mode #browse-tags-panel { background: #ffffff; border: solid #d0d7de; }
 Screen.-light-mode .tag-section-label { color: #656d76; }
-Screen.-light-mode .tag-chip { color: #656d76; }
-Screen.-light-mode .tag-chip:hover { color: #1f2328; background: #eaeef2; }
-Screen.-light-mode .tag-include-active { color: #1a7f37; }
-Screen.-light-mode .tag-exclude-active { color: #cf222e; }
+Screen.-light-mode .tag-chip-line { color: #656d76; }
 Screen.-light-mode DataTable { background: #ffffff; color: #1f2328; }
 Screen.-light-mode DataTable > .datatable--header { background: #f6f8fa; color: #656d76; }
 Screen.-light-mode DataTable > .datatable--cursor { background: #ddf4ff; color: #1f2328; }
