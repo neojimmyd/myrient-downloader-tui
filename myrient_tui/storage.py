@@ -1,10 +1,7 @@
 """SQLite-backed storage for config, queues, history, and library status.
 
-Replaces the monolithic JSON file with per-row CRUD — no more serializing
-the entire state on every queue mutation.  Uses WAL mode for concurrent
-reads from worker threads while the main thread writes.
-
-Auto-migrates from the legacy JSON config on first run.
+Per-row CRUD with WAL mode for concurrent reads from worker threads
+while the main thread writes.
 """
 from __future__ import annotations
 
@@ -16,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from myrient_tui.constants import _DATA_DIR, CONFIG_FILE
+from myrient_tui.constants import _DATA_DIR
 
 _DB_PATH = _DATA_DIR / "myrient.db"
 
@@ -101,7 +98,6 @@ class SQLiteStorage:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         self._init_schema()
-        self._maybe_migrate_json()
 
     # ── Connection management ────────────────────────────────────────────
 
@@ -136,101 +132,6 @@ class SQLiteStorage:
         )
         conn.commit()
 
-    # ── JSON migration ───────────────────────────────────────────────────
-
-    def _maybe_migrate_json(self) -> None:
-        """One-time migration from the legacy JSON config file."""
-        conn = self._conn()
-        row = conn.execute(
-            "SELECT value FROM meta WHERE key='migrated_json'"
-        ).fetchone()
-        if row is not None:
-            return  # already migrated
-
-        json_path = CONFIG_FILE
-        if not json_path.exists():
-            # No legacy file — mark as migrated and seed defaults
-            conn.execute(
-                "INSERT INTO meta(key, value) VALUES ('migrated_json', '1')"
-            )
-            conn.execute(
-                "INSERT OR IGNORE INTO queues(name) VALUES ('default')"
-            )
-            conn.execute(
-                "INSERT OR IGNORE INTO meta(key, value) VALUES ('active_queue', 'default')"
-            )
-            conn.commit()
-            return
-
-        log.info("Migrating JSON config → SQLite: %s", json_path)
-        try:
-            with open(json_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError) as exc:
-            log.error("JSON migration failed: %s", exc)
-            conn.execute(
-                "INSERT INTO meta(key, value) VALUES ('migrated_json', '1')"
-            )
-            conn.commit()
-            return
-
-        # Settings
-        for k, v in data.get("settings", {}).items():
-            conn.execute(
-                "INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
-                (k, json.dumps(v)),
-            )
-
-        # Queues and queue items
-        queues = data.get("queues", {"default": []})
-        active = data.get("active_queue", "default")
-        for qname, items in queues.items():
-            conn.execute("INSERT OR IGNORE INTO queues(name) VALUES (?)", (qname,))
-            for pos, item in enumerate(items):
-                # Extract known fields, put the rest in extra
-                item_id = item.get("id", f"migrated_{pos}")
-                known = {"id", "name", "game_url", "dest_path", "size_str", "status"}
-                extra = {k: v for k, v in item.items() if k not in known}
-                conn.execute(
-                    "INSERT OR IGNORE INTO queue_items"
-                    "(id, queue, name, game_url, dest_path, size_str, status, position, extra)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        item_id,
-                        qname,
-                        item.get("name", ""),
-                        item.get("game_url", ""),
-                        item.get("dest_path", ""),
-                        item.get("size_str", "N/A"),
-                        item.get("status", "pending"),
-                        pos,
-                        json.dumps(extra),
-                    ),
-                )
-        conn.execute(
-            "INSERT OR REPLACE INTO meta(key, value) VALUES ('active_queue', ?)",
-            (active,),
-        )
-
-        # Download history
-        for entry in data.get("download_history", []):
-            conn.execute(
-                "INSERT INTO download_history(name, console, size, timestamp)"
-                " VALUES (?, ?, ?, ?)",
-                (
-                    entry.get("name", ""),
-                    entry.get("console", ""),
-                    entry.get("size", ""),
-                    entry.get("timestamp", ""),
-                ),
-            )
-
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES ('migrated_json', '1')"
-        )
-        conn.commit()
-        log.info("JSON → SQLite migration complete.")
-
     # ── Settings ─────────────────────────────────────────────────────────
 
     def get_setting(self, key: str, default: Any = None) -> Any:
@@ -254,11 +155,10 @@ class SQLiteStorage:
 
     def update_settings(self, updates: dict[str, Any]) -> None:
         conn = self._conn()
-        for k, v in updates.items():
-            conn.execute(
-                "INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
-                (k, json.dumps(v)),
-            )
+        conn.executemany(
+            "INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
+            [(k, json.dumps(v)) for k, v in updates.items()],
+        )
         conn.commit()
 
     # ── Queue management ─────────────────────────────────────────────────
@@ -332,18 +232,18 @@ class SQLiteStorage:
         ).fetchall()
         result = []
         for r in rows:
-            item: dict[str, Any] = {
+            extra = json.loads(r["extra"]) if r["extra"] else {}
+            # Build item from extra first, then overlay known columns so
+            # extra cannot overwrite them.
+            item: dict[str, Any] = dict(extra)
+            item.update({
                 "id": r["id"],
                 "name": r["name"],
                 "game_url": r["game_url"],
                 "dest_path": r["dest_path"],
                 "size_str": r["size_str"],
-            }
-            # Merge extra fields (status, progress, etc.)
-            extra = json.loads(r["extra"]) if r["extra"] else {}
-            if r["status"] != "pending":
-                item["status"] = r["status"]
-            item.update(extra)
+                "status": r["status"],
+            })
             result.append(item)
         return result
 
@@ -353,17 +253,16 @@ class SQLiteStorage:
         ).fetchone()
         if row is None:
             return None
-        item: dict[str, Any] = {
+        extra = json.loads(row["extra"]) if row["extra"] else {}
+        item: dict[str, Any] = dict(extra)
+        item.update({
             "id": row["id"],
             "name": row["name"],
             "game_url": row["game_url"],
             "dest_path": row["dest_path"],
             "size_str": row["size_str"],
-        }
-        extra = json.loads(row["extra"]) if row["extra"] else {}
-        if row["status"] != "pending":
-            item["status"] = row["status"]
-        item.update(extra)
+            "status": row["status"],
+        })
         return item
 
     def queue_length(self, queue_name: str | None = None) -> int:
@@ -440,23 +339,26 @@ class SQLiteStorage:
         conn = self._conn()
         conn.execute("DELETE FROM queue_items WHERE queue=?", (queue_name,))
         known = {"id", "name", "game_url", "dest_path", "size_str", "status"}
+        rows = []
         for pos, item in enumerate(items):
             extra = {k: v for k, v in item.items() if k not in known}
-            conn.execute(
+            rows.append((
+                item["id"],
+                queue_name,
+                item.get("name", ""),
+                item.get("game_url", ""),
+                item.get("dest_path", ""),
+                item.get("size_str", "N/A"),
+                item.get("status", "pending"),
+                pos,
+                json.dumps(extra),
+            ))
+        if rows:
+            conn.executemany(
                 "INSERT INTO queue_items"
                 "(id, queue, name, game_url, dest_path, size_str, status, position, extra)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    item["id"],
-                    queue_name,
-                    item.get("name", ""),
-                    item.get("game_url", ""),
-                    item.get("dest_path", ""),
-                    item.get("size_str", "N/A"),
-                    item.get("status", "pending"),
-                    pos,
-                    json.dumps(extra),
-                ),
+                rows,
             )
         conn.commit()
 
@@ -550,17 +452,6 @@ class SQLiteStorage:
             conn.commit()
         return len(stale)
 
-    def migrate_library_status_json(self, json_data: dict[str, str]) -> None:
-        """Import library status entries from the legacy JSON file."""
-        conn = self._conn()
-        for path_key, status in json_data.items():
-            if status in ("validated", "corrupted"):
-                conn.execute(
-                    "INSERT OR IGNORE INTO library_status(path, status) VALUES (?, ?)",
-                    (path_key, status),
-                )
-        conn.commit()
-
     # ── IGDB cache ────────────────────────────────────────────────────────
 
     def get_igdb_cache(
@@ -610,24 +501,27 @@ class SQLiteStorage:
             return
         conn = self._conn()
         now = time.time()
-        for clean_name, meta in entries.items():
-            conn.execute(
-                "INSERT OR REPLACE INTO igdb_cache "
-                "(platform_id, clean_name, igdb_id, rating, popularity, "
-                " genres, themes, game_modes, fetched_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    platform_id,
-                    clean_name,
-                    meta.get("igdb_id", 0),
-                    meta.get("rating", -1),
-                    meta.get("popularity", 0),
-                    json.dumps(meta.get("genres", [])),
-                    json.dumps(meta.get("themes", [])),
-                    json.dumps(meta.get("game_modes", [])),
-                    now,
-                ),
+        rows = [
+            (
+                platform_id,
+                clean_name,
+                meta.get("igdb_id", 0),
+                meta.get("rating", -1),
+                meta.get("popularity", 0),
+                json.dumps(meta.get("genres", [])),
+                json.dumps(meta.get("themes", [])),
+                json.dumps(meta.get("game_modes", [])),
+                now,
             )
+            for clean_name, meta in entries.items()
+        ]
+        conn.executemany(
+            "INSERT OR REPLACE INTO igdb_cache "
+            "(platform_id, clean_name, igdb_id, rating, popularity, "
+            " genres, themes, game_modes, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
         conn.commit()
 
     def clear_igdb_cache(self) -> None:

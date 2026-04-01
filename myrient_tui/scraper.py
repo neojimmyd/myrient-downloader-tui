@@ -13,6 +13,8 @@ from myrient_tui.constants import _LINK_CACHE_TTL, _SCRAPE_STRAINER, SIZE_REGEX
 from myrient_tui.messages import SystemLog
 from myrient_tui.types import ConsoleItem, GameItem
 
+_PENDING = object()  # Sentinel for in-flight cache entries
+
 
 class MyrientScraper:
     """Thread-safe Myrient HTTP index scraper with TTL-aware in-memory cache.
@@ -30,9 +32,9 @@ class MyrientScraper:
 
     def __init__(self, post_message_fn: Callable[[Message], None]) -> None:
         self._post = post_message_fn
-        # TTL-aware cache: (data, timestamp) | ("_PENDING", timestamp)
+        # TTL-aware cache: (data, timestamp) | (_PENDING, timestamp)
         self._cache: dict[str, tuple[Any, float]] = {}
-        self._lock  = threading.Lock()
+        self._lock = threading.Lock()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -55,14 +57,14 @@ class MyrientScraper:
             cached = self._cache.get(url)
             if cached is not None:
                 value, ts = cached
-                if value == "_PENDING":
+                if value is _PENDING:
                     # Another thread is already fetching — return empty list;
                     # the first thread's completion will post ConsolesLoaded/GamesLoaded.
                     return []
                 elif (now - ts) < _LINK_CACHE_TTL:
                     return value  # type: ignore[return-value]
             snapshot_items = list(self._cache.items())
-            self._cache[url] = ("_PENDING", now)
+            self._cache[url] = (_PENDING, now)
 
         # Evict stale entries outside the lock.
         # Exclude the current url — we just set it to _PENDING above; the snapshot
@@ -94,8 +96,18 @@ class MyrientScraper:
                         if matches:
                             size_str = f"{matches[-1][0]}{matches[-1][1]}"
 
+                    # For absolute paths / full URLs, prefer the link text as
+                    # the display name (e.g. Vimm shows "PlayStation" for href
+                    # "/vault/PS1").  Directory-listing hrefs are relative and
+                    # already human-readable after unquoting.
+                    if href.startswith(("/", "http")):
+                        link_text = a_tag.get_text(strip=True)
+                        name = link_text if link_text else unquote(href.rsplit("/", 1)[-1])
+                    else:
+                        name = unquote(href)
+
                     items.append({          # type: ignore[misc]
-                        "name":     unquote(href),
+                        "name":     name,
                         "url_part": href,
                         "size_str": size_str,
                     })
@@ -106,7 +118,7 @@ class MyrientScraper:
 
         except Exception as err:
             with self._lock:
-                if self._cache.get(url, (None,))[0] == "_PENDING":
+                if self._cache.get(url, (None,))[0] is _PENDING:
                     del self._cache[url]
             self._post(SystemLog(f"Scrape Error: {err}", True))
             return []

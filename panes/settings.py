@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 from textual.app import ComposeResult
-from textual.containers import Horizontal, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import (
     Button, DataTable, Input, Label, Rule, Select, Switch,
     TabbedContent, TabPane,
 )
-from textual.containers import Vertical
 
 
 
@@ -14,16 +13,22 @@ class SettingsPane(Vertical):
     """Settings organised into tabbed sections."""
 
     def compose(self) -> ComposeResult:
-        from myrient_tui.constants import _COLLECTIONS
-
         with TabbedContent(id="settings-tabs"):
             with TabPane("Engine", id="tab-engine"):
                 with VerticalScroll():
-                    yield Label("Collection source", classes="setting-label")
-                    yield Select(
-                        [(k, k) for k in _COLLECTIONS],
-                        id="set-collection", prompt="collection…",
-                    )
+                    yield Label("Active source", classes="setting-label")
+                    yield Select([], id="set-active-source", prompt="select source…")
+                    yield Label("── Manage sources ──", classes="setting-label")
+                    yield Label("Name", classes="setting-label")
+                    yield Input(id="src-name", placeholder="e.g. Redump")
+                    yield Label("Browse URL", classes="setting-label")
+                    yield Input(id="src-browse-url", placeholder="https://example.com/files/Redump/")
+                    yield Label("DAT URL  [dim](optional)[/dim]", classes="setting-label")
+                    yield Input(id="src-dat-url", placeholder="https://example.com/dats/Redump/")
+                    with Horizontal(classes="btn-row"):
+                        yield Button("Save Source", id="btn-save-source", variant="success")
+                        yield Button("Delete Source", id="btn-delete-source", variant="error")
+                    yield Rule()
                     yield Label("Library root path", classes="setting-label")
                     yield Input(id="set-lib-path")
                     yield Label("Max concurrent downloads  [dim](1–10)[/dim]", classes="setting-label")

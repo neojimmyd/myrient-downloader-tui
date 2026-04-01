@@ -21,7 +21,7 @@ class GameItem(TypedDict):
 
 
 class QueueItem(TypedDict):
-    """One entry persisted in myrient_config.json → queues → <name>."""
+    """One entry persisted in the download queue (SQLite-backed)."""
     id:        str   # unique token, e.g. "dl_a1b2c3d4"
     name:      str   # display label shown in the queue table
     game_url:  str   # full absolute Myrient download URL
@@ -37,12 +37,6 @@ class GameMetadata(TypedDict):
     genres:     list[str]    # e.g. ["Puzzle", "Adventure"]
     themes:     list[str]    # e.g. ["Horror", "Survival"]
     game_modes: list[str]    # e.g. ["Single player", "Co-operative"]
-
-
-class RomEntry(TypedDict):
-    """One <rom> element parsed from a Redump DAT file."""
-    name:  str   # filename stored in the DAT
-    game:  str   # parent <game name="…"> attribute
 
 
 class DataListItem(ListItem):

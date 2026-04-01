@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 from textual.message import Message
 
-from .types import GameMetadata, QueueItem
+from .types import ConsoleItem, GameItem, GameMetadata, QueueItem
 
 
 # C3: __slots__ on hot-path Message subclasses saves ~40 bytes per instance
@@ -24,7 +23,7 @@ class SystemLog(Message):
 class ConsolesLoaded(Message):
     __slots__ = ("consoles",)
 
-    def __init__(self, consoles: list[Any]):
+    def __init__(self, consoles: list[ConsoleItem]):
         self.consoles = consoles
         super().__init__()
 
@@ -32,7 +31,7 @@ class ConsolesLoaded(Message):
 class GamesLoaded(Message):
     __slots__ = ("games",)
 
-    def __init__(self, games: list[Any]):
+    def __init__(self, games: list[GameItem]):
         self.games = games
         super().__init__()
 
@@ -109,4 +108,4 @@ class RatingsLoaded(Message):
 
 class LibraryWatchEvent(Message):
     """Posted by the watchdog observer thread when a filesystem change is detected."""
-    pass
+    __slots__ = ()

@@ -6,6 +6,7 @@ module.  The public surface is re-exported by ``myrient_tui.__init__``.
 from __future__ import annotations
 
 import enum
+import hashlib
 import logging
 import os
 import random
@@ -33,7 +34,7 @@ from myrient_tui.constants import (
     WGET_LENGTH_REGEX,
     WGET_PROG_REGEX,
 )
-from myrient_tui.messages import DownloadComplete, DownloadProgress, SystemLog
+from myrient_tui.messages import DownloadProgress, SystemLog
 from myrient_tui.types import QueueItem
 from myrient_tui.toolchain import Toolchain, _safe_extractall
 from myrient_tui.utils import normalize_game_title
@@ -108,9 +109,6 @@ class DownloadWorker:
         _url_path = urllib.parse.urlparse(item["game_url"]).path
         self.target_file = self.dest_dir / unquote(_url_path.split("/")[-1])
         self.item_name = item["name"]
-        self.size_bytes = 1
-        self.speed_samples: deque[tuple[float, int]] = deque()
-        self.speed_limit_bps = 0
 
     # ── Speed computation ────────────────────────────────────────────────
 
@@ -338,7 +336,6 @@ class DownloadWorker:
         logged but never raise — verification is best-effort and must not
         block the download pipeline.
         """
-        import hashlib
         from .constants import _DAT_AUDITABLE_EXTS, _HASH_CHUNK_BYTES
 
         console_name = (
@@ -659,9 +656,6 @@ class DownloadWorker:
                     if ok:
                         download_success = True
                         break
-                else:
-                    ok = False
-
                 # ── Phase 2: urllib fallback ─────────────────────────────────
                 try:
                     ok, size_bytes = self._run_urllib_fallback(

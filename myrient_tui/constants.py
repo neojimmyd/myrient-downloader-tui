@@ -21,15 +21,6 @@ _DATA_DIR.mkdir(parents=True, exist_ok=True)
 _TOOLS_DIR  = _DATA_DIR / "tools"
 _TOOLS_DIR.mkdir(parents=True, exist_ok=True)
 
-BASE_URL        = "https://myrient.erista.me/files/Redump/"
-DAT_BASE_URL    = "https://myrient.erista.me/dats/Redump/"
-
-# N5: Collection base URLs — selectable via Settings → Engine tab.
-_COLLECTIONS: dict[str, tuple[str, str]] = {
-    "Redump":   (BASE_URL, DAT_BASE_URL),
-    "No-Intro": ("https://myrient.erista.me/files/No-Intro/", "https://myrient.erista.me/dats/No-Intro/"),
-}
-
 # PS2 Master Disc Patcher
 _PS2MDP_BINARY_NAME     = "ps2_master"
 _PS2MDP_RELEASE_VERSION = "v1.0.5"
@@ -53,7 +44,6 @@ _DAT_SEARCH_PREFIXES: dict[str, list[str]] = {
     "Nintendo - Wii U - WUX":                       ["Nintendo - Wii U - WUX"],
 }
 
-CONFIG_FILE     = _DATA_DIR / "myrient_config.json"
 SESSION_LOG_DIR = _DATA_DIR / "logs"
 DAT_CACHE_DIR   = _DATA_DIR / "dats"
 

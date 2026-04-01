@@ -3,8 +3,8 @@
 Re-exports the main App class and commonly-used symbols so the entry point
 can simply ``from myrient_tui import MyrientTUI``.
 """
-from .constants import _COLLECTIONS, _DATA_DIR, _SCRIPT_DIR, _TOOLS_DIR, CONFIG_FILE
-from .types import ConsoleItem, DataListItem, GameItem, GameMetadata, QueueItem, RomEntry
+from .constants import _DATA_DIR, _SCRIPT_DIR, _TOOLS_DIR
+from .types import ConsoleItem, GameItem, GameMetadata, QueueItem
 from .messages import (
     BatchComplete, ConsolesLoaded, DownloadComplete, DownloadProgress,
     GamesLoaded, LibraryProgress, LibraryTreeReady, LibraryWatchEvent,
@@ -25,7 +25,7 @@ __all__ = [
     # App (lazy — import from .app directly to avoid circular deps)
     "MyrientTUI",
     # Types
-    "ConsoleItem", "GameItem", "GameMetadata", "QueueItem", "RomEntry",
+    "ConsoleItem", "GameItem", "GameMetadata", "QueueItem",
     # Messages
     "BatchComplete", "ConsolesLoaded", "DownloadComplete", "DownloadProgress",
     "GamesLoaded", "LibraryProgress", "LibraryTreeReady", "LibraryWatchEvent",
@@ -40,7 +40,7 @@ __all__ = [
     # Modals
     "ConfirmDeleteScreen", "ConfirmDownloadScreen", "ConfirmVerifyScreen", "HelpModal",
     # Constants
-    "_COLLECTIONS", "_DATA_DIR", "_SCRIPT_DIR", "_TOOLS_DIR", "CONFIG_FILE",
+    "_DATA_DIR", "_SCRIPT_DIR", "_TOOLS_DIR",
     # Helpers
     "_sha256_file", "_safe_extractall",
     "normalize_game_title", "normalize_game_title_keep_disc", "strip_extension",

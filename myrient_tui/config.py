@@ -7,13 +7,12 @@ the durable store that replaces the old monolithic JSON file.
 from __future__ import annotations
 
 import copy
-import logging
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
 
-from myrient_tui.constants import _SCRIPT_DIR, CONFIG_FILE
+from myrient_tui.constants import _SCRIPT_DIR
 from myrient_tui.storage import SQLiteStorage
 from myrient_tui.types import QueueItem
 
@@ -35,7 +34,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "watch_library": False,         # auto-rescan library when files change (requires watchdog)
     "notify_on_batch_complete": True,  # desktop notification when batch finishes
     "favorite_consoles": [],        # pinned console names shown at top of browse list
-    "collection": "Redump",         # active Myrient collection (Redump, No-Intro)
+    # Runtime-editable download sources (replaces hard-coded _COLLECTIONS)
+    "sources": [
+        {"name": "Redump",   "browse_url": "https://myrient.erista.me/files/Redump/",   "dat_url": "https://myrient.erista.me/dats/Redump/"},
+        {"name": "No-Intro", "browse_url": "https://myrient.erista.me/files/No-Intro/", "dat_url": "https://myrient.erista.me/dats/No-Intro/"},
+    ],
+    "active_source": "Redump",
     # F3: User-configurable quick-filter tags
     "include_tags": ["USA", "Europe", "Japan", "World"],
     "exclude_tags": ["Demo", "Beta", "Proto"],
@@ -60,11 +64,10 @@ class ConfigManager:
     state on every change.
     """
 
-    def __init__(self, config_path: Path):
-        self.config_path = config_path
-        self._lock = threading.Lock()
+    def __init__(self, db_path: Path | None = None):
+        self._lock = threading.RLock()
         self._dirty = False
-        self._db = SQLiteStorage()
+        self._db = SQLiteStorage(db_path)
         self.data: dict[str, Any] = self._load()
 
     def _load(self) -> dict[str, Any]:
@@ -77,6 +80,16 @@ class ConfigManager:
         db_settings = self._db.get_all_settings()
         settings = copy.deepcopy(DEFAULT_SETTINGS)
         settings.update(db_settings)
+
+        # Migrate old "collection" key → "active_source" + "sources"
+        if "collection" in settings and "active_source" not in settings:
+            settings["active_source"] = settings.pop("collection")
+            self._db.update_settings({
+                "active_source": settings["active_source"],
+                "sources": settings["sources"],
+            })
+            self._db._conn().execute("DELETE FROM settings WHERE key='collection'")
+            self._db._conn().commit()
 
         active_queue = self._db.get_active_queue_name()
         queues = self._db.get_all_queues()
@@ -113,16 +126,6 @@ class ConfigManager:
             self._dirty = True
             raise
 
-    def save(self) -> None:
-        """Acquire lock and write current state to disk immediately."""
-        with self._lock:
-            self._write_locked()
-
-    def mark_dirty(self) -> None:
-        """Mark state as needing a flush without touching the disk."""
-        with self._lock:
-            self._dirty = True
-
     def flush_if_dirty(self) -> None:
         """Write to disk only if state has been dirtied since the last save."""
         with self._lock:
@@ -132,20 +135,35 @@ class ConfigManager:
 
     @property
     def settings(self) -> dict[str, Any]:
-        return self.data["settings"]
+        with self._lock:
+            return dict(self.data["settings"])
 
     def get_setting(self, key: str, default: Any = None) -> Any:
         """B3: Thread-safe single-key read — holds lock for the read."""
         with self._lock:
             return self.data["settings"].get(key, default)
 
+    def get_active_source(self) -> dict:
+        """Return the active source dict, falling back to the first source."""
+        with self._lock:
+            sources = self.data["settings"].get("sources", [])
+            name = self.data["settings"].get("active_source", "")
+            for s in sources:
+                if s["name"] == name:
+                    return dict(s)
+            return dict(sources[0]) if sources else {
+                "name": "", "browse_url": "", "dat_url": ""
+            }
+
     @property
     def queues(self) -> dict[str, list[QueueItem]]:
-        return self.data["queues"]
+        with self._lock:
+            return dict(self.data["queues"])
 
     @property
     def active_queue_name(self) -> str:
-        return self.data["active_queue"]
+        with self._lock:
+            return self.data["active_queue"]
 
     def get_active_queue(self) -> list[QueueItem]:
         with self._lock:
@@ -266,8 +284,7 @@ class ConfigManager:
             history.append(entry)
             if len(history) > self._HISTORY_MAX:
                 self.data["download_history"] = history[-self._HISTORY_MAX:]
-        # SQLite handles its own trimming
-        self._db.record_download(name, console, size_str)
+            self._db.record_download(name, console, size_str)
 
     @property
     def download_history(self) -> list[dict[str, str]]:
@@ -277,7 +294,7 @@ class ConfigManager:
     def clear_history(self) -> None:
         with self._lock:
             self.data["download_history"] = []
-        self._db.clear_history()
+            self._db.clear_history()
 
     def mutate_settings(self, fn: Callable[[dict[str, Any]], None]) -> None:
         """Call *fn(settings_dict)* while holding the lock and flush once.

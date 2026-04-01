@@ -6,6 +6,7 @@ Results are cached in SQLite with a configurable TTL.
 """
 from __future__ import annotations
 
+import heapq
 import json
 import logging
 import re
@@ -15,8 +16,8 @@ import unicodedata
 import urllib.request
 import urllib.error
 import urllib.parse
+from collections.abc import Callable
 from difflib import SequenceMatcher
-from typing import Callable
 
 from .storage import SQLiteStorage
 from .types import GameMetadata
@@ -134,6 +135,8 @@ class RatingsProvider:
         self._token: str = ""
         self._token_expires: float = 0.0
         self._last_request: float = 0.0
+        self._rate_lock = threading.Lock()
+        self._auth_lock = threading.Lock()
 
     @property
     def configured(self) -> bool:
@@ -143,42 +146,48 @@ class RatingsProvider:
     # ── Authentication ────────────────────────────────────────────────────
 
     def _authenticate(self) -> str:
-        """Obtain or reuse a Twitch OAuth bearer token."""
-        now = time.time()
-        if self._token and now < self._token_expires:
-            return self._token
+        """Obtain or reuse a Twitch OAuth bearer token.
 
-        params = urllib.parse.urlencode({
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-            "grant_type": "client_credentials",
-        })
-        req = urllib.request.Request(
-            _TWITCH_TOKEN_URL,
-            data=params.encode(),
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                body = json.loads(resp.read())
-            self._token = body["access_token"]
-            # Expire a bit early to avoid edge-case failures.
-            self._token_expires = now + body.get("expires_in", 3600) - 60
-            log.info("IGDB: authenticated (token valid for %ds)", body.get("expires_in", 0))
-            return self._token
-        except Exception as exc:
-            log.error("IGDB auth failed: %s", exc)
-            raise
+        Serialized with ``_auth_lock`` so concurrent threads don't issue
+        duplicate OAuth requests when the token expires.
+        """
+        with self._auth_lock:
+            now = time.time()
+            if self._token and now < self._token_expires:
+                return self._token
+
+            params = urllib.parse.urlencode({
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+                "grant_type": "client_credentials",
+            })
+            req = urllib.request.Request(
+                _TWITCH_TOKEN_URL,
+                data=params.encode(),
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    body = json.loads(resp.read())
+                self._token = body["access_token"]
+                # Expire a bit early to avoid edge-case failures.
+                self._token_expires = now + body.get("expires_in", 3600) - 60
+                log.info("IGDB: authenticated (token valid for %ds)", body.get("expires_in", 0))
+                return self._token
+            except Exception as exc:
+                log.error("IGDB auth failed: %s", exc)
+                raise
 
     # ── IGDB query ────────────────────────────────────────────────────────
 
     def _rate_limit(self) -> None:
         """Sleep if needed to respect the 4-req/s limit."""
-        now = time.time()
-        elapsed = now - self._last_request
-        if elapsed < _MIN_REQUEST_INTERVAL:
-            time.sleep(_MIN_REQUEST_INTERVAL - elapsed)
-        self._last_request = time.time()
+        with self._rate_lock:
+            now = time.time()
+            elapsed = now - self._last_request
+            if elapsed < _MIN_REQUEST_INTERVAL:
+                time.sleep(_MIN_REQUEST_INTERVAL - elapsed)
+            self._last_request = time.time()
 
     def _query(self, body: str) -> list[dict]:
         """Send an Apicalypse query to IGDB and return parsed JSON."""
@@ -200,8 +209,9 @@ class RatingsProvider:
         except urllib.error.HTTPError as exc:
             if exc.code == 401:
                 # Token expired — clear and retry once.
-                self._token = ""
-                self._token_expires = 0.0
+                with self._auth_lock:
+                    self._token = ""
+                    self._token_expires = 0.0
                 token = self._authenticate()
                 req.add_header("Authorization", f"Bearer {token}")
                 self._rate_limit()
@@ -377,10 +387,13 @@ class RatingsProvider:
             "game_modes": [m["name"] for m in match.get("game_modes", []) if "name" in m],
         }
 
-    _MISS_ENTRY: dict = {
-        "igdb_id": 0, "rating": -1, "popularity": 0,
-        "genres": [], "themes": [], "game_modes": [],
-    }
+    @staticmethod
+    def _miss_entry() -> dict:
+        """Return a fresh miss-cache dict (avoids shared mutable lists)."""
+        return {
+            "igdb_id": 0, "rating": -1, "popularity": 0,
+            "genres": [], "themes": [], "game_modes": [],
+        }
 
     def _fetch_batch(
         self,
@@ -447,7 +460,7 @@ class RatingsProvider:
 
         # Cache remaining unmatched as misses
         for clean_name in unmatched:
-            out[clean_name] = dict(self._MISS_ENTRY)
+            out[clean_name] = self._miss_entry()
 
     def _search_single(
         self, platform_id: int, clean_name: str,
@@ -564,7 +577,7 @@ class RatingsProvider:
         log.info("IGDB: fetched %d games for platform %d", len(all_games), platform_id)
         _log(f"IGDB: {len(all_games)} games in IGDB for this platform — matching against {len(misses)} titles…")
         if not all_games:
-            return {n: dict(self._MISS_ENTRY) for n in misses}
+            return {n: self._miss_entry() for n in misses}
 
         # Phase 2: build lookup structures from IGDB data
         igdb_entries: list[tuple[str, dict]] = []  # (primary_norm, game)
@@ -639,7 +652,7 @@ class RatingsProvider:
                     for word in target_words:
                         for i in word_index.get(word, ()):
                             scores[i] = scores.get(i, 0) + 1
-                    top = sorted(scores, key=scores.get, reverse=True)[:20]
+                    top = heapq.nlargest(20, scores, key=scores.get)
                     best_ratio = 0.0
                     best_g: dict | None = None
                     for i in top:
@@ -651,7 +664,7 @@ class RatingsProvider:
                     if best_ratio >= 0.68:
                         match = best_g
 
-            entry = self._meta_from_match(match) if match else dict(self._MISS_ENTRY)
+            entry = self._meta_from_match(match) if match else self._miss_entry()
             out[clean_name] = entry
             chunk[clean_name] = entry
 

@@ -41,15 +41,15 @@ from textual.widgets import (
 from panes import BrowsePane, DownloadsPane, GameSearchInput, LibraryPane, SettingsPane, LogsPane
 
 from .constants import (
-    _CHD_SOURCE_EXTS, _CHD_TIMEOUT, _COLLECTIONS, _DATA_DIR,
+    _CHD_TIMEOUT, _DATA_DIR,
     _DAT_AUDITABLE_EXTS, _DAT_INDEX_STRAINER, _DAT_SEARCH_PREFIXES,
     _DOWNLOAD_EXTS, _FLUSH_INTERVAL, _GAME_EXTS, _HASH_CHUNK_BYTES,
     _LOW_PRIO_POPEN, _OS, _PROGRESS_DONE_STATES, _PS2_PATCH_EXTS,
-    _SCRAPE_CONCURRENCY, _SCRIPT_DIR, _SEARCH_DEBOUNCE,
+    _SCRAPE_CONCURRENCY, _SEARCH_DEBOUNCE,
     _SESSION_LOG_MAX_FILES, _SIZE_MULTIPLIERS, _SIZE_UNITS,
-    _TOOLS_DIR, _TREE_AMBER, _TREE_DIM, _TREE_GREEN,
+    _TREE_AMBER, _TREE_DIM, _TREE_GREEN,
     _TREE_RED, _TREE_YELLOW, _WATCH_DEBOUNCE, CUE_BIN_REGEX,
-    CONFIG_FILE, DAT_CACHE_DIR, DISC_REGEX, SESSION_LOG_DIR, SIZE_REGEX,
+    DAT_CACHE_DIR, DISC_REGEX, SESSION_LOG_DIR, SIZE_REGEX,
 )
 from .types import ConsoleItem, DataListItem, GameItem, QueueItem
 from .messages import (
@@ -61,11 +61,11 @@ from .config import ConfigManager
 from .library_status import LibraryStatus
 from .ratings import RatingsProvider
 from .scraper import MyrientScraper
-from .toolchain import Toolchain, _sha256_file, _safe_extractall
+from .toolchain import Toolchain
 from .download import DownloadWorker, EngineState, TokenBucket
 from .library_ops import LibraryOperation
 from .commands import LibraryCommand, OrganizeCommand, RefreshCommand, ConvertCommand, DatAuditCommand
-from .utils import normalize_game_title, normalize_game_title_keep_disc, strip_extension
+from .utils import normalize_game_title, normalize_game_title_keep_disc, strip_extension, extract_region, extract_revision
 from .modals import ConfirmDeleteScreen, ConfirmDownloadScreen, HelpModal
 
 # ── Optional watchdog import for filesystem watch mode ───────────────────────
@@ -103,7 +103,7 @@ class MyrientTUI(App):
 
     def __init__(self):
         super().__init__()
-        self.state = ConfigManager(CONFIG_FILE)
+        self.state = ConfigManager()
         self._lib_status = LibraryStatus()
 
         # ── Extracted subsystems ───────────────────────────────────────────────
@@ -225,23 +225,50 @@ class MyrientTUI(App):
         # F3: In-library path set (populated on library scan)
         self._library_game_names: set[str] = set()
 
-    # ── N5: Dynamic collection URLs ──────────────────────────────────────
+    # ── Dynamic source URLs ───────────────────────────────────────────────
     @property
     def _active_base_url(self) -> str:
-        col = self.state.settings.get("collection", "Redump")
-        return _COLLECTIONS.get(col, _COLLECTIONS["Redump"])[0]
+        return self.state.get_active_source()["browse_url"]
 
     @property
     def _active_dat_url(self) -> str:
-        col = self.state.settings.get("collection", "Redump")
-        return _COLLECTIONS.get(col, _COLLECTIONS["Redump"])[1]
+        return self.state.get_active_source().get("dat_url", "")
 
-    # ── S3/S4: Helper factories ──────────────────────────────────────────
-    def _build_game_url(self, console_url_part: str, game_url_part: str) -> str:
-        """S3: Single point of URL construction for game downloads."""
-        console_url = urljoin(self._active_base_url, console_url_part)
-        return urljoin(console_url, game_url_part)
+    # ── Console detection ────────────────────────────────────────────────
+    _SKIP_NAMES: frozenset[str] = frozenset({
+        "files", "donate", "upload", "faq", "contact", "login", "register",
+    })
 
+    def _filter_console_items(self, items: list[ConsoleItem]) -> list[ConsoleItem]:
+        """Filter scraped links to those that look like console directories.
+
+        Works with both Apache/nginx directory listings (trailing ``/``) and
+        non-directory-listing sites (links that are direct children of the
+        browse URL with no file extension).
+        """
+        base_path = urllib.parse.urlparse(self._active_base_url).path.rstrip("/")
+        consoles: list[ConsoleItem] = []
+        for i in items:
+            url = i["url_part"]
+            name_lower = i["name"].strip("/").lower()
+            if name_lower in self._SKIP_NAMES or not name_lower:
+                continue
+            # Directory-listing style: trailing slash means directory
+            if url.endswith("/"):
+                consoles.append(i)
+                continue
+            # Non-directory site: accept direct child paths without download extensions
+            if url.startswith("/"):
+                child = url.rstrip("/")
+                if child.startswith(base_path + "/"):
+                    relative = child[len(base_path) + 1:]
+                    if "/" not in relative and not any(
+                        child.lower().endswith(ext) for ext in _DOWNLOAD_EXTS
+                    ):
+                        consoles.append(i)
+        return consoles
+
+    # ── S4: Helper factory ───────────────────────────────────────────────
     def _make_queue_item(self, console_name: str, game_name: str,
                          game_url: str, dest_path: str, size_str: str) -> QueueItem:
         """S4: Canonical queue-item factory — eliminates copy-paste across 8 sites."""
@@ -272,6 +299,15 @@ class MyrientTUI(App):
     def engine_running(self) -> bool:
         """Backward-compatible check — True when the download engine is active."""
         return self._engine_state in (EngineState.RUNNING, EngineState.PAUSING)
+
+    def _flash_nav_button(self, button_id: str, duration: float = 1.5) -> None:
+        """Briefly highlight a nav button (e.g. after queuing items)."""
+        try:
+            btn = self.query_one(f"#{button_id}", Button)
+            btn.add_class("--nav-flash")
+            self.set_timer(duration, lambda: btn.remove_class("--nav-flash"))
+        except Exception:
+            pass
 
     def action_refresh_browser(self) -> None:
         """Ctrl+R: re-scrape console list (bypasses cache)."""
@@ -594,11 +630,7 @@ class MyrientTUI(App):
         self._refresh_queue_dropdown()
         self._refresh_queue_table()
         self._load_settings_toggles()
-        try:
-            col = self.state.settings.get("collection", "Redump")
-            self.query_one("#set-collection", Select).value = col
-        except Exception:
-            pass
+        self._populate_source_select()
         self.fetch_consoles()
         # Load library status store before scanning so the tree renders correctly.
         self._lib_status.load(Path(self.state.settings['library_root']), db=self.state._db)
@@ -766,7 +798,7 @@ class MyrientTUI(App):
                 lbl.update(Text(""))
                 return
             t = Text()
-            t.append("Redump", style="#3d4451")
+            t.append(self.state.get_active_source()["name"] or "Source", style="#3d4451")
             t.append("  ›  ", style="dim #1c2333")
             t.append(console_name, style="#9aa0aa")
             if game_count > 0:
@@ -973,7 +1005,8 @@ class MyrientTUI(App):
         brackets in game/console names (e.g. [USA], [SLES-00867]) are NEVER
         parsed as markup tags.
         """
-        def _game_label(name: str, status: str, has_chd: bool = False) -> Text:
+        def _game_label(name: str, status: str, has_chd: bool = False,
+                        region: str = "", revision: str = "") -> Text:
             t = Text(no_wrap=True, overflow="ellipsis")
             if status == "validated":
                 t.append("✓ ", style=_TREE_GREEN)
@@ -984,6 +1017,12 @@ class MyrientTUI(App):
             else:
                 t.append("~ ", style=_TREE_YELLOW)
                 t.append(name, style=_TREE_YELLOW)
+            if region:
+                t.append(" │ ", style="dim #00ffbb")
+                t.append(f"({region})", style="dim #d2a8ff")
+            if revision:
+                t.append(" │ ", style="dim #00ffbb")
+                t.append(revision, style="dim #e0a458")
             if has_chd:
                 t.append(" │ ", style="dim #00ffbb")
                 t.append("CHD", style="dim #58a6ff")
@@ -1043,10 +1082,14 @@ class MyrientTUI(App):
                     if name in disc_groups:
                         continue  # rendered as disc group instead
                     clean = normalize_game_title(name)
-                    tree_entries.append((clean.lower(), _game_label(clean, status, has_chd), game_dir))
+                    region = extract_region(name)
+                    revision = extract_revision(name)
+                    tree_entries.append((clean.lower(), _game_label(clean, status, has_chd, region, revision), game_dir))
 
                 for base_name, discs in disc_groups.items():
                     clean_base = normalize_game_title(base_name)
+                    region = extract_region(base_name)
+                    revision = extract_revision(base_name)
                     discs.sort(key=lambda d: d[2])  # sort by disc label
                     t = Text(no_wrap=True, overflow="ellipsis")
                     # Aggregate status for leading icon + game name
@@ -1060,12 +1103,21 @@ class MyrientTUI(App):
                     else:
                         t.append("~ ", style=_TREE_YELLOW)
                         t.append(clean_base, style=_TREE_YELLOW)
-                    # Dim pipe separator to visually divide name from disc labels
-                    t.append(" │ ", style="dim #00ffbb")
+                    # Region tag
+                    if region:
+                        t.append(" │ ", style="dim #00ffbb")
+                        t.append(f"({region})", style="dim #d2a8ff")
+                    # Revision tag
+                    if revision:
+                        t.append(" │ ", style="dim #00ffbb")
+                        t.append(revision, style="dim #e0a458")
                     # CHD indicator if any disc is in CHD format
                     any_chd = any(c for _, _, _, c in discs)
                     if any_chd:
-                        t.append("CHD ", style="dim #58a6ff")
+                        t.append(" │ ", style="dim #00ffbb")
+                        t.append("CHD", style="dim #58a6ff")
+                    # Dim pipe separator before per-disc status
+                    t.append(" │ ", style="dim #00ffbb")
                     # Per-disc status: dim grey number + small colored icon
                     for i, (_, st, dlbl, _) in enumerate(discs):
                         num_m = re.search(r'\d+', dlbl)
@@ -2002,6 +2054,19 @@ class MyrientTUI(App):
             except Exception as e:
                 logging.debug("Reflect queue settings on select failed: %s", e)
 
+        elif event.control.id == "set-active-source" and event.value != Select.BLANK:
+            # Populate edit fields with the selected source's data
+            sources = self.state.settings.get("sources", [])
+            for s in sources:
+                if s["name"] == str(event.value):
+                    try:
+                        self.query_one("#src-name", Input).value = s.get("name", "")
+                        self.query_one("#src-browse-url", Input).value = s.get("browse_url", "")
+                        self.query_one("#src-dat-url", Input).value = s.get("dat_url", "")
+                    except Exception:
+                        pass
+                    break
+
     _NAV_PANE_IDS: tuple[str, ...] = (
         "pane-browse", "pane-downloads", "pane-library",
         "pane-settings", "pane-logs",
@@ -2228,7 +2293,13 @@ class MyrientTUI(App):
 
         elif button_id == "btn-save-settings":
             self._handle_save_settings()
-                
+
+        elif button_id == "btn-save-source":
+            self._handle_save_source()
+
+        elif button_id == "btn-delete-source":
+            self._handle_delete_source()
+
         elif button_id == "btn-export-queue":
             try:
                 io_input = self.query_one("#input-queue-io-path", Input)
@@ -2424,6 +2495,14 @@ class MyrientTUI(App):
             except Exception:
                 igdb_csec = self.state.settings.get("igdb_client_secret", "")
 
+            try:
+                src_val = self.query_one("#set-active-source", Select).value
+                active_src = str(src_val) if src_val != Select.BLANK else self.state.get_active_source()["name"]
+            except Exception:
+                active_src = self.state.get_active_source()["name"]
+
+            prev_settings = dict(self.state.settings)
+
             self.state.update_settings({
                 "library_root":             str(new_path),
                 "max_concurrent":           max(1, min(10, thread_count)),
@@ -2437,10 +2516,25 @@ class MyrientTUI(App):
                 "filter_exclude":           sorted(self._filter_exclude_sel),
                 "custom_include_regex":     custom_inc,
                 "custom_exclude_regex":     custom_exc,
-                "collection":               str(self.query_one("#set-collection", Select).value) if self.query_one("#set-collection", Select).value != Select.BLANK else "Redump",
+                "active_source":            active_src,
                 "igdb_client_id":           igdb_cid,
                 "igdb_client_secret":       igdb_csec,
             })
+
+            # Source switch side effects — clear cached data and re-fetch
+            old_source = prev_settings.get("active_source", "")
+            new_source = self.state.settings.get("active_source", "")
+            if old_source != new_source:
+                self.scraper.clear_cache()
+                self.selected_console = None
+                self._all_games_data = []
+                self._games_lookup = {}
+                self._selected_games.clear()
+                try:
+                    self.query_one("#game-list", DataTable).clear()
+                except Exception:
+                    pass
+                self.fetch_consoles()
 
             # Invalidate ratings provider if credentials changed
             if self._ratings_provider and (
@@ -2470,6 +2564,88 @@ class MyrientTUI(App):
 
         except Exception as err:
             self.notify(f"Error saving settings: {err}", severity="error")
+
+    def _populate_source_select(self) -> None:
+        """Populate the active-source Select and edit fields from settings."""
+        try:
+            sources = self.state.settings.get("sources", [])
+            sel = self.query_one("#set-active-source", Select)
+            sel.set_options([(s["name"], s["name"]) for s in sources])
+            active = self.state.get_active_source()
+            sel.value = active["name"]
+            # Fill edit fields with active source data
+            try:
+                self.query_one("#src-name", Input).value = active.get("name", "")
+                self.query_one("#src-browse-url", Input).value = active.get("browse_url", "")
+                self.query_one("#src-dat-url", Input).value = active.get("dat_url", "")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _handle_save_source(self) -> None:
+        """Save or update a source from the edit fields."""
+        try:
+            name = self.query_one("#src-name", Input).value.strip()
+            browse_url = self.query_one("#src-browse-url", Input).value.strip()
+            dat_url = self.query_one("#src-dat-url", Input).value.strip()
+            if not name or not browse_url:
+                self.notify("Source name and browse URL are required", severity="error")
+                return
+            if not browse_url.endswith("/"):
+                browse_url += "/"
+            if dat_url and not dat_url.endswith("/"):
+                dat_url += "/"
+            sources = list(self.state.settings.get("sources", []))
+            # Upsert: update existing or append new
+            found = False
+            for i, s in enumerate(sources):
+                if s["name"] == name:
+                    sources[i] = {"name": name, "browse_url": browse_url, "dat_url": dat_url}
+                    found = True
+                    break
+            if not found:
+                sources.append({"name": name, "browse_url": browse_url, "dat_url": dat_url})
+            old_source = self.state.get_active_source()["name"]
+            self.state.update_settings({"sources": sources, "active_source": name})
+            self._populate_source_select()
+            self.notify(f"Source '{name}' saved")
+            # Switch side effects — clear cache and re-fetch console list
+            if old_source != name:
+                self.scraper.clear_cache()
+                self.selected_console = None
+                self._all_games_data = []
+                self._games_lookup = {}
+                self._selected_games.clear()
+                try:
+                    self.query_one("#game-list", DataTable).clear()
+                except Exception:
+                    pass
+            self.fetch_consoles()
+        except Exception as err:
+            self.notify(f"Error saving source: {err}", severity="error")
+
+    def _handle_delete_source(self) -> None:
+        """Delete the source shown in the edit fields."""
+        try:
+            name = self.query_one("#src-name", Input).value.strip()
+            if not name:
+                self.notify("No source name specified", severity="error")
+                return
+            sources = list(self.state.settings.get("sources", []))
+            if len(sources) <= 1:
+                self.notify("Cannot delete the only source", severity="error")
+                return
+            active = self.state.get_active_source()["name"]
+            if name == active:
+                self.notify("Cannot delete the active source — switch first", severity="error")
+                return
+            sources = [s for s in sources if s["name"] != name]
+            self.state.update_settings({"sources": sources})
+            self._populate_source_select()
+            self.notify(f"Source '{name}' deleted")
+        except Exception as err:
+            self.notify(f"Error deleting source: {err}", severity="error")
 
     def _add_selected_to_queue(self) -> None:
         # Global search mode: results keyed as "Console/url_part"
@@ -2503,13 +2679,7 @@ class MyrientTUI(App):
             self.state.update_active_queue(current_queue)
             self._refresh_queue_table()
             self.notify(f"Queued {added_count} item(s)")
-            # U7: Flash Downloads nav button on queue add
-            try:
-                btn = self.query_one("#nav-btn-downloads", Button)
-                btn.add_class("--nav-flash")
-                self.set_timer(1.5, lambda: btn.remove_class("--nav-flash"))
-            except Exception:
-                pass
+            self._flash_nav_button("nav-btn-downloads")
             self._update_global_statusbar()
             return
 
@@ -2557,13 +2727,7 @@ class MyrientTUI(App):
         self.state.update_active_queue(current_queue)
         self._refresh_queue_table()
         self.notify(f"Queued {added_count} item(s)")
-        # U7: Flash Downloads nav button on queue add
-        try:
-            btn = self.query_one("#nav-btn-downloads", Button)
-            btn.add_class("--nav-flash")
-            self.set_timer(1.5, lambda: btn.remove_class("--nav-flash"))
-        except Exception:
-            pass
+        self._flash_nav_button("nav-btn-downloads")
         self._update_global_statusbar()
 
     # --- UI Message Receivers ---
@@ -2757,12 +2921,7 @@ class MyrientTUI(App):
         self.call_from_thread(_show_loading)
         self.post_message(SystemLog("Scraping console list..."))
         items = self.scraper.scrape_links(self._active_base_url)
-        _SKIP_NAMES = {"files", "donate", "upload", "faq", "contact", "login", "register"}
-        consoles = [
-            i for i in items
-            if i["url_part"].endswith('/')
-            and i["name"].strip('/').lower() not in _SKIP_NAMES
-        ]
+        consoles = self._filter_console_items(items)
         self.post_message(ConsolesLoaded(consoles))  # type: ignore[arg-type]
 
     @work(exclusive=True, thread=True)
@@ -2770,7 +2929,7 @@ class MyrientTUI(App):
         """Concurrently scrape all console game pages and warm the link cache."""
         self._lib_cancel.clear()
         items = self.scraper.scrape_links(self._active_base_url)
-        consoles = [i for i in items if i["url_part"].endswith('/')]
+        consoles = self._filter_console_items(items)
         if not consoles:
             return
 
@@ -2808,7 +2967,7 @@ class MyrientTUI(App):
             try:
                 lbl = self.query_one("#breadcrumb", Label)
                 t = Text()
-                t.append("Redump", style="#3d4451")
+                t.append(self.state.get_active_source()["name"] or "Source", style="#3d4451")
                 t.append("  ›  ", style="dim #1c2333")
                 t.append(console_data["name"], style="#9aa0aa")
                 t.append("  ⟳ Loading…", style="italic #d29922")
@@ -3191,9 +3350,6 @@ class MyrientTUI(App):
 
     # Convenience wrappers — keep the old call-site API working.
 
-    def run_lib_organize(self) -> None:
-        self.run_library_command(OrganizeCommand())
-
     def run_lib_refresh(self) -> None:
         self.run_library_command(RefreshCommand())
 
@@ -3206,6 +3362,9 @@ class MyrientTUI(App):
 
         Returns ``None`` on failure (already logged).
         """
+        if not self._active_dat_url:
+            op.log("DAT audit skipped — active source has no DAT URL configured.")
+            return None
         op.progress("DAT Audit", "Fetching DAT index...", 0, 100)
         try:
             try:
@@ -3260,7 +3419,7 @@ class MyrientTUI(App):
 
         if not dat_href:
             op.log(
-                f"DAT Audit [{console_name}]: No matching DAT found on Myrient — skipping.\n"
+                f"DAT Audit [{console_name}]: No matching DAT found at source — skipping.\n"
                 f"  (Tried prefixes: {', '.join(prefixes_to_try)})"
             )
             return None
@@ -3362,7 +3521,8 @@ class MyrientTUI(App):
                     elem.clear()
                 elif event == 'end' and elem.tag == 'game':
                     xml_root.clear()
-        except Exception:
+        except Exception as exc:
+            logging.error("DAT XML parse failed for %s: %s", dat_path, exc)
             return None
         return dat_by_sha1, ambiguous_sha1s, dat_all_games
 
@@ -3857,8 +4017,8 @@ class MyrientTUI(App):
             # Move cursor to follow the item
             new_cursor = max(0, min(cursor + direction, len(rows) - 1))
             table.move_cursor(row=new_cursor)
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.debug("Queue item move failed: %s", exc)
 
     # ── Watchdog filesystem watch ─────────────────────────────────────────────
 
@@ -4166,7 +4326,7 @@ class MyrientTUI(App):
         ``None`` — it is either an orphaned multi-disc grouping folder or a
         download that was interrupted before any data landed.  In both cases
         the directory is not a recognisable game and should be invisible in
-        the library tree.  ``run_lib_organize`` cleans these up on request.
+        the library tree.  The Organize command cleans these up on request.
         """
         try:
             dir_files = [f for f in d.iterdir() if f.is_file() and not f.name.startswith('.')]
@@ -4282,11 +4442,10 @@ class MyrientTUI(App):
 
         self.post_message(LibraryTreeReady(structure, library, disk_usage))
 
-    def _find_myrient_game(self, console_name: str, dir_name: str) -> tuple[str, str, str] | None:
-        """Find a game on Myrient by matching its directory name against the console listing.
+    def _find_source_game(self, console_name: str, dir_name: str) -> tuple[str, str, str] | None:
+        """Find a game on the active source by matching its directory name against the console listing.
 
         Returns ``(game_name, game_url, size_str)`` on hit, or *None* if not found.
-        This replaces the old pattern of assuming ``dir_name + ".zip"`` as the remote filename.
         """
         try:
             console_url = self._active_base_url + quote(console_name, safe="") + "/"
@@ -4294,12 +4453,12 @@ class MyrientTUI(App):
             for g in games:
                 if strip_extension(g["name"]) == dir_name:
                     return g["name"], urljoin(console_url, g["url_part"]), g.get("size_str", "N/A")
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.debug("_find_source_game failed for %s/%s: %s", console_name, dir_name, exc)
         return None
 
     def _find_disc_variants(self, console_name: str, base_name: str) -> list[GameItem]:
-        """Scrape the console page on Myrient and return disc-specific entries
+        """Scrape the console page on the active source and return disc-specific entries
         whose base name (with the disc suffix stripped) matches *base_name*.
 
         Used by the requeue methods to expand multi-disc parent folders into
@@ -4452,7 +4611,7 @@ class MyrientTUI(App):
                 # Fall through to single-file queue if no variants found
 
             # Look up the actual remote filename from the scrape cache.
-            match = self._find_myrient_game(console_name, game_dir.name)
+            match = self._find_source_game(console_name, game_dir.name)
             if not match:
                 continue
             game_name, game_url, size_str = match
@@ -4537,7 +4696,7 @@ class MyrientTUI(App):
                     added += disc_added
                     continue
 
-            match = self._find_myrient_game(console_name, game_dir.name)
+            match = self._find_source_game(console_name, game_dir.name)
             if not match:
                 continue
             game_name, game_url, size_str = match
@@ -4687,7 +4846,7 @@ class MyrientTUI(App):
         for line in lines:
             if self._lib_cancel.is_set():
                 return
-            if line.startswith(("http://", "https://")) and "myrient" in line.lower():
+            if line.startswith(("http://", "https://")):
                 try:
                     parsed = urllib.parse.urlparse(line)
                     parts = [unquote(p) for p in parsed.path.strip('/').split('/') if p]
@@ -4715,7 +4874,7 @@ class MyrientTUI(App):
                 game_name = strip_extension(game_entry)
                 if game_name == game_entry:
                     # No recognized extension — look up actual filename on Myrient
-                    match = self._find_myrient_game(console_name, game_entry)
+                    match = self._find_source_game(console_name, game_entry)
                     if not match:
                         continue
                     game_entry, game_url, size_str = match

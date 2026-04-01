@@ -13,13 +13,28 @@ from __future__ import annotations
 import shutil
 import threading
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
-from .constants import (
-    _CHD_SOURCE_EXTS, _DAT_AUDITABLE_EXTS, _HASH_CHUNK_BYTES,
-    DAT_CACHE_DIR, DISC_REGEX,
-)
+from .constants import _CHD_SOURCE_EXTS, DISC_REGEX
 from .library_ops import LibraryOperation
+
+
+def _is_chd_candidate(directory: Path) -> bool:
+    """Return True if *directory* has CHD source files but no .chd files."""
+    try:
+        files = [f for f in directory.iterdir() if f.is_file()]
+    except PermissionError:
+        return False
+    has_source = has_chd = False
+    for f in files:
+        ext = f.suffix.lower()
+        if ext in _CHD_SOURCE_EXTS:
+            has_source = True
+        elif ext == '.chd':
+            has_chd = True
+        if has_source and has_chd:
+            break
+    return has_source and not has_chd
 
 if TYPE_CHECKING:
     from .app import MyrientTUI
@@ -173,20 +188,7 @@ class ConvertCommand(LibraryCommand):
         targets = []
         if scope != library and scope.parent != library:
             # Game-level scope
-            try:
-                dir_files = [f for f in scope.iterdir() if f.is_file()]
-            except PermissionError:
-                dir_files = []
-            has_source = has_chd = False
-            for f in dir_files:
-                ext = f.suffix.lower()
-                if ext in _CHD_SOURCE_EXTS:
-                    has_source = True
-                elif ext == '.chd':
-                    has_chd = True
-                if has_source and has_chd:
-                    break
-            if has_source and not has_chd:
+            if _is_chd_candidate(scope):
                 targets.append(scope)
             else:
                 try:
@@ -195,20 +197,7 @@ class ConvertCommand(LibraryCommand):
                 except PermissionError:
                     subdirs = []
                 for sub in subdirs:
-                    try:
-                        sub_files = [f for f in sub.iterdir() if f.is_file()]
-                    except PermissionError:
-                        continue
-                    s_src = s_chd = False
-                    for f in sub_files:
-                        ext = f.suffix.lower()
-                        if ext in _CHD_SOURCE_EXTS:
-                            s_src = True
-                        elif ext == '.chd':
-                            s_chd = True
-                        if s_src and s_chd:
-                            break
-                    if s_src and not s_chd:
+                    if _is_chd_candidate(sub):
                         targets.append(sub)
         else:
             for _, game_dir, status in app._walk_library_game_dirs(library, op.lib_status):
@@ -216,20 +205,7 @@ class ConvertCommand(LibraryCommand):
                     continue
                 if status == "corrupted":
                     continue
-                try:
-                    dir_files = [f for f in game_dir.iterdir() if f.is_file()]
-                except PermissionError:
-                    continue
-                has_source = has_chd = False
-                for f in dir_files:
-                    ext = f.suffix.lower()
-                    if ext in _CHD_SOURCE_EXTS:
-                        has_source = True
-                    elif ext == '.chd':
-                        has_chd = True
-                    if has_source and has_chd:
-                        break
-                if has_source and not has_chd:
+                if _is_chd_candidate(game_dir):
                     targets.append(game_dir)
 
         total_ops = len(targets)
@@ -282,10 +258,13 @@ class DatAuditCommand(LibraryCommand):
 
         # Phase 1: discover console dirs
         if scope == library:
-            console_dirs = sorted(
-                d for d in library.iterdir()
-                if d.is_dir() and not d.name.startswith('.')
-            )
+            try:
+                console_dirs = sorted(
+                    d for d in library.iterdir()
+                    if d.is_dir() and not d.name.startswith('.')
+                )
+            except PermissionError:
+                console_dirs = []
         elif scope.parent == library:
             console_dirs = [scope] if scope.is_dir() else []
         else:
