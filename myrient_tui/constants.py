@@ -29,7 +29,7 @@ _PS2MDP_RELEASE_URL  = (
     f"{_PS2MDP_RELEASE_VERSION}/playstation-disc-burner-{_PS2MDP_RELEASE_VERSION}-x86_64.zip"
 )
 _PS2MDP_RELEASE_SHA256 = (
-    "fa862ff48f7979f9e20d30ace3af5bd1f11bfca04bfe1c354caf38a3ebaf2d5b"
+    "709e0fec97d1869fee3d055df23a8e2e531fc5012c0d025b662b9d214f8f581d"
 )
 
 # DAT search prefix overrides

@@ -23,6 +23,7 @@ class LibraryPane(Vertical):
                 yield Button("CHD→Orig", id="btn-lib-chd-to-orig", classes="lib-tb-btn")
                 yield Button("Refresh", id="btn-lib-refresh", classes="lib-tb-btn")
                 yield Button("PS2 Patch", id="btn-ps2-md-patch", classes="lib-tb-btn")
+                yield Button("PS2 Unpatch", id="btn-ps2-md-unpatch", classes="lib-tb-btn")
                 yield Button("Requeue ✗", id="btn-requeue-failed", classes="lib-tb-btn")
                 yield Button("Requeue Console", id="btn-requeue-console", classes="lib-tb-btn")
             # ── Library search ────────────────────────────────────────────

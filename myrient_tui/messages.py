@@ -78,7 +78,7 @@ class LibraryTreeReady(Message):
     """Carries the fully-built library structure to the main thread for Tree rendering."""
     __slots__ = ("structure", "library_path", "disk_usage")
 
-    def __init__(self, structure: dict[str, tuple[Path, list[tuple[Path, str, bool]]]], library_path: Path,
+    def __init__(self, structure: dict[str, tuple[Path, list[tuple[Path, str, bool, bool]]]], library_path: Path,
                  disk_usage: dict[str, int] | None = None):
         self.structure = structure
         self.library_path = library_path

@@ -444,7 +444,17 @@ class MyrientTUI(App):
             ]
         else:
             scope_label = scope_path.name
-            game_dirs = [scope_path]
+            # If scope is a multi-disc grouping folder (no game files itself,
+            # but contains disc subdirs), expand to the individual disc dirs.
+            try:
+                disc_subdirs = sorted(
+                    (d for d in scope_path.iterdir()
+                     if d.is_dir() and DISC_REGEX.search(d.name)),
+                    key=lambda d: d.name,
+                )
+            except (PermissionError, OSError):
+                disc_subdirs = []
+            game_dirs = disc_subdirs if disc_subdirs else [scope_path]
 
         if not game_dirs:
             self.post_message(SystemLog(
@@ -540,6 +550,171 @@ class MyrientTUI(App):
             f"[bold red]{failed}[/] failed.\n"
             "Images are patched in-place. Directories with a [dim]DVD_Sectors.Bin[/dim] "
             "file will be skipped on future runs."
+        ))
+
+    @work(exclusive=True, thread=True)
+    def run_ps2_master_disc_unpatch(self) -> None:
+        """Restore PS2 ISO/BIN images to their original pre-patched state.
+
+        Re-runs ps2_master on games that have a DVD_Sectors.Bin sidecar file.
+        ps2_master detects the sidecar and restores the original sectors, then
+        removes DVD_Sectors.Bin on success.
+        """
+        self._lib_cancel.clear()
+        ps2mdp = self.toolchain.ps2mdp_path or Toolchain.find_ps2mdp()
+        if not ps2mdp:
+            self.post_message(SystemLog(
+                "[bold red]ps2_master not found.[/bold red] "
+                "Run 'Setup PS2 Patcher' first.", True
+            ))
+            return
+
+        library = Path(self.state.settings["library_root"])
+        scope_path: Path = getattr(self, "_ps2mdp_target", library)
+
+        # ── Build the list of game dirs to process ───────────────────────────
+        if scope_path == library:
+            scope_label = "full library (PS2 only)"
+            ps2_console_dirs = {
+                d for d in library.iterdir()
+                if d.is_dir() and not d.name.startswith('.')
+                and "PlayStation 2" in d.name
+            }
+            game_dirs = [
+                gd
+                for _, gd, _ in self._walk_library_game_dirs(library, self._lib_status)
+                if any(gd.is_relative_to(d) for d in ps2_console_dirs)
+            ]
+        elif scope_path.parent == library:
+            scope_label = scope_path.name
+            game_dirs = [
+                gd for _, gd, _ in self._walk_library_game_dirs(library, self._lib_status)
+                if gd.is_relative_to(scope_path)
+            ]
+        else:
+            scope_label = scope_path.name
+            try:
+                disc_subdirs = sorted(
+                    (d for d in scope_path.iterdir()
+                     if d.is_dir() and DISC_REGEX.search(d.name)),
+                    key=lambda d: d.name,
+                )
+            except (PermissionError, OSError):
+                disc_subdirs = []
+            game_dirs = disc_subdirs if disc_subdirs else [scope_path]
+
+        # Filter to only dirs that have DVD_Sectors.Bin (i.e. previously patched)
+        game_dirs = [
+            gd for gd in game_dirs
+            if (gd / "DVD_Sectors.Bin").exists()
+        ]
+
+        if not game_dirs:
+            self.post_message(SystemLog(
+                f"PS2 Unpatch: No patched games found in [{scope_label}].\n"
+                "Only games with a [dim]DVD_Sectors.Bin[/dim] sidecar can be unpatched."
+            ))
+            return
+
+        self.post_message(SystemLog(
+            f"PS2 Unpatch: Restoring {len(game_dirs)} game dir(s) in [{scope_label}]…"
+        ))
+
+        restored = failed = 0
+        total = len(game_dirs)
+
+        for i, game_dir in enumerate(game_dirs, 1):
+            if self._lib_cancel.is_set():
+                self.post_message(SystemLog("[yellow]PS2 unpatch cancelled.[/]"))
+                break
+
+            self.post_message(LibraryProgress(
+                f"PS2 Unpatch ({i}/{total})", game_dir.name, i, total
+            ))
+
+            # Find the ISO/BIN that was patched
+            try:
+                candidates = [
+                    f for f in game_dir.iterdir()
+                    if f.is_file() and f.suffix.lower() in _PS2_PATCH_EXTS
+                ]
+            except PermissionError:
+                failed += 1
+                continue
+
+            if not candidates:
+                failed += 1
+                self.post_message(SystemLog(
+                    f"[red]PS2 Unpatch:[/red] No ISO/BIN found in "
+                    f"{_escape_markup(game_dir.name)} to restore.", True
+                ))
+                continue
+
+            for src_file in candidates:
+                if self._lib_cancel.is_set():
+                    break
+
+                self.post_message(SystemLog(
+                    f"PS2 Unpatch: Restoring [bold]{_escape_markup(src_file.name)}[/bold]…"
+                ))
+                try:
+                    proc = subprocess.Popen(
+                        [ps2mdp, str(src_file)],
+                        cwd=str(game_dir),
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    )
+                    self._register_process(proc)
+                    stdout_b, stderr_b = proc.communicate(timeout=300)
+                    self._unregister_process(proc)
+
+                    sidecar = game_dir / "DVD_Sectors.Bin"
+                    if proc.returncode == 0:
+                        # ps2_master should remove DVD_Sectors.Bin on restore;
+                        # if it didn't, clean up manually.
+                        if sidecar.exists():
+                            try:
+                                sidecar.unlink()
+                            except OSError:
+                                pass
+                        restored += 1
+                        self.post_message(SystemLog(
+                            f"[green]PS2 Unpatch: ✓ Restored[/green] "
+                            f"{_escape_markup(src_file.name)}"
+                        ))
+                    else:
+                        failed += 1
+                        err_msg = (stdout_b + stderr_b).decode(
+                            "utf-8", errors="replace"
+                        ).strip()
+                        self.post_message(SystemLog(
+                            f"[red]PS2 Unpatch: Failed[/red] for "
+                            f"{_escape_markup(src_file.name)} "
+                            f"(exit {proc.returncode}):\n"
+                            f"{_escape_markup(err_msg)}",
+                            True,
+                        ))
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                    self._unregister_process(proc)
+                    failed += 1
+                    self.post_message(SystemLog(
+                        f"[red]PS2 Unpatch: Timeout[/red] restoring "
+                        f"{_escape_markup(src_file.name)}", True
+                    ))
+                except Exception as e:
+                    failed += 1
+                    self.post_message(SystemLog(
+                        f"[red]PS2 Unpatch: Error[/red] restoring "
+                        f"{_escape_markup(src_file.name)}: "
+                        f"{_escape_markup(str(e))}", True
+                    ))
+
+        self.post_message(LibraryProgress("PS2 Unpatch", "Complete", total, total))
+        self.post_message(SystemLog(
+            f"PS2 Unpatch complete — "
+            f"[bold green]{restored}[/] restored, "
+            f"[bold red]{failed}[/] failed."
         ))
 
     @staticmethod
@@ -1006,7 +1181,8 @@ class MyrientTUI(App):
         parsed as markup tags.
         """
         def _game_label(name: str, status: str, has_chd: bool = False,
-                        region: str = "", revision: str = "") -> Text:
+                        region: str = "", revision: str = "",
+                        has_ps2_patch: bool = False) -> Text:
             t = Text(no_wrap=True, overflow="ellipsis")
             if status == "validated":
                 t.append("✓ ", style=_TREE_GREEN)
@@ -1026,6 +1202,9 @@ class MyrientTUI(App):
             if has_chd:
                 t.append(" │ ", style="dim #00ffbb")
                 t.append("CHD", style="dim #58a6ff")
+            if has_ps2_patch:
+                t.append(" │ ", style="dim #00ffbb")
+                t.append("PS2P", style="dim #f78166")
             return t
 
         def _console_label(name: str, n_ok: int, n_bad: int, n_inc: int,
@@ -1054,7 +1233,7 @@ class MyrientTUI(App):
             tree.root.label = root_label
 
             for console_name, (console_path, games) in message.structure.items():
-                counts = Counter(s for _, s, _ in games)
+                counts = Counter(s for _, s, _, _ in games)
                 n_ok  = counts["validated"]
                 n_bad = counts["corrupted"]
                 n_inc = counts["incomplete"]
@@ -1064,27 +1243,27 @@ class MyrientTUI(App):
                 # C6+A2: Group multi-disc games into inline labels
                 # Partition into disc entries (keyed by base name) and singles
                 # disc_groups values: (game_dir, status, disc_label_str, has_chd)
-                disc_groups: dict[str, list[tuple[Path, str, str, bool]]] = {}
-                singles: dict[str, tuple[Path, str, bool]] = {}
-                for game_dir, status, has_chd in games:
+                disc_groups: dict[str, list[tuple[Path, str, str, bool, bool]]] = {}
+                singles: dict[str, tuple[Path, str, bool, bool]] = {}
+                for game_dir, status, has_chd, has_ps2_patch in games:
                     m = DISC_REGEX.search(game_dir.name)
                     if m:
                         base = DISC_REGEX.sub('', game_dir.name).strip()
                         disc_label = m.group(0).strip()  # e.g. "(Disc 1)"
-                        disc_groups.setdefault(base, []).append((game_dir, status, disc_label, has_chd))
+                        disc_groups.setdefault(base, []).append((game_dir, status, disc_label, has_chd, has_ps2_patch))
                     else:
-                        singles[game_dir.name] = (game_dir, status, has_chd)
+                        singles[game_dir.name] = (game_dir, status, has_chd, has_ps2_patch)
 
                 # Build unified sorted list: (sort_key, label, data_path)
                 tree_entries: list[tuple[str, Text, Path]] = []
 
-                for name, (game_dir, status, has_chd) in singles.items():
+                for name, (game_dir, status, has_chd, has_ps2_patch) in singles.items():
                     if name in disc_groups:
                         continue  # rendered as disc group instead
                     clean = normalize_game_title(name)
                     region = extract_region(name)
                     revision = extract_revision(name)
-                    tree_entries.append((clean.lower(), _game_label(clean, status, has_chd, region, revision), game_dir))
+                    tree_entries.append((clean.lower(), _game_label(clean, status, has_chd, region, revision, has_ps2_patch), game_dir))
 
                 for base_name, discs in disc_groups.items():
                     clean_base = normalize_game_title(base_name)
@@ -1093,7 +1272,7 @@ class MyrientTUI(App):
                     discs.sort(key=lambda d: d[2])  # sort by disc label
                     t = Text(no_wrap=True, overflow="ellipsis")
                     # Aggregate status for leading icon + game name
-                    statuses = {s for _, s, _, _ in discs}
+                    statuses = {s for _, s, _, _, _ in discs}
                     if statuses == {"validated"}:
                         t.append("✓ ", style=_TREE_GREEN)
                         t.append(clean_base, style=_TREE_GREEN)
@@ -1112,14 +1291,19 @@ class MyrientTUI(App):
                         t.append(" │ ", style="dim #00ffbb")
                         t.append(revision, style="dim #e0a458")
                     # CHD indicator if any disc is in CHD format
-                    any_chd = any(c for _, _, _, c in discs)
+                    any_chd = any(c for _, _, _, c, _ in discs)
                     if any_chd:
                         t.append(" │ ", style="dim #00ffbb")
                         t.append("CHD", style="dim #58a6ff")
+                    # PS2 patch indicator if any disc is patched
+                    any_ps2_patch = any(p for _, _, _, _, p in discs)
+                    if any_ps2_patch:
+                        t.append(" │ ", style="dim #00ffbb")
+                        t.append("PS2P", style="dim #f78166")
                     # Dim pipe separator before per-disc status
                     t.append(" │ ", style="dim #00ffbb")
                     # Per-disc status: dim grey number + small colored icon
-                    for i, (_, st, dlbl, _) in enumerate(discs):
+                    for i, (_, st, dlbl, _, _) in enumerate(discs):
                         num_m = re.search(r'\d+', dlbl)
                         dnum = num_m.group(0) if num_m else dlbl
                         if i > 0:
@@ -1163,7 +1347,7 @@ class MyrientTUI(App):
 
             # Update merged summary bar
             try:
-                all_statuses = [s for _, games in message.structure.values() for _, s, _ in games]
+                all_statuses = [s for _, games in message.structure.values() for _, s, _, _ in games]
                 total_ok  = all_statuses.count("validated")
                 total_bad = all_statuses.count("corrupted")
                 total_inc = all_statuses.count("incomplete")
@@ -1299,6 +1483,7 @@ class MyrientTUI(App):
             "btn-lib-chd-to-orig":    {"root", "console", "game"},
             "btn-lib-refresh":        {"root"},
             "btn-ps2-md-patch":       {"console", "game"},
+            "btn-ps2-md-unpatch":     {"console", "game"},
             "btn-requeue-failed":     {"root"},
             "btn-requeue-console":    {"console"},
         }
@@ -2383,7 +2568,7 @@ class MyrientTUI(App):
             self.requeue_console_games(console_path.name, console_path)
 
         elif button_id in ("btn-lib-convert", "btn-lib-chd-to-orig", "btn-ps2-md-patch",
-                           "btn-lib-dat-audit"):
+                           "btn-ps2-md-unpatch", "btn-lib-dat-audit"):
             # All scoped operations use the tree cursor when one is selected,
             # or fall back to the full library when nothing is highlighted.
             tree = self.query_one("#lib-tree", Tree)
@@ -2410,6 +2595,9 @@ class MyrientTUI(App):
             elif button_id == "btn-ps2-md-patch":
                 self._ps2mdp_target = scope
                 self.run_ps2_master_disc_patch()
+            elif button_id == "btn-ps2-md-unpatch":
+                self._ps2mdp_target = scope
+                self.run_ps2_master_disc_unpatch()
 
 
 
@@ -4410,22 +4598,25 @@ class MyrientTUI(App):
         library = Path(self.state.settings['library_root'])
         self.post_message(LibraryProgress("Library Scan", "Scanning…", 0, 1))
 
-        # structure: {console_name: (console_path, [(game_dir, status_str, has_chd), ...])}
-        structure: dict[str, tuple[Path, list[tuple[Path, str, bool]]]] = {}
+        # structure: {console_name: (console_path, [(game_dir, status_str, has_chd, has_ps2_patch), ...])}
+        structure: dict[str, tuple[Path, list[tuple[Path, str, bool, bool]]]] = {}
         for console_name, game_dir, status in self._walk_library_game_dirs(library, self._lib_status):
-            # Detect .chd files — lightweight suffix check on already-listed dir
+            # Detect .chd files and PS2 patch sidecar — lightweight checks on already-listed dir
             try:
-                has_chd = any(f.suffix.lower() == '.chd' for f in game_dir.iterdir() if f.is_file())
+                dir_files = [f for f in game_dir.iterdir() if f.is_file()]
+                has_chd = any(f.suffix.lower() == '.chd' for f in dir_files)
+                has_ps2_patch = any(f.name == 'DVD_Sectors.Bin' for f in dir_files)
             except PermissionError:
                 has_chd = False
+                has_ps2_patch = False
             if console_name not in structure:
                 structure[console_name] = (library / console_name, [])
-            structure[console_name][1].append((game_dir, status, has_chd))
+            structure[console_name][1].append((game_dir, status, has_chd, has_ps2_patch))
 
         # F3: Build set of validated game directory names for browser indicator
         validated_names: set[str] = set()
         for _cname, (_cpath, games_list) in structure.items():
-            for game_dir, status, _has_chd in games_list:
+            for game_dir, status, _has_chd, _has_patch in games_list:
                 if status == "validated":
                     validated_names.add(game_dir.name)
         self.call_from_thread(setattr, self, "_library_game_names", validated_names)
