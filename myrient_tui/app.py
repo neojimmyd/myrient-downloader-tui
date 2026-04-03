@@ -19,6 +19,7 @@ import urllib.parse
 import urllib.request
 from urllib.parse import quote, unquote, urljoin
 import uuid
+import zipfile
 import xml.etree.ElementTree as ET
 from collections import Counter, deque
 from pathlib import Path
@@ -42,7 +43,7 @@ from panes import BrowsePane, DownloadsPane, GameSearchInput, LibraryPane, Setti
 
 from .constants import (
     _CHD_TIMEOUT, _DATA_DIR,
-    _DAT_AUDITABLE_EXTS, _DAT_INDEX_STRAINER, _DAT_SEARCH_PREFIXES,
+    _DAT_AUDITABLE_EXTS, _DAT_SEARCH_PREFIXES,
     _DOWNLOAD_EXTS, _FLUSH_INTERVAL, _GAME_EXTS, _HASH_CHUNK_BYTES,
     _LOW_PRIO_POPEN, _OS, _PROGRESS_DONE_STATES, _PS2_PATCH_EXTS,
     _SCRAPE_CONCURRENCY, _SEARCH_DEBOUNCE,
@@ -114,7 +115,7 @@ class MyrientTUI(App):
         self._all_games_data:    list[GameItem] = []
         self._games_lookup:      dict[str, GameItem] = {}
 
-        self.selected_console: dict[str, str] | None = None
+        self.selected_console: ConsoleItem | None = None
 
         self.proc_lock      = threading.Lock()
         self.active_processes: set[subprocess.Popen] = set()
@@ -154,7 +155,7 @@ class MyrientTUI(App):
         # IGDB ratings state
         self._ratings_provider: RatingsProvider | None = None
         self._ratings_cancel = threading.Event()
-        self._game_metadata: dict[str, dict] = {}   # clean_name → GameMetadata
+        self._game_metadata: dict[str, Any] = {}   # clean_name → GameMetadata
         self._browse_sort_key: str = "name"          # "name" | "rating" | "popularity" | "size"
         self._browse_sort_reverse: bool = False
         self._browse_active_tags: set[str] = set()
@@ -513,7 +514,17 @@ class MyrientTUI(App):
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     )
                     self._register_process(proc)
-                    stdout_b, stderr_b = proc.communicate(timeout=300)
+                    try:
+                        stdout_b, stderr_b = proc.communicate(timeout=300)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                        self._unregister_process(proc)
+                        failed += 1
+                        self.post_message(SystemLog(
+                            f"[red]PS2 MD: Timeout[/red] patching {_escape_markup(src_file.name)}", True
+                        ))
+                        continue
                     self._unregister_process(proc)
 
                     if proc.returncode == 0:
@@ -529,14 +540,6 @@ class MyrientTUI(App):
                             f"(exit {proc.returncode}):\n{_escape_markup(err_msg)}",
                             True,
                         ))
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()            # reap zombie to avoid resource leak
-                    self._unregister_process(proc)
-                    failed += 1
-                    self.post_message(SystemLog(
-                        f"[red]PS2 MD: Timeout[/red] patching {_escape_markup(src_file.name)}", True
-                    ))
                 except Exception as e:
                     failed += 1
                     self.post_message(SystemLog(
@@ -665,7 +668,18 @@ class MyrientTUI(App):
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     )
                     self._register_process(proc)
-                    stdout_b, stderr_b = proc.communicate(timeout=300)
+                    try:
+                        stdout_b, stderr_b = proc.communicate(timeout=300)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                        self._unregister_process(proc)
+                        failed += 1
+                        self.post_message(SystemLog(
+                            f"[red]PS2 Unpatch: Timeout[/red] restoring "
+                            f"{_escape_markup(src_file.name)}", True
+                        ))
+                        continue
                     self._unregister_process(proc)
 
                     sidecar = game_dir / "DVD_Sectors.Bin"
@@ -694,15 +708,6 @@ class MyrientTUI(App):
                             f"{_escape_markup(err_msg)}",
                             True,
                         ))
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-                    self._unregister_process(proc)
-                    failed += 1
-                    self.post_message(SystemLog(
-                        f"[red]PS2 Unpatch: Timeout[/red] restoring "
-                        f"{_escape_markup(src_file.name)}", True
-                    ))
                 except Exception as e:
                     failed += 1
                     self.post_message(SystemLog(
@@ -946,7 +951,7 @@ class MyrientTUI(App):
             return  # let the digit go to the input widget
         self._nav_switch(pane_id)
 
-    def on_resize(self, event) -> None:
+    def on_resize(self, _event: Any) -> None:
         """Adjust layouts when terminal size changes."""
         try:
             grid = self.query_one("#progress-grid", Container)
@@ -2275,7 +2280,7 @@ class MyrientTUI(App):
         active_tags = self._browse_active_tags
 
         # Build filtered list of (game, clean_name, display_name, spans)
-        filtered: list[tuple[dict, str, str, list | None]] = []
+        filtered: list[tuple[GameItem, str, str, list[tuple[int, int]] | None]] = []
         for game in self._all_games_data:
             name = game["name"]
             clean_name = normalize_game_title(name)
@@ -2822,7 +2827,7 @@ class MyrientTUI(App):
                 added = 0
                 for item in imported:
                     if isinstance(item, dict) and item.get("id") not in existing_ids:
-                        current.append(item)
+                        current.append(item)  # type: ignore[arg-type]  # JSON dict → QueueItem
                         existing_ids.add(item["id"])
                         added += 1
                 if added:
@@ -3846,24 +3851,42 @@ class MyrientTUI(App):
         try:
             try:
                 index_html = subprocess.check_output(
-                    ["wget", "-qO-", self._active_dat_url],
-                    text=True, errors="ignore", timeout=30,
+                    ["wget", "-qO-", "--timeout=120", self._active_dat_url],
+                    text=True, errors="ignore", timeout=180,
                 )
             except Exception:
                 req = urllib.request.Request(
                     self._active_dat_url,
                     headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
                 )
-                with urllib.request.urlopen(req, timeout=60) as res:
+                with urllib.request.urlopen(req, timeout=120) as res:
                     index_html = res.read().decode('utf-8', errors='ignore')
 
-            soup = BeautifulSoup(index_html, 'html.parser', parse_only=_DAT_INDEX_STRAINER)
+            soup = BeautifulSoup(index_html, 'html.parser')
             dat_index: dict[str, str] = {}
-            for a_tag in soup.find_all('a'):
-                href = a_tag.get('href', '')
-                name = unquote(href)
-                if name.endswith('.dat'):
-                    dat_index[name] = href
+
+            # Redump.org table format: <tr><td>System Name</td>...<a href="/datfile/xxx/">...</tr>
+            for row in soup.find_all('tr'):
+                cells = row.find_all('td')
+                if len(cells) < 2:
+                    continue
+                system_name = cells[0].get_text(strip=True)
+                if not system_name:
+                    continue
+                for a_tag in row.find_all('a'):
+                    href = str(a_tag.get('href', ''))
+                    if '/datfile/' in href and '-bios' not in href:
+                        dat_index[system_name] = href
+                        break
+
+            # Myrient-style fallback: bare .dat file links
+            if not dat_index:
+                for a_tag in soup.find_all('a'):
+                    href = str(a_tag.get('href', ''))
+                    name = unquote(href)
+                    if name.endswith('.dat'):
+                        dat_index[name] = href
+
             return dat_index
         except Exception as err:
             op.log(f"DAT Audit: Failed to fetch DAT index: {err}", True)
@@ -3879,8 +3902,10 @@ class MyrientTUI(App):
         Returns the local path to the cached DAT, or ``None`` if unavailable.
         """
         standard_prefix = f"{console_name} - Datfile"
+        # Redump.org uses "Sony PlayStation 2", myrient uses "Sony - PlayStation 2"
+        normalized_name = console_name.replace(" - ", " ", 1)
         extra_prefixes = _DAT_SEARCH_PREFIXES.get(console_name, [])
-        prefixes_to_try = [standard_prefix] + extra_prefixes
+        prefixes_to_try = [standard_prefix, console_name, normalized_name] + extra_prefixes
 
         dat_href: str | None = None
         matched_prefix: str = ""
@@ -3910,11 +3935,18 @@ class MyrientTUI(App):
         # Download if not cached or stale
         dat_dir = DAT_CACHE_DIR / console_name
         dat_dir.mkdir(parents=True, exist_ok=True)
+
+        # Locate existing cached .dat file in this console's cache dir
         dat_filename = Path(unquote(dat_href)).name
-        dat_path = dat_dir / dat_filename
+        if dat_filename.endswith('.dat'):
+            dat_path: Path | None = dat_dir / dat_filename
+        else:
+            # Redump.org-style: href is like /datfile/ps2/ — find cached .dat
+            existing = list(dat_dir.glob('*.dat'))
+            dat_path = existing[0] if existing else None
 
         _dat_is_stale = False
-        if dat_path.exists():
+        if dat_path and dat_path.exists():
             try:
                 age = time.time() - dat_path.stat().st_mtime
                 if age > dat_ttl:
@@ -3926,18 +3958,17 @@ class MyrientTUI(App):
             except OSError:
                 pass
 
-        if not dat_path.exists() or _dat_is_stale:
+        if dat_path is None or not dat_path.exists() or _dat_is_stale:
             dat_url = urljoin(self._active_dat_url, dat_href)
             op.log(f"DAT Audit [{console_name}]: Downloading DAT...")
-            dat_tmp = dat_path.with_suffix('.tmp')
+            dat_tmp = dat_dir / "download.tmp"
             try:
                 proc = subprocess.run(
-                    ["wget", "-q", "-O", str(dat_tmp), dat_url],
-                    timeout=120,
+                    ["wget", "-q", "--timeout=120", "-O", str(dat_tmp), dat_url],
+                    timeout=180,
                 )
                 if proc.returncode != 0:
                     raise RuntimeError("wget failed")
-                dat_tmp.replace(dat_path)
             except Exception:
                 dat_tmp.unlink(missing_ok=True)
                 try:
@@ -3945,15 +3976,37 @@ class MyrientTUI(App):
                         dat_url,
                         headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
                     )
-                    with urllib.request.urlopen(req, timeout=30) as res, open(dat_tmp, 'wb') as f:
+                    with urllib.request.urlopen(req, timeout=120) as res, open(dat_tmp, 'wb') as f:
                         shutil.copyfileobj(res, f)
-                    dat_tmp.replace(dat_path)
                 except Exception as err:
                     dat_tmp.unlink(missing_ok=True)
                     op.log(
                         f"DAT Audit [{console_name}]: Could not download DAT: {err}", True
                     )
                     return None
+
+            # Handle ZIP archives (e.g. redump.org serves DATs inside ZIPs)
+            if dat_tmp.exists() and zipfile.is_zipfile(dat_tmp):
+                try:
+                    with zipfile.ZipFile(dat_tmp) as zf:
+                        dat_names = [n for n in zf.namelist() if n.endswith('.dat')]
+                        if not dat_names:
+                            dat_tmp.unlink(missing_ok=True)
+                            op.log(f"DAT Audit [{console_name}]: ZIP contains no .dat file", True)
+                            return None
+                        dat_data = zf.read(dat_names[0])
+                    dat_tmp.unlink(missing_ok=True)
+                    dat_path = dat_dir / dat_names[0]
+                    dat_path.write_bytes(dat_data)
+                except Exception as err:
+                    dat_tmp.unlink(missing_ok=True)
+                    op.log(f"DAT Audit [{console_name}]: Failed to extract DAT from ZIP: {err}", True)
+                    return None
+            else:
+                # Plain .dat download — use href-derived filename
+                if dat_path is None:
+                    dat_path = dat_dir / dat_filename
+                dat_tmp.replace(dat_path)
 
         return dat_path
 
@@ -4314,10 +4367,10 @@ class MyrientTUI(App):
             for subcommand, output_suffix in [("extractcd", ".cue"), ("extracthd", ".iso")]:
                 original_cue = chd_path.with_suffix(".cue")
                 has_preserved_cue = subcommand == "extractcd" and original_cue.exists()
+                tmp_cue = chd_path.with_suffix(".cue.tmp")
 
                 if has_preserved_cue:
                     # Extract to a temp .cue so the original is not overwritten
-                    tmp_cue = chd_path.with_suffix(".cue.tmp")
                     output_file = tmp_cue
                 else:
                     output_file = chd_path.with_suffix(output_suffix)
@@ -4335,7 +4388,7 @@ class MyrientTUI(App):
                     )
                     self._register_process(proc)
                     try:
-                        _, err_out = proc.communicate(timeout=_CHD_TIMEOUT)
+                        _, _err_out = proc.communicate(timeout=_CHD_TIMEOUT)
                     except subprocess.TimeoutExpired:
                         proc.kill()
                         proc.wait()
@@ -4521,7 +4574,7 @@ class MyrientTUI(App):
         app_ref = self   # capture for closure
 
         class _Handler(_FSEventHandler):  # type: ignore[misc]
-            def on_any_event(self, event: Any) -> None:  # noqa: ANN001
+            def on_any_event(self, _event: Any) -> None:  # noqa: ANN001
                 app_ref.post_message(LibraryWatchEvent())
 
         observer = _WatchdogObserver()   # type: ignore[misc]
@@ -4867,8 +4920,8 @@ class MyrientTUI(App):
 
         # F3: Build set of validated game directory names for browser indicator
         validated_names: set[str] = set()
-        for _cname, (_cpath, games_list) in structure.items():
-            for game_dir, status, _has_chd, _has_patch in games_list:
+        for _, (_, games_list) in structure.items():
+            for game_dir, status, _, _ in games_list:
                 if status == "validated":
                     validated_names.add(game_dir.name)
         self.call_from_thread(setattr, self, "_library_game_names", validated_names)
@@ -5209,7 +5262,7 @@ class MyrientTUI(App):
                     if self._fuzzy_spans(query, g["name"]) is not None:
                         # B10: Pre-compute the full game URL using urljoin
                         # so _add_selected_to_queue doesn't double-encode.
-                        g["game_url"] = urljoin(url, g["url_part"])
+                        g["game_url"] = urljoin(url, g["url_part"])  # type: ignore[assignment]
                         with lock:
                             results.append((console["name"].strip('/'), g))  # type: ignore[arg-type]
 

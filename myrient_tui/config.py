@@ -36,7 +36,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "favorite_consoles": [],        # pinned console names shown at top of browse list
     # Runtime-editable download sources (replaces hard-coded _COLLECTIONS)
     "sources": [
-        {"name": "Redump",   "browse_url": "https://myrient.erista.me/files/Redump/",   "dat_url": "https://myrient.erista.me/dats/Redump/"},
+        {"name": "Redump",   "browse_url": "https://myrient.erista.me/files/Redump/",   "dat_url": "http://redump.org/downloads/"},
         {"name": "No-Intro", "browse_url": "https://myrient.erista.me/files/No-Intro/", "dat_url": "https://myrient.erista.me/dats/No-Intro/"},
     ],
     "active_source": "Redump",

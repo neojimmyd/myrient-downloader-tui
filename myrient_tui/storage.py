@@ -334,7 +334,7 @@ class SQLiteStorage:
         conn.execute("DELETE FROM queue_items WHERE id=?", (item_id,))
         conn.commit()
 
-    def replace_queue(self, queue_name: str, items: list[dict[str, Any]]) -> None:
+    def replace_queue(self, queue_name: str, items: list[Any]) -> None:
         """Replace all items in a queue (bulk update — used for reordering etc.)."""
         conn = self._conn()
         conn.execute("DELETE FROM queue_items WHERE queue=?", (queue_name,))

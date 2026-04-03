@@ -1,7 +1,7 @@
 """Strongly-typed data structures used throughout Myrient TUI."""
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 from textual.widgets import ListItem
 
@@ -15,9 +15,10 @@ class ConsoleItem(TypedDict):
 
 class GameItem(TypedDict):
     """One row returned by a Myrient console-page scrape."""
-    name:     str   # decoded filename, e.g. "Ico (USA).zip"
-    url_part: str   # percent-encoded href fragment
-    size_str: str   # human-readable size, e.g. "2.3GB"
+    name:     str                  # decoded filename, e.g. "Ico (USA).zip"
+    url_part: str                  # percent-encoded href fragment
+    size_str: str                  # human-readable size, e.g. "2.3GB"
+    game_url: NotRequired[str]     # pre-computed full URL (set by global search)
 
 
 class QueueItem(TypedDict):
