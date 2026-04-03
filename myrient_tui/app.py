@@ -27,7 +27,7 @@ from typing import Any, Iterator
 from bs4 import BeautifulSoup
 from rich.markup import escape as _escape_markup
 from rich.text import Text
-from textual import events, on, work
+from textual import on, work
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical
 from textual.events import Key
@@ -66,7 +66,7 @@ from .download import DownloadWorker, EngineState, TokenBucket
 from .library_ops import LibraryOperation
 from .commands import LibraryCommand, OrganizeCommand, RefreshCommand, ConvertCommand, DatAuditCommand
 from .utils import normalize_game_title, normalize_game_title_keep_disc, strip_extension, extract_region, extract_revision
-from .modals import ConfirmDeleteScreen, ConfirmDownloadScreen, HelpModal
+from .modals import ConfirmActionScreen, ConfirmDownloadScreen, HelpModal
 
 # ── Optional watchdog import for filesystem watch mode ───────────────────────
 try:
@@ -217,10 +217,11 @@ class MyrientTUI(App):
         # N6: Queue range selection — last toggled index
         self._last_queue_selected_idx: int = -1
 
-        # N1: Library search
-        self._lib_search_timer: Timer | None = None
-        self._lib_search_text: str = ""
+        # Library tree state
         self._last_lib_tree_data: LibraryTreeReady | None = None
+        self._lib_selected_paths: set[Path] = set()
+        self._lib_cursor_path: Path | None = None
+        self._lib_base_labels: dict[Path | None, Text] = {}  # None = root
 
         # F3: In-library path set (populated on library scan)
         self._library_game_names: set[str] = set()
@@ -797,7 +798,7 @@ class MyrientTUI(App):
                 tbl.add_row(Text(" ", style="dim"), Text(label, style="dim"), key=value)
 
         # Initial toolbar state — show root-level operations
-        self._update_lib_toolbar(None)
+        self._update_lib_toolbar()
 
         # Hide IGDB sort/tag rows until credentials are configured
         self._update_igdb_ui_visibility()
@@ -1180,6 +1181,8 @@ class MyrientTUI(App):
         brackets in game/console names (e.g. [USA], [SLES-00867]) are NEVER
         parsed as markup tags.
         """
+        sel = self._lib_selected_paths
+
         def _game_label(name: str, status: str, has_chd: bool = False,
                         region: str = "", revision: str = "",
                         has_ps2_patch: bool = False) -> Text:
@@ -1222,15 +1225,20 @@ class MyrientTUI(App):
             return t
 
         self._last_lib_tree_data = message
-        search_text = self._lib_search_text
 
         try:
             tree = self.query_one("#lib-tree", Tree)
+            # Save cursor position before rebuild
+            cursor_node = tree.cursor_node
+            if cursor_node and isinstance(getattr(cursor_node, "data", None), Path):
+                self._lib_cursor_path = cursor_node.data
             tree.clear()
+            self._lib_base_labels = {}
             library = message.library_path
             root_name = library.name if library.exists() else "Library"
-            root_label = Text(root_name, style=f"bold {_TREE_AMBER}", no_wrap=True)
-            tree.root.label = root_label
+            root_base = Text(root_name, style=f"bold {_TREE_AMBER}", no_wrap=True)
+            self._lib_base_labels[None] = root_base
+            tree.root.label = root_base
 
             for console_name, (console_path, games) in message.structure.items():
                 counts = Counter(s for _, s, _, _ in games)
@@ -1263,74 +1271,90 @@ class MyrientTUI(App):
                     clean = normalize_game_title(name)
                     region = extract_region(name)
                     revision = extract_revision(name)
-                    tree_entries.append((clean.lower(), _game_label(clean, status, has_chd, region, revision, has_ps2_patch), game_dir))
+                    base_lbl = _game_label(clean, status, has_chd, region, revision, has_ps2_patch)
+                    self._lib_base_labels[game_dir] = base_lbl
+                    display = Text(no_wrap=True, overflow="ellipsis")
+                    if game_dir in sel:
+                        display.append("● ", style="bold cyan")
+                    display.append_text(base_lbl)
+                    tree_entries.append((clean.lower(), display, game_dir))
 
                 for base_name, discs in disc_groups.items():
                     clean_base = normalize_game_title(base_name)
                     region = extract_region(base_name)
                     revision = extract_revision(base_name)
                     discs.sort(key=lambda d: d[2])  # sort by disc label
-                    t = Text(no_wrap=True, overflow="ellipsis")
+                    group_path = discs[0][0].parent
+                    base_lbl = Text(no_wrap=True, overflow="ellipsis")
                     # Aggregate status for leading icon + game name
                     statuses = {s for _, s, _, _, _ in discs}
                     if statuses == {"validated"}:
-                        t.append("✓ ", style=_TREE_GREEN)
-                        t.append(clean_base, style=_TREE_GREEN)
+                        base_lbl.append("✓ ", style=_TREE_GREEN)
+                        base_lbl.append(clean_base, style=_TREE_GREEN)
                     elif "corrupted" in statuses:
-                        t.append("✗ ", style=_TREE_RED)
-                        t.append(clean_base, style=_TREE_RED)
+                        base_lbl.append("✗ ", style=_TREE_RED)
+                        base_lbl.append(clean_base, style=_TREE_RED)
                     else:
-                        t.append("~ ", style=_TREE_YELLOW)
-                        t.append(clean_base, style=_TREE_YELLOW)
+                        base_lbl.append("~ ", style=_TREE_YELLOW)
+                        base_lbl.append(clean_base, style=_TREE_YELLOW)
                     # Region tag
                     if region:
-                        t.append(" │ ", style="dim #00ffbb")
-                        t.append(f"({region})", style="dim #d2a8ff")
+                        base_lbl.append(" │ ", style="dim #00ffbb")
+                        base_lbl.append(f"({region})", style="dim #d2a8ff")
                     # Revision tag
                     if revision:
-                        t.append(" │ ", style="dim #00ffbb")
-                        t.append(revision, style="dim #e0a458")
+                        base_lbl.append(" │ ", style="dim #00ffbb")
+                        base_lbl.append(revision, style="dim #e0a458")
                     # CHD indicator if any disc is in CHD format
                     any_chd = any(c for _, _, _, c, _ in discs)
                     if any_chd:
-                        t.append(" │ ", style="dim #00ffbb")
-                        t.append("CHD", style="dim #58a6ff")
+                        base_lbl.append(" │ ", style="dim #00ffbb")
+                        base_lbl.append("CHD", style="dim #58a6ff")
                     # PS2 patch indicator if any disc is patched
                     any_ps2_patch = any(p for _, _, _, _, p in discs)
                     if any_ps2_patch:
-                        t.append(" │ ", style="dim #00ffbb")
-                        t.append("PS2P", style="dim #f78166")
+                        base_lbl.append(" │ ", style="dim #00ffbb")
+                        base_lbl.append("PS2P", style="dim #f78166")
                     # Dim pipe separator before per-disc status
-                    t.append(" │ ", style="dim #00ffbb")
+                    base_lbl.append(" │ ", style="dim #00ffbb")
                     # Per-disc status: dim grey number + small colored icon
                     for i, (_, st, dlbl, _, _) in enumerate(discs):
                         num_m = re.search(r'\d+', dlbl)
                         dnum = num_m.group(0) if num_m else dlbl
                         if i > 0:
-                            t.append(" ", style="dim")
-                        t.append(f"({dnum})", style="dim #6e7681")
+                            base_lbl.append(" ", style="dim")
+                        base_lbl.append(f"({dnum})", style="dim #6e7681")
                         if st == "validated":
-                            t.append("✓", style="dim green")
+                            base_lbl.append("✓", style="dim green")
                         elif st == "corrupted":
-                            t.append("✗", style="dim red")
+                            base_lbl.append("✗", style="dim red")
                         else:
-                            t.append("~", style="dim yellow")
-                    group_path = discs[0][0].parent
-                    tree_entries.append((clean_base.lower(), t, group_path))
+                            base_lbl.append("~", style="dim yellow")
+                    self._lib_base_labels[group_path] = base_lbl
+                    display = Text(no_wrap=True, overflow="ellipsis")
+                    if group_path in sel:
+                        display.append("● ", style="bold cyan")
+                    display.append_text(base_lbl)
+                    tree_entries.append((clean_base.lower(), display, group_path))
 
-                # N1: Filter by library search text
-                if search_text:
-                    tree_entries = [
-                        e for e in tree_entries if search_text in e[0]
-                    ]
-                    # Skip entire console if no games match and console name doesn't match
-                    if not tree_entries and search_text not in console_name.lower():
-                        continue
+                # Compute console selection marker
+                console_game_paths = {e[2] for e in tree_entries}
+                if console_game_paths and console_game_paths <= sel:
+                    c_sel_marker = "all"
+                elif console_game_paths & sel:
+                    c_sel_marker = "some"
+                else:
+                    c_sel_marker = ""
 
-                console_node = tree.root.add(
-                    _console_label(console_name, n_ok, n_bad, n_inc, disk_bytes),
-                    data=console_path,
-                )
+                c_base = _console_label(console_name, n_ok, n_bad, n_inc, disk_bytes)
+                self._lib_base_labels[console_path] = c_base
+                c_display = Text(no_wrap=True, overflow="ellipsis")
+                if c_sel_marker == "all":
+                    c_display.append("◉ ", style="bold cyan")
+                elif c_sel_marker == "some":
+                    c_display.append("◎ ", style="cyan")
+                c_display.append_text(c_base)
+                console_node = tree.root.add(c_display, data=console_path)
 
                 # Render all entries in alphabetical order
                 tree_entries.sort(key=lambda e: e[0])
@@ -1341,7 +1365,41 @@ class MyrientTUI(App):
                 no_games = Text("No consoles found — check library path in Settings", style=_TREE_DIM)
                 tree.root.add_leaf(no_games)
 
+            # Update root label with selection marker
+            all_game_paths = {
+                e.data for cn in tree.root.children for e in cn.children
+                if isinstance(getattr(e, "data", None), Path)
+            }
+            root_display = Text(no_wrap=True)
+            if all_game_paths and all_game_paths <= sel:
+                root_display.append("◉ ", style="bold cyan")
+            elif all_game_paths & sel:
+                root_display.append("◎ ", style="cyan")
+            root_display.append_text(self._lib_base_labels[None])
+            tree.root.set_label(root_display)
+
             tree.root.expand_all()
+
+            # Restore cursor position
+            if self._lib_cursor_path is not None:
+                target_node = None
+                for console_node in tree.root.children:
+                    if getattr(console_node, "data", None) == self._lib_cursor_path:
+                        target_node = console_node
+                        break
+                    for game_node in console_node.children:
+                        if getattr(game_node, "data", None) == self._lib_cursor_path:
+                            target_node = game_node
+                            break
+                    if target_node:
+                        break
+                if target_node is not None:
+                    # Use select_node if available, fall back to scroll_to_node
+                    if hasattr(tree, "select_node"):
+                        tree.select_node(target_node)
+                    elif hasattr(tree, "scroll_to_node"):
+                        tree.scroll_to_node(target_node)
+
             self.query_one("#lib-status-label", Label).update("[dim]Scan complete[/dim]")
             self.query_one("#lib-progress-bar", ProgressBar).display = False
 
@@ -1382,12 +1440,13 @@ class MyrientTUI(App):
                 logging.debug("Update lib summary bar failed: %s", e)
 
             # Reset toolbar to root-level operations
-            self._update_lib_toolbar(tree.root)
+            self._update_lib_toolbar()
+            self._update_lib_selection_status()
         except Exception as e:
             self._log(f"Tree build error: {e}", is_error=True)
 
-    def _filter_library_tree(self) -> None:
-        """Re-render the library tree applying the current search filter."""
+    def _rebuild_library_tree(self) -> None:
+        """Re-render the library tree from cached data."""
         if self._last_lib_tree_data is not None:
             self.on_library_tree_ready(self._last_lib_tree_data)
 
@@ -1397,17 +1456,17 @@ class MyrientTUI(App):
         """Update toolbar and status bar when the library tree cursor moves."""
         if event.control.id != "lib-tree":
             return
-        self._update_lib_toolbar(event.node)
-        self._update_lib_selection_status(event.node)
+        self._update_lib_toolbar()
+        self._update_lib_selection_status()
 
-    async def on_click(self, event: events.Click) -> None:
-        """Handle clicks on header label controls (library)."""
-        widget = event.widget
-        if not isinstance(widget, Label):
-            return
-        wid = widget.id or ""
-        if wid == "btn-lib-delete":
-            self._lib_delete_selected()
+    def on_tree_node_collapsed(self, event: Tree.NodeCollapsed) -> None:
+        """Prevent the root Library node from collapsing."""
+        try:
+            tree = self.query_one("#lib-tree", Tree)
+            if event.node == tree.root:
+                event.node.expand()
+        except Exception:
+            pass
 
     def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
         """Sort the game list when a column header is clicked."""
@@ -1465,46 +1524,310 @@ class MyrientTUI(App):
             if self.selected_console:
                 self.fetch_games(self.selected_console)
 
-    def _update_lib_toolbar(self, node: Any) -> None:
-        """Show/hide toolbar buttons based on tree selection context."""
+    # ── Multi-selection helpers ─────────────────────────────────────────
+
+    def _lib_get_target_paths(self) -> list[Path]:
+        """Return the selected library paths, sorted."""
+        return sorted(self._lib_selected_paths)
+
+    def _lib_get_all_game_paths(self) -> set[Path]:
+        """Collect all game-level Path objects from the current tree."""
+        paths: set[Path] = set()
+        try:
+            tree = self.query_one("#lib-tree", Tree)
+            for console_node in tree.root.children:
+                for game_node in console_node.children:
+                    if isinstance(game_node.data, Path):
+                        paths.add(game_node.data)
+        except Exception:
+            pass
+        return paths
+
+    def _lib_toggle_at_cursor(self) -> None:
+        """Toggle selection on the currently highlighted library tree node."""
+        try:
+            tree = self.query_one("#lib-tree", Tree)
+        except Exception:
+            return
+        node = tree.cursor_node
+        if node is None:
+            return
         library = Path(self.state.settings["library_root"])
-        node_path = getattr(node, "data", None) if node else None
+        node_path = getattr(node, "data", None)
 
-        if node_path is None or not isinstance(node_path, Path):
-            level = "root"
-        elif node_path == library or node_path.parent == library:
-            level = "console" if node_path != library else "root"
-        else:
-            level = "game"
+        if node == tree.root or (isinstance(node_path, Path) and node_path == library):
+            # Root — toggle all games
+            all_paths = self._lib_get_all_game_paths()
+            if all_paths and all_paths <= self._lib_selected_paths:
+                self._lib_selected_paths -= all_paths
+            else:
+                self._lib_selected_paths |= all_paths
+        elif isinstance(node_path, Path) and node_path.parent == library:
+            # Console node — toggle all games under this console
+            console_paths: set[Path] = set()
+            for child in node.children:
+                if isinstance(child.data, Path):
+                    console_paths.add(child.data)
+            if console_paths and console_paths <= self._lib_selected_paths:
+                self._lib_selected_paths -= console_paths
+            else:
+                self._lib_selected_paths |= console_paths
+        elif isinstance(node_path, Path):
+            # Game node — toggle individual path
+            # For multi-disc: use the node's data path directly (already the game dir)
+            if node_path in self._lib_selected_paths:
+                self._lib_selected_paths.discard(node_path)
+            else:
+                self._lib_selected_paths.add(node_path)
 
-        _vis: dict[str, set[str]] = {
-            "btn-lib-dat-audit":      {"root", "console"},
-            "btn-lib-convert":        {"root", "console", "game"},
-            "btn-lib-chd-to-orig":    {"root", "console", "game"},
-            "btn-lib-refresh":        {"root"},
-            "btn-ps2-md-patch":       {"console", "game"},
-            "btn-ps2-md-unpatch":     {"console", "game"},
-            "btn-requeue-failed":     {"root"},
-            "btn-requeue-console":    {"console"},
-        }
-        for btn_id, levels in _vis.items():
+        self._refresh_lib_tree_selection_visuals()
+        self._update_lib_toolbar()
+        self._update_lib_selection_status()
+
+    def _lib_clear_selection(self) -> None:
+        """Clear all library selections."""
+        self._lib_selected_paths.clear()
+        self._refresh_lib_tree_selection_visuals()
+        self._update_lib_toolbar()
+        self._update_lib_selection_status()
+
+    def _lib_select_all(self) -> None:
+        """Select all game paths across all consoles."""
+        self._lib_selected_paths = self._lib_get_all_game_paths()
+        self._refresh_lib_tree_selection_visuals()
+        self._update_lib_toolbar()
+        self._update_lib_selection_status()
+
+    def _refresh_lib_tree_selection_visuals(self) -> None:
+        """Update tree node labels in-place to reflect current selection state."""
+        try:
+            tree = self.query_one("#lib-tree", Tree)
+        except Exception:
+            return
+        sel = self._lib_selected_paths
+        all_game_paths: set[Path] = set()
+
+        for console_node in tree.root.children:
+            console_path = getattr(console_node, "data", None)
+            console_game_paths: set[Path] = set()
+            for game_node in console_node.children:
+                gp = getattr(game_node, "data", None)
+                if isinstance(gp, Path):
+                    console_game_paths.add(gp)
+                    all_game_paths.add(gp)
+                    base = self._lib_base_labels.get(gp)
+                    if base is None:
+                        continue
+                    display = Text(no_wrap=True, overflow="ellipsis")
+                    if gp in sel:
+                        display.append("● ", style="bold cyan")
+                    display.append_text(base)
+                    game_node.set_label(display)
+
+            # Update console node label
+            if isinstance(console_path, Path):
+                c_base = self._lib_base_labels.get(console_path)
+                if c_base is not None:
+                    c_display = Text(no_wrap=True, overflow="ellipsis")
+                    if console_game_paths and console_game_paths <= sel:
+                        c_display.append("◉ ", style="bold cyan")
+                    elif console_game_paths & sel:
+                        c_display.append("◎ ", style="cyan")
+                    c_display.append_text(c_base)
+                    console_node.set_label(c_display)
+
+        # Update root label
+        r_base = self._lib_base_labels.get(None)
+        if r_base is not None:
+            root_display = Text(no_wrap=True)
+            if all_game_paths and all_game_paths <= sel:
+                root_display.append("◉ ", style="bold cyan")
+            elif all_game_paths & sel:
+                root_display.append("◎ ", style="cyan")
+            root_display.append_text(r_base)
+            tree.root.set_label(root_display)
+
+    def _has_ps2_selection(self) -> bool:
+        """Check if any selected path is under a PS2 console directory."""
+        for p in self._lib_selected_paths:
+            parent_name = p.parent.name.lower()
+            if "ps2" in parent_name or "playstation 2" in parent_name:
+                return True
+        return False
+
+    def _lib_select_failed(self) -> None:
+        """Select all failed/incomplete games (adds to existing selection)."""
+        try:
+            tree = self.query_one("#lib-tree", Tree)
+        except Exception:
+            return
+        for console_node in tree.root.children:
+            for game_node in console_node.children:
+                gpath = getattr(game_node, "data", None)
+                if not isinstance(gpath, Path):
+                    continue
+                status = self._lib_status.get(gpath)
+                if status != "validated":
+                    self._lib_selected_paths.add(gpath)
+        self._refresh_lib_tree_selection_visuals()
+        self._update_lib_toolbar()
+        self._update_lib_selection_status()
+
+    def _lib_execute_delete(self, paths: list[Path]) -> None:
+        """Delete the given game paths from disk and update library."""
+        library = Path(self.state.settings['library_root'])
+        for target_path in paths:
             try:
-                btn = self.query_one(f"#{btn_id}", Button)
-                if level in levels:
-                    btn.remove_class("--lib-hidden")
-                else:
-                    btn.add_class("--lib-hidden")
+                self._lib_status.remove(target_path)
+                if target_path.is_dir():
+                    shutil.rmtree(target_path)
+                elif target_path.exists():
+                    target_path.unlink()
+                # Clean up empty parent grouping folder
+                parent = target_path.parent
+                if (parent.exists() and parent != library
+                        and parent.parent != library):
+                    try:
+                        if not any(parent.iterdir()):
+                            self._lib_status.remove(parent)
+                            parent.rmdir()
+                    except OSError:
+                        pass
+            except Exception as err:
+                self._log(f"Delete error for {target_path.name}: {err}", is_error=True)
+        # Remove deleted paths from selection
+        self._lib_selected_paths -= set(paths)
+        self._lib_status.prune(library)
+        self.run_lib_status_scan()
+
+    @work(exclusive=True, thread=True)
+    def _lib_execute_requeue(self, paths: list[Path]) -> None:
+        """Requeue the given game paths for re-download."""
+        library = Path(self.state.settings['library_root'])
+        current_queue = self.state.get_active_queue()
+        existing_paths = {i["dest_path"] for i in current_queue}
+        added = 0
+
+        for game_dir in paths:
+            if str(game_dir) in existing_paths:
+                continue
+            # Determine console name from parent
+            console_path = game_dir.parent
+            if console_path == library:
+                continue
+            console_name = console_path.name
+            self._lib_status.remove(game_dir)
+
+            # Multi-disc detection
+            if DISC_REGEX.search(game_dir.name) is None:
+                disc_added = self._queue_disc_variants(
+                    console_name, game_dir, "incomplete", library,
+                    current_queue, existing_paths,
+                )
+                if disc_added:
+                    added += disc_added
+                    continue
+
+            match = self._find_source_game(console_name, game_dir.name)
+            if not match:
+                continue
+            game_name, game_url, size_str = match
+            current_queue.append(self._make_queue_item(
+                console_name, game_name, game_url, str(game_dir), size_str,
+            ))
+            existing_paths.add(str(game_dir))
+            added += 1
+
+        if added:
+            self.state.update_active_queue(current_queue, immediate=True)
+            self.call_from_thread(self._refresh_queue_table)
+            self.call_from_thread(lambda: self._nav_switch("pane-downloads"))
+
+        self.post_message(SystemLog(
+            f"Re-queued [bold]{added}[/bold] game(s) from selection."
+        ))
+
+    def _lib_execute_action(self, button_id: str, paths: list[Path]) -> None:
+        """Execute a library action on selected paths.
+
+        Workers accept a directory scope, so we compute the narrowest common
+        scope that covers all selected paths.  Single game → game dir, all
+        under one console → console dir, mixed → library root.
+        """
+        library = Path(self.state.settings["library_root"])
+        if len(paths) == 1:
+            scope = paths[0]
+        else:
+            parents = {p.parent for p in paths}
+            if len(parents) == 1:
+                scope = next(iter(parents))
+            else:
+                scope = library
+
+        if button_id == "btn-lib-convert":
+            self.run_lib_convert(scope)
+        elif button_id == "btn-lib-chd-to-orig":
+            self.run_chd_to_original(scope)
+        elif button_id == "btn-lib-dat-audit":
+            self.run_bulk_dat_audit(scope)
+        elif button_id == "btn-ps2-md-patch":
+            self._ps2mdp_target = scope
+            self.run_ps2_master_disc_patch()
+        elif button_id == "btn-ps2-md-unpatch":
+            self._ps2mdp_target = scope
+            self.run_ps2_master_disc_unpatch()
+
+    def _update_lib_toolbar(self) -> None:
+        """Enable/disable toolbar buttons based on selection state."""
+        has_sel = bool(self._lib_selected_paths)
+        has_ps2 = self._has_ps2_selection() if has_sel else False
+
+        _action_btns = (
+            "btn-lib-dat-audit", "btn-lib-convert", "btn-lib-chd-to-orig",
+            "btn-requeue-console", "btn-lib-delete",
+        )
+        for btn_id in _action_btns:
+            try:
+                self.query_one(f"#{btn_id}", Button).disabled = not has_sel
             except Exception:
                 pass
 
-    def _update_lib_selection_status(self, node: Any) -> None:
-        """Show the selected node name in the status bar."""
+        for btn_id in ("btn-ps2-md-patch", "btn-ps2-md-unpatch"):
+            try:
+                self.query_one(f"#{btn_id}", Button).disabled = not has_ps2
+            except Exception:
+                pass
+
+        for btn_id in ("btn-lib-refresh", "btn-requeue-failed"):
+            try:
+                self.query_one(f"#{btn_id}", Button).disabled = False
+            except Exception:
+                pass
+
+    def _update_lib_selection_status(self) -> None:
+        """Update the status label to reflect selection or cursor state."""
         try:
             status_label = self.query_one("#lib-status-label", Label)
             progress_bar = self.query_one("#lib-progress-bar", ProgressBar)
-            # Don't overwrite active operation progress
             if progress_bar.display:
                 return
+        except Exception:
+            return
+
+        if self._lib_selected_paths:
+            n_games = len(self._lib_selected_paths)
+            consoles = {p.parent.name for p in self._lib_selected_paths}
+            n_cons = len(consoles)
+            t = Text()
+            t.append(f"{n_games} game(s) selected", style="bold cyan")
+            t.append(f" across {n_cons} console(s)", style="cyan")
+            status_label.update(t)
+            return
+
+        # No selection — show cursor node detail
+        try:
+            tree = self.query_one("#lib-tree", Tree)
+            node = tree.cursor_node
         except Exception:
             return
         node_path = getattr(node, "data", None) if node else None
@@ -1519,57 +1842,22 @@ class MyrientTUI(App):
         elif node_path.parent == library:
             t.append(node_path.name, style="bold #e6b73e")
         else:
-            # Check if this is a multi-disc grouping folder
-            disc_subdirs: list[Path] = []
+            status = self._lib_status.get(node_path)
+            if status == "validated":
+                t.append("✓ ", style="bold green")
+            elif status == "corrupted":
+                t.append("✗ ", style="bold red")
+            else:
+                t.append("~ ", style="yellow")
+            t.append(node_path.name, style="#c9d1d9")
             try:
-                disc_subdirs = [
-                    d for d in node_path.iterdir()
-                    if d.is_dir() and DISC_REGEX.search(d.name)
-                ]
+                files = [f for f in node_path.iterdir() if f.is_file() and not f.name.startswith('.')]
+                if files:
+                    total_size = sum(f.stat().st_size for f in files)
+                    t.append(f"  {len(files)} file(s)", style="dim")
+                    t.append(f"  {MyrientTUI._format_size(total_size)}", style="dim #9aa0aa")
             except (PermissionError, OSError):
                 pass
-
-            if disc_subdirs:
-                # Multi-disc grouping folder — aggregate status from disc subdirs
-                statuses = {self._lib_status.get(d) for d in disc_subdirs}
-                if statuses == {"validated"}:
-                    t.append("✓ ", style="bold green")
-                elif "corrupted" in statuses:
-                    t.append("✗ ", style="bold red")
-                else:
-                    t.append("~ ", style="yellow")
-                t.append(node_path.name, style="#c9d1d9")
-                t.append(f"  {len(disc_subdirs)} disc(s)", style="dim")
-                try:
-                    total_files = 0
-                    total_size = 0
-                    for d in disc_subdirs:
-                        for f in d.iterdir():
-                            if f.is_file() and not f.name.startswith('.'):
-                                total_files += 1
-                                total_size += f.stat().st_size
-                    if total_files:
-                        t.append(f"  {total_files} file(s)", style="dim")
-                        t.append(f"  {MyrientTUI._format_size(total_size)}", style="dim #9aa0aa")
-                except (PermissionError, OSError):
-                    pass
-            else:
-                status = self._lib_status.get(node_path)
-                if status == "validated":
-                    t.append("✓ ", style="bold green")
-                elif status == "corrupted":
-                    t.append("✗ ", style="bold red")
-                else:
-                    t.append("~ ", style="yellow")
-                t.append(node_path.name, style="#c9d1d9")
-                try:
-                    files = [f for f in node_path.iterdir() if f.is_file() and not f.name.startswith('.')]
-                    if files:
-                        total_size = sum(f.stat().st_size for f in files)
-                        t.append(f"  {len(files)} file(s)", style="dim")
-                        t.append(f"  {MyrientTUI._format_size(total_size)}", style="dim #9aa0aa")
-                except (PermissionError, OSError):
-                    pass
         status_label.update(t)
 
     def on_library_progress(self, message: LibraryProgress) -> None:
@@ -1680,12 +1968,25 @@ class MyrientTUI(App):
         self._add_selected_to_queue()
 
     def on_key(self, event: Key) -> None:
-        """Handles keys for game-list and filter tables.
-        search-games keys (↑↓/Tab/Enter) are handled by GameSearchInput._on_key
-        before they bubble, so they never reach here.
-        """
+        """Handles keys for game-list, filter tables, and library tree."""
         focused = self.focused
         fid = getattr(focused, "id", None)
+
+        if fid == "lib-tree":
+            if event.key == "tab":
+                event.prevent_default()
+                event.stop()
+                self._lib_toggle_at_cursor()
+            elif event.key == "escape":
+                if self._lib_selected_paths:
+                    event.prevent_default()
+                    event.stop()
+                    self._lib_clear_selection()
+            elif event.key == "ctrl+a":
+                event.prevent_default()
+                event.stop()
+                self._lib_select_all()
+            return
 
         if fid == "game-list":
             if event.key == "space":
@@ -1855,13 +2156,6 @@ class MyrientTUI(App):
                 self._games_search_timer = self.set_timer(
                     _SEARCH_DEBOUNCE, lambda: self._render_games(event.value)
                 )
-        elif event.input.id == "lib-search":
-            self._lib_search_text = event.value.lower().strip()
-            if self._lib_search_timer is not None:
-                self._lib_search_timer.stop()
-            self._lib_search_timer = self.set_timer(
-                _SEARCH_DEBOUNCE, self._filter_library_tree
-            )
         elif event.input.id == "log-search":
             self._log_search_text = event.value.lower().strip()
             if self._log_search_timer is not None:
@@ -2273,7 +2567,7 @@ class MyrientTUI(App):
         "btn-lib-refresh":          "run_lib_refresh",
         "btn-setup-chdman":         "setup_chdman_auto",
         "btn-setup-ps2mdp":         "setup_ps2mdp_auto",
-        "btn-requeue-failed":       "requeue_failed_games",
+        "btn-requeue-failed":       "_lib_select_failed",
         "btn-prefetch-consoles":    "prefetch_all_consoles",
         "btn-refresh-session-logs": "_refresh_session_log_list",
         "btn-schedule-dl":          "_schedule_download",
@@ -2544,60 +2838,55 @@ class MyrientTUI(App):
             self._refresh_history_table()
             self.notify("Download history cleared")
 
+        elif button_id == "btn-lib-delete":
+            paths = self._lib_get_target_paths()
+            if not paths:
+                return
+            def _on_delete_confirm(result: bool) -> None:
+                if result:
+                    self._lib_execute_delete(paths)
+            self.push_screen(
+                ConfirmActionScreen("Delete", paths,
+                    warning_text="This action is IRREVERSIBLE. Files will be permanently deleted from disk."),
+                _on_delete_confirm,
+            )
+
         elif button_id == "btn-requeue-console":
-            # Read tree cursor on the main thread before dispatching worker.
-            tree = self.query_one("#lib-tree", Tree)
-            node = tree.cursor_node
-            if not node or not isinstance(getattr(node, 'data', None), Path):
-                self.notify("Select a console or game in the tree first.", severity="warning")
+            paths = self._lib_get_target_paths()
+            if not paths:
                 return
-            library = Path(self.state.settings['library_root'])
-            node_path: Path = node.data
-            # Resolve to console level — if a game leaf is selected, walk up one level.
-            # Console nodes are direct children of the library root (depth 1).
-            if node_path.parent == library:
-                console_path = node_path
-            elif node_path.parent.parent == library:
-                console_path = node_path.parent
-            else:
-                # Deeper nesting (multi-disc grandchild) — go up two levels
-                console_path = node_path.parent.parent
-            if not console_path.is_dir():
-                self.notify("Could not resolve a console folder from the selected node.", severity="warning")
-                return
-            self.requeue_console_games(console_path.name, console_path)
+            def _on_requeue_confirm(result: bool) -> None:
+                if result:
+                    self._lib_execute_requeue(paths)
+            self.push_screen(
+                ConfirmActionScreen("Requeue All", paths),
+                _on_requeue_confirm,
+            )
 
         elif button_id in ("btn-lib-convert", "btn-lib-chd-to-orig", "btn-ps2-md-patch",
                            "btn-ps2-md-unpatch", "btn-lib-dat-audit"):
-            # All scoped operations use the tree cursor when one is selected,
-            # or fall back to the full library when nothing is highlighted.
-            tree = self.query_one("#lib-tree", Tree)
-            node = tree.cursor_node
-            library = Path(self.state.settings["library_root"])
+            paths = self._lib_get_target_paths()
+            if not paths:
+                return
 
-            if node and isinstance(getattr(node, "data", None), Path):
-                node_path: Path = node.data
-                if node_path == library:
-                    scope = library
-                elif node_path.parent == library:
-                    scope = node_path          # console node
-                else:
-                    scope = node_path          # game dir at any depth
-            else:
-                scope = library               # nothing selected → full library
+            action_names = {
+                "btn-lib-convert": "Convert to CHD",
+                "btn-lib-chd-to-orig": "CHD → Original",
+                "btn-lib-dat-audit": "Verify (DAT Audit)",
+                "btn-ps2-md-patch": "PS2 Master Disc Patch",
+                "btn-ps2-md-unpatch": "PS2 Master Disc Unpatch",
+            }
+            action_name = action_names.get(button_id, "Action")
+            _bid = button_id  # capture for closure
 
-            if button_id == "btn-lib-convert":
-                self.run_lib_convert(scope)
-            elif button_id == "btn-lib-chd-to-orig":
-                self.run_chd_to_original(scope)
-            elif button_id == "btn-lib-dat-audit":
-                self.run_bulk_dat_audit(scope)
-            elif button_id == "btn-ps2-md-patch":
-                self._ps2mdp_target = scope
-                self.run_ps2_master_disc_patch()
-            elif button_id == "btn-ps2-md-unpatch":
-                self._ps2mdp_target = scope
-                self.run_ps2_master_disc_unpatch()
+            def _on_action_confirm(result: bool) -> None:
+                if result:
+                    self._lib_execute_action(_bid, paths)
+
+            self.push_screen(
+                ConfirmActionScreen(action_name, paths),
+                _on_action_confirm,
+            )
 
 
 
@@ -4318,43 +4607,6 @@ class MyrientTUI(App):
                 viewer.write(line)
         except Exception:
             pass
-
-    def _lib_delete_selected(self) -> None:
-        """Delete the currently selected game/console from the library tree."""
-        tree = self.query_one("#lib-tree", Tree)
-        if not tree.cursor_node or not isinstance(tree.cursor_node.data, Path):
-            self.notify("Select a game or console folder first.", severity="warning")
-            return
-        target_path: Path = tree.cursor_node.data
-
-        def check_delete(confirm: bool) -> None:
-            if confirm and target_path:
-                try:
-                    library = Path(self.state.settings['library_root'])
-                    self._lib_status.remove(target_path)
-                    self._lib_status.prune(library)
-                    if target_path.is_dir():
-                        shutil.rmtree(target_path)
-                    else:
-                        target_path.unlink()
-                    # Clean up empty parent grouping folder (multi-disc case)
-                    parent = target_path.parent
-                    if (parent.exists()
-                            and parent != library
-                            and parent.parent != library):
-                        try:
-                            if not any(parent.iterdir()):
-                                self._lib_status.remove(parent)
-                                parent.rmdir()
-                                self.post_message(SystemLog(
-                                    f"Cleaned up empty grouping folder: {parent.name}"
-                                ))
-                        except OSError:
-                            pass
-                    self.run_lib_status_scan()
-                except Exception as err:
-                    self.notify(f"Error during deletion: {err}", severity="error")
-        self.push_screen(ConfirmDeleteScreen(target_path.name), check_delete)
 
     # ── Queue multi-select ───────────────────────────────────────────────────
 

@@ -275,22 +275,14 @@ ProgressBar > .bar--complete { color: #3fb950; }
 
 /* ── ⊞ LIBRARY pane ───────────────────────────────────────────── */
 #lib-tab-wrapper { height: 1fr; layout: vertical; }
-#lib-header-bar {
-    height: 1;
-    layout: horizontal;
-    padding: 0 1;
-    background: #080c12;
-}
 #lib-summary-bar {
     width: 1fr;
     height: 1;
     color: #3d4451;
     content-align: left middle;
+    padding: 0 1;
+    background: #080c12;
 }
-.lib-hdr-btn { width: 5; height: 1; color: #606878; content-align: center middle; background: #161b22; }
-.lib-hdr-btn:hover { color: #c9d1d9; background: #21262d; }
-.lib-hdr-del { color: #f85149; }
-.lib-hdr-del:hover { color: #ff7b72; background: #21262d; }
 #lib-toolbar {
     height: auto;
     min-height: 3;
@@ -301,9 +293,14 @@ ProgressBar > .bar--complete { color: #3fb950; }
     overflow: hidden auto;
 }
 .lib-tb-btn { width: auto; min-width: 8; margin: 0 1 0 0; height: 3; }
-.lib-tb-label { height: 3; content-align: left middle; margin: 0 1 0 0; color: #9aa0aa; }
-.--lib-hidden { display: none; }
-#lib-search { margin: 0 1; }
+#btn-lib-delete {
+    color: #f85149;
+    border: tall #f85149;
+}
+#btn-lib-delete:hover {
+    color: #ff7b72;
+    border: tall #ff7b72;
+}
 #lib-tree {
     height: 1fr;
     border: solid #1c2333;
@@ -457,6 +454,41 @@ Button.-warning:hover { background: #5a3e00; color: #e6edf3; border: solid #d299
 
 /* ── Confirm dialog ───────────────────────────────────────────── */
 ConfirmDeleteScreen { align: center middle; background: rgba(0,0,0,0.82); }
+ConfirmActionScreen { align: center middle; background: rgba(0,0,0,0.82); }
+#action-dialog {
+    padding: 2 3;
+    width: 72;
+    height: auto;
+    max-height: 80%;
+    border: thick #58a6ff;
+    background: #0d1117;
+    align: center middle;
+}
+#action-dialog.--destructive { border: thick #f85149; }
+#action-title {
+    width: 1fr;
+    content-align: center middle;
+    text-align: center;
+    height: auto;
+    color: #e6edf3;
+    text-style: bold;
+    padding: 1 0;
+}
+#action-warning {
+    width: 1fr;
+    text-align: center;
+    height: auto;
+    color: #f85149;
+    text-style: bold;
+    padding: 0 0 1 0;
+}
+#action-game-list {
+    height: auto;
+    max-height: 20;
+    padding: 0 2;
+    color: #9aa0aa;
+}
+#action-btn-row { height: auto; align: center middle; width: 1fr; layout: horizontal; }
 #dialog {
     padding: 2 3;
     width: 68;
@@ -530,7 +562,7 @@ Screen.-light-mode ListView > ListItem { color: #656d76; }
 Screen.-light-mode ListView > ListItem.-highlight { background: #ddf4ff; }
 Screen.-light-mode Tree { background: #ffffff; color: #1f2328; }
 Screen.-light-mode Tree > .tree--cursor { background: #ddf4ff; color: #1f2328; }
-Screen.-light-mode #lib-header-bar { background: #f6f8fa; border-bottom: solid #d0d7de; }
+Screen.-light-mode #lib-summary-bar { background: #f6f8fa; border-bottom: solid #d0d7de; }
 Screen.-light-mode #lib-toolbar { background: #f6f8fa; }
 Screen.-light-mode #lib-tree { background: #ffffff; }
 Screen.-light-mode #lib-tree > .tree--cursor { background: #ddf4ff; color: #1f2328; }
@@ -557,6 +589,11 @@ Screen.-light-mode .help-key { color: #0969da; }
 
 /* ── Light theme: missing overrides ──────────────────────────── */
 Screen.-light-mode ConfirmDeleteScreen { background: rgba(255,255,255,0.82); }
+Screen.-light-mode ConfirmActionScreen { background: rgba(255,255,255,0.82); }
+Screen.-light-mode #action-dialog { background: #ffffff; border: thick #0969da; }
+Screen.-light-mode #action-dialog.--destructive { border: thick #cf222e; }
+Screen.-light-mode #action-title { color: #1f2328; }
+Screen.-light-mode #action-warning { color: #cf222e; }
 Screen.-light-mode #dialog { background: #ffffff; border: thick #cf222e; }
 Screen.-light-mode #question { color: #1f2328; }
 Screen.-light-mode #queue-settings-collapsible { background: #ffffff; }

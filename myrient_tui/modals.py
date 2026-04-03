@@ -1,5 +1,7 @@
-"""Modal screen widgets — ConfirmDeleteScreen, HelpModal."""
+"""Modal screen widgets — ConfirmDeleteScreen, ConfirmActionScreen, HelpModal."""
 from __future__ import annotations
+
+from pathlib import Path
 
 from rich.text import Text
 from textual.app import ComposeResult
@@ -81,6 +83,50 @@ class ConfirmVerifyScreen(ModalScreen[bool]):
         self.dismiss(event.button.id == "btn-apply")
 
 
+class ConfirmActionScreen(ModalScreen[bool]):
+    """Reusable confirmation screen for library actions."""
+
+    def __init__(self, action_name: str, game_paths: list[Path],
+                 warning_text: str | None = None):
+        super().__init__()
+        self.action_name = action_name
+        self.game_paths = game_paths
+        self.warning_text = warning_text
+
+    def compose(self) -> ComposeResult:
+        is_destructive = self.warning_text is not None
+        dialog_classes = "--destructive" if is_destructive else ""
+        with Vertical(id="action-dialog", classes=dialog_classes):
+            title = Text.assemble(
+                "Confirm: ",
+                (self.action_name, "bold"),
+            )
+            yield Label(title, id="action-title")
+            if self.warning_text:
+                yield Label(
+                    Text(self.warning_text, style="bold red"),
+                    id="action-warning",
+                )
+            count_label = Text.assemble(
+                "On ",
+                (f"{len(self.game_paths)}", "bold #58a6ff"),
+                " game(s):",
+            )
+            yield Label(count_label)
+            with VerticalScroll(id="action-game-list"):
+                for p in self.game_paths[:100]:
+                    yield Label(Text.assemble(("  • ", "dim"), (p.name, "#9aa0aa")))
+                if len(self.game_paths) > 100:
+                    yield Label(Text(f"  … and {len(self.game_paths) - 100} more", style="dim"))
+            with Horizontal(id="action-btn-row"):
+                yield Button("Cancel", variant="primary", id="btn-action-cancel")
+                variant = "error" if is_destructive else "success"
+                yield Button("Continue", variant=variant, id="btn-action-continue")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "btn-action-continue")
+
+
 class HelpModal(ModalScreen):
     """Keyboard shortcut reference, shown with ?."""
 
@@ -116,7 +162,9 @@ class HelpModal(ModalScreen):
                     ("Shift+↓",  "Move queue item down"),
                     ("",          ""),
                     ("── Library ──", ""),
-                    ("▸ / ▾ / ✕",  "Expand / collapse / delete (header)"),
+                    ("Tab",        "Toggle game/console selection"),
+                    ("Ctrl+A",    "Select all games"),
+                    ("Escape",     "Clear selection"),
                     ("",          ""),
                     ("── Nav ──",  ""),
                     ("1–5",       "Switch pane (when not in input)"),
